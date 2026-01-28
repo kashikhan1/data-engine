@@ -1,0 +1,214 @@
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    background: #141414;
+    color: var(--text-primary);
+}
+
+.header {
+    padding: 16px 20px;
+    border-bottom: 1px solid var(--border);
+    background: #141414;
+}
+
+.headerTop {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 16px;
+}
+
+.headerTitle {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    font-size: 14px;
+    font-weight: 600;
+}
+
+.headerTitle svg {
+    color: var(--primary);
+}
+
+.tabs {
+    display: flex;
+    gap: 20px;
+    border-bottom: none;
+}
+
+.tab {
+    background: transparent;
+    border: none;
+    padding: 0 0 8px 0;
+    font-size: 13px;
+    color: var(--text-muted);
+    cursor: pointer;
+    border-bottom: 2px solid transparent;
+    transition: all 0.2s;
+}
+
+.tab:hover {
+    color: var(--text-primary);
+}
+
+.tab.active {
+    color: var(--primary);
+    border-bottom-color: var(--primary);
+}
+
+.content {
+    flex: 1;
+    overflow: auto;
+    position: relative;
+    background: #000;
+}
+
+.empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    padding: 40px;
+    color: var(--text-muted);
+    font-size: 14px;
+    gap: 12px;
+}
+
+/* SQL Area */
+.sqlTab {
+    position: relative;
+    min-height: 100%;
+}
+
+.lineNumberSidebar {
+    position: absolute;
+    left: 0;
+    top: 0;
+    bottom: 0;
+    width: 32px;
+    background: #000;
+    border-right: 1px solid #1a1a1a;
+    padding: 16px 0;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    color: #303030;
+    font-family: var(--font-mono);
+    font-size: 12px;
+    user-select: none;
+}
+
+.line {
+    height: 20px;
+    display: flex;
+    align-items: center;
+}
+
+.codeArea {
+    padding: 16px 16px 16px 48px;
+}
+
+.sqlCode {
+    margin: 0;
+    font-family: var(--font-mono);
+    font-size: 13px;
+    line-height: 20px;
+    color: #abb2bf;
+    white-space: pre-wrap;
+}
+
+/* Syntax Highlighting - Professional WebStorm/VSCode dark style */
+.keyword {
+    color: #c678dd;
+    font-weight: 600;
+}
+
+.function {
+    color: #61afef;
+}
+
+.string {
+    color: #98c379;
+}
+
+.number {
+    color: #d19a66;
+}
+
+/* Footer / QA Section */
+.footer {
+    padding: 20px;
+    background: #141414;
+    border-top: 1px solid var(--border);
+}
+
+.footerTitle {
+    font-size: 10px;
+    font-weight: 800;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.1em;
+    margin-bottom: 12px;
+}
+
+.qaList {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+}
+
+.qaItem {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 8px 12px;
+    background: #000;
+    border-radius: 6px;
+    border: 1px solid #1a1a1a;
+    font-size: 13px;
+}
+
+.qaPass {
+    color: #52c41a;
+}
+
+.qaWarn {
+    color: #faad14;
+}
+
+.actions {
+    display: flex;
+    gap: 12px;
+    margin-top: 20px;
+}
+
+.actionButton {
+    flex: 1;
+    height: 36px;
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    border-radius: 6px;
+    font-size: 14px;
+    font-weight: 500;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.actionButton.secondary {
+    background: #1f1f1f;
+    color: #fff;
+    border: 1px solid var(--border);
+}
+
+.actionButton.primary {
+    background: var(--primary);
+    color: #fff;
+    border: none;
+}
+
+.actionButton:hover {
+    filter: brightness(1.2);
+}

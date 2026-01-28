@@ -1,0 +1,213 @@
+.container {
+    background: rgba(13, 17, 23, 0.8);
+    backdrop-filter: blur(20px);
+    border: 1px solid rgba(255, 255, 255, 0.05);
+    border-radius: 20px;
+    padding: 24px;
+    width: 100%;
+    box-shadow: 0 20px 40px rgba(0, 0, 0, 0.4);
+}
+
+.header {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    margin-bottom: 24px;
+    font-size: 11px;
+    font-weight: 900;
+    text-transform: uppercase;
+    letter-spacing: 2.5px;
+    color: rgba(255, 255, 255, 0.4);
+    padding-bottom: 12px;
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05);
+}
+
+.streamingDot {
+    width: 8px;
+    height: 8px;
+    background: #135bec;
+    border-radius: 50%;
+    box-shadow: 0 0 10px #135bec;
+    animation: pulse 1.5s infinite;
+}
+
+@keyframes pulse {
+    0% {
+        transform: scale(0.95);
+        opacity: 0.5;
+    }
+
+    50% {
+        transform: scale(1.05);
+        opacity: 1;
+    }
+
+    100% {
+        transform: scale(0.95);
+        opacity: 0.5;
+    }
+}
+
+.timeline {
+    display: flex;
+    flex-direction: column;
+    gap: 16px;
+}
+
+.step {
+    display: flex;
+    gap: 16px;
+    position: relative;
+    padding: 12px;
+    border-radius: 12px;
+    transition: all 0.3s;
+}
+
+.step:hover {
+    background: rgba(255, 255, 255, 0.03);
+}
+
+.connector {
+    position: absolute;
+    left: 27px;
+    top: -16px;
+    width: 2px;
+    height: 16px;
+}
+
+.stepIcon {
+    width: 32px;
+    height: 32px;
+    border-radius: 10px;
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    flex-shrink: 0;
+    transition: all 0.3s;
+}
+
+.stepContent {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    min-width: 0;
+}
+
+.stepHeader {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+}
+
+.stepHeaderRight {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+}
+
+.viewOutput {
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.6);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.viewOutput:hover {
+    color: #fff;
+    border-color: rgba(19, 91, 236, 0.6);
+    background: rgba(19, 91, 236, 0.12);
+}
+
+.stepLabel {
+    font-size: 12px;
+    font-weight: 800;
+    color: #fff;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+}
+
+.stepMessage {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.4);
+    font-weight: 500;
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+}
+
+.stepMessageExpanded {
+    white-space: pre-wrap;
+    overflow: visible;
+    text-overflow: clip;
+}
+
+.logsToggle {
+    align-self: flex-start;
+    background: transparent;
+    border: 1px solid rgba(255, 255, 255, 0.08);
+    color: rgba(255, 255, 255, 0.5);
+    font-size: 10px;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1px;
+    padding: 4px 8px;
+    border-radius: 999px;
+    cursor: pointer;
+    transition: all 0.2s;
+}
+
+.logsToggle:hover {
+    color: #fff;
+    border-color: rgba(19, 91, 236, 0.6);
+    background: rgba(19, 91, 236, 0.12);
+}
+
+.logs {
+    margin-top: 6px;
+    padding: 8px 10px;
+    border-radius: 10px;
+    background: rgba(15, 21, 27, 0.7);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    display: flex;
+    flex-direction: column;
+    gap: 6px;
+}
+
+.logLine {
+    font-size: 11px;
+    color: rgba(255, 255, 255, 0.6);
+    white-space: pre-wrap;
+    word-break: break-word;
+}
+
+.spinning {
+    animation: spin 1s linear infinite;
+}
+
+@keyframes spin {
+    from {
+        transform: rotate(0deg);
+    }
+
+    to {
+        transform: rotate(360deg);
+    }
+}
+
+.running .stepIcon {
+    border-color: #135bec;
+    box-shadow: 0 0 15px rgba(19, 91, 236, 0.2);
+}
+
+.done .stepIcon {
+    border-color: #22c55e;
+}

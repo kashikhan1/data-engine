@@ -1,0 +1,177 @@
+.container {
+    display: flex;
+    flex-direction: column;
+    height: 100%;
+    padding: 0.5rem;
+    gap: 1rem;
+}
+
+/* Summary header */
+.summary {
+    display: flex;
+    gap: 2rem;
+    padding: 0.5rem 0;
+}
+
+.summaryItem {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    font-size: 0.8rem;
+    color: var(--text-secondary);
+}
+
+.summaryItem svg {
+    color: var(--text-muted);
+}
+
+/* Funnel visualization */
+.funnel {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    justify-content: center;
+}
+
+.stepWrapper {
+    position: relative;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+}
+
+.step {
+    height: 44px;
+    border-radius: 6px;
+    display: flex;
+    align-items: center;
+    padding: 0 1rem;
+    min-width: 120px;
+    position: relative;
+    box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.stepContent {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
+    width: 100%;
+    gap: 1rem;
+}
+
+.stepInfo {
+    display: flex;
+    align-items: center;
+    gap: 0.75rem;
+}
+
+.stepName {
+    font-size: 0.8rem;
+    font-weight: 500;
+    color: white;
+    white-space: nowrap;
+}
+
+.stepCount {
+    font-size: 0.9rem;
+    font-weight: 700;
+    color: white;
+}
+
+.stepConversion {
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.conversionPct {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: rgba(255, 255, 255, 0.9);
+    background: rgba(0, 0, 0, 0.2);
+    padding: 0.125rem 0.5rem;
+    border-radius: 4px;
+}
+
+.stepLabel {
+    font-size: 0.7rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* Dropoff indicator */
+.dropoff {
+    position: absolute;
+    right: -80px;
+    top: 50%;
+    transform: translateY(-50%);
+    display: flex;
+    align-items: center;
+    gap: 0.25rem;
+}
+
+.dropoffLine {
+    width: 20px;
+    height: 1px;
+    background: var(--border);
+}
+
+.dropoffValue {
+    font-size: 0.65rem;
+    color: #ef4444;
+    white-space: nowrap;
+}
+
+/* Conversion breakdown */
+.breakdown {
+    padding: 0.75rem;
+    background: var(--bg-tertiary);
+    border-radius: 8px;
+}
+
+.breakdown h4 {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: var(--text-muted);
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    margin-bottom: 0.5rem;
+}
+
+.breakdownList {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+}
+
+.breakdownItem {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    font-size: 0.75rem;
+}
+
+.breakdownLabel {
+    color: var(--text-secondary);
+}
+
+.breakdownValue {
+    font-weight: 600;
+    color: var(--text-primary);
+}
+
+/* Responsive adjustments */
+@media (max-width: 600px) {
+    .dropoff {
+        display: none;
+    }
+
+    .stepName {
+        font-size: 0.7rem;
+    }
+
+    .stepCount {
+        font-size: 0.8rem;
+    }
+}

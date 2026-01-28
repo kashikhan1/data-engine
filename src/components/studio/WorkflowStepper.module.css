@@ -1,0 +1,89 @@
+.stepper {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 0;
+    padding: 24px;
+    background: rgba(13, 17, 23, 0.4);
+    border-bottom: 1px solid var(--border);
+    backdrop-filter: blur(10px);
+}
+
+.stepWrapper {
+    display: flex;
+    align-items: center;
+}
+
+.step {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    gap: 8px;
+    cursor: pointer;
+    transition: all 0.3s ease;
+    width: 100px;
+    opacity: 0.4;
+}
+
+.step.active {
+    opacity: 1;
+}
+
+.step.completed {
+    opacity: 0.8;
+}
+
+.number {
+    width: 32px;
+    height: 32px;
+    border-radius: 50%;
+    background: rgba(255, 255, 255, 0.05);
+    border: 1px solid rgba(255, 255, 255, 0.1);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    font-weight: 700;
+    transition: all 0.3s ease;
+}
+
+.active .number {
+    background: #135bec;
+    border-color: #135bec;
+    box-shadow: 0 0 15px rgba(19, 91, 236, 0.4);
+    transform: scale(1.1);
+}
+
+.completed .number {
+    background: rgba(19, 91, 236, 0.2);
+    border-color: #135bec;
+    color: #135bec;
+}
+
+.label {
+    font-size: 10px;
+    font-weight: 800;
+    text-transform: uppercase;
+    letter-spacing: 1.5px;
+    color: rgba(255, 255, 255, 0.5);
+}
+
+.active .label {
+    color: #fff;
+}
+
+.completed .label {
+    color: #135bec;
+}
+
+.connector {
+    width: 60px;
+    height: 1px;
+    background: rgba(255, 255, 255, 0.1);
+    margin: 0 -20px;
+    margin-top: -16px;
+}
+
+.stepWrapper:has(+ .stepWrapper .completed) .connector {
+    background: #135bec;
+}
