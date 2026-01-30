@@ -68,7 +68,7 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
                 }
             } else {
                 setConnectionStatus("Error");
-                setError("Failed to connect to Postgres.");
+                setError(`Failed to connect to ${dbType === 'MSSQL' ? 'MSSQL' : 'PostgreSQL'}.`);
             }
         } catch (err: any) {
             setConnectionStatus("Error");

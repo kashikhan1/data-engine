@@ -1,6 +1,7 @@
 "use client";
 
 import React, { useEffect, useMemo } from "react";
+import { Select, Input } from "antd";
 import {
     Calendar,
     ChevronDown,
@@ -14,13 +15,27 @@ import { useDashboardStore, useWorkflowStore } from "@/state/stores";
 
 interface FilterBarProps {
     filters?: Filter[];
+    variant?: "panel" | "compact";
 }
 
-export function FilterBar({ filters = [] }: FilterBarProps) {
+export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
     const { activeFilters, setFilter, clearFilter, clearAllFilters, markFiltersActivated } = useDashboardStore();
     const { setStaleStep } = useWorkflowStore();
+    const isCompact = variant === "compact";
 
     const resolvedFilters = useMemo<Filter[]>(() => filters || [], [filters]);
+    const activeCount = useMemo(() => {
+        let count = 0;
+        resolvedFilters.forEach((f) => {
+            const value = activeFilters.get(f.dimension);
+            if (Array.isArray(value)) {
+                if (value.length > 0) count += 1;
+                return;
+            }
+            if (value && value !== "All") count += 1;
+        });
+        return count;
+    }, [resolvedFilters, activeFilters]);
 
     // Seed provided filters into store on first render (per dimension)
     useEffect(() => {
@@ -82,25 +97,29 @@ export function FilterBar({ filters = [] }: FilterBarProps) {
     };
 
     return (
-        <div className={styles.container}>
-            <div className={styles.headerRow}>
-                <div className={styles.headerTitle}>
-                    <Clock size={14} />
-                    <span>Filters</span>
+        <div className={`${styles.container} ${isCompact ? styles.compactContainer : ""}`}>
+            {!isCompact && (
+                <div className={styles.headerRow}>
+                    <div className={styles.headerTitle}>
+                        <Clock size={14} />
+                        <span>Filters</span>
+                        <span className={styles.headerCount}>{activeCount}</span>
+                    </div>
+                    <button
+                        className={styles.clearButton}
+                        onClick={() => {
+                            clearAllFilters();
+                            markFiltersActivated();
+                            setStaleStep(4);
+                        }}
+                    >
+                        Clear All
+                    </button>
                 </div>
-                <button
-                    className={styles.clearButton}
-                    onClick={() => {
-                        clearAllFilters();
-                        markFiltersActivated();
-                        setStaleStep(4);
-                    }}
-                >
-                    Clear All
-                </button>
-            </div>
+            )}
             {resolvedFilters.map((f) => {
                 const value = renderValue(f.dimension);
+                const isActive = Array.isArray(value) ? value.length > 0 : Boolean(value);
             if (f.type === "date-range") {
                 const options = f.options || [];
                 const preset = typeof value === "string" ? value : value?.preset;
@@ -108,41 +127,46 @@ export function FilterBar({ filters = [] }: FilterBarProps) {
                 const current = options[currentIndex] || options[0];
                 const rangeValue = typeof value === "object" ? value : {};
                 return (
-                    <div key={f.id} className={styles.filterSection}>
+                    <div
+                        key={f.id}
+                        className={`${styles.filterSection} ${isActive ? styles.filterSectionActive : ""} ${isCompact ? styles.compactSection : ""}`}
+                    >
                         <div className={styles.sectionHeader}>
                             <div className={styles.sectionTitle}>
                                 <Calendar size={16} />
                                 <span>{f.label || "Date Range"}</span>
                             </div>
-                            <span className={styles.valuePill}>
-                                {current?.value === "custom"
-                                    ? formatValue(value)
-                                    : formatValue(current?.label || current?.value || value)}
-                            </span>
+                            {!isCompact && (
+                                <span className={styles.valuePill}>
+                                    {current?.value === "custom"
+                                        ? formatValue(value)
+                                        : formatValue(current?.label || current?.value || value)}
+                                </span>
+                            )}
                         </div>
-                        <div className={styles.filterContent}>
-                            <div
-                                className={styles.periodSelect}
-                                onClick={() => {
-                                    if (options.length === 0) return;
-                                    const next = options[(currentIndex + 1) % options.length];
-                                    if (next?.value === "custom") {
+                        <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
+                            <Select
+                                size="middle"
+                                value={current?.value || current?.label || "custom"}
+                                options={options.map((opt) => ({
+                                    label: opt.label || String(opt.value),
+                                    value: opt.value
+                                }))}
+                                onChange={(nextValue) => {
+                                    if (nextValue === "custom") {
                                         updateFilter(f.dimension, {
                                             preset: "custom",
                                             from: rangeValue?.from || "",
                                             to: rangeValue?.to || ""
                                         });
                                     } else {
-                                        updateFilter(f.dimension, next?.value ?? value);
+                                        updateFilter(f.dimension, nextValue);
                                     }
                                 }}
-                            >
-                                <span>{current?.label || current?.value || "Select range"}</span>
-                                <ChevronDown size={14} />
-                            </div>
+                            />
                             {current?.value === "custom" && (
                                 <div className={styles.customDateRange}>
-                                    <input
+                                    <Input
                                         type="date"
                                         value={rangeValue?.from || ""}
                                         onChange={(e) => {
@@ -153,7 +177,7 @@ export function FilterBar({ filters = [] }: FilterBarProps) {
                                             });
                                         }}
                                     />
-                                    <input
+                                    <Input
                                         type="date"
                                         value={rangeValue?.to || ""}
                                         onChange={(e) => {
@@ -173,28 +197,33 @@ export function FilterBar({ filters = [] }: FilterBarProps) {
 
                 if (f.type === "multi-select") {
                     return (
-                        <div key={f.id} className={styles.filterSection}>
+                        <div
+                            key={f.id}
+                            className={`${styles.filterSection} ${isActive ? styles.filterSectionActive : ""} ${isCompact ? styles.compactSection : ""}`}
+                        >
                             <div className={styles.sectionHeader}>
                                 <div className={styles.sectionTitle}>
                                     <MapPin size={16} />
                                     <span>{f.label || f.dimension}</span>
                                 </div>
-                                <span className={styles.valuePill}>{formatValue(value)}</span>
+                                {!isCompact && (
+                                    <span className={styles.valuePill}>
+                                        {Array.isArray(value) ? `${value.length} selected` : formatValue(value)}
+                                    </span>
+                                )}
                             </div>
-                            <div className={styles.filterContent}>
-                                {(f.options || []).map((opt) => {
-                                    const checked = Array.isArray(value) ? value.includes(opt.value) : false;
-                                    return (
-                                        <label key={opt.value} className={styles.checkboxItem}>
-                                            <input
-                                                type="checkbox"
-                                                checked={checked}
-                                                onChange={() => toggleMulti(f.dimension, opt.value as string)}
-                                            />
-                                            <span>{opt.label}</span>
-                                        </label>
-                                    );
-                                })}
+                            <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
+                                <Select
+                                    mode="multiple"
+                                    size="middle"
+                                    value={Array.isArray(value) ? value : []}
+                                    options={(f.options || []).map((opt) => ({
+                                        label: opt.label,
+                                        value: opt.value
+                                    }))}
+                                    onChange={(next) => updateFilter(f.dimension, next)}
+                                    placeholder="Select values"
+                                />
                             </div>
                         </div>
                     );
@@ -205,26 +234,29 @@ export function FilterBar({ filters = [] }: FilterBarProps) {
                     const currentIndex = Math.max(0, options.findIndex(o => o.value === value));
                     const current = options[currentIndex] || options[0];
                     return (
-                        <div key={f.id} className={styles.filterSection}>
+                        <div
+                            key={f.id}
+                            className={`${styles.filterSection} ${isActive ? styles.filterSectionActive : ""} ${isCompact ? styles.compactSection : ""}`}
+                        >
                             <div className={styles.sectionHeader}>
                                 <div className={styles.sectionTitle}>
                                     <Layers size={16} />
                                     <span>{f.label || f.dimension}</span>
                                 </div>
-                                <span className={styles.valuePill}>{formatValue(current?.label || current?.value)}</span>
+                                {!isCompact && (
+                                    <span className={styles.valuePill}>{formatValue(current?.label || current?.value)}</span>
+                                )}
                             </div>
-                            <div className={styles.filterContent}>
-                                <div
-                                    className={styles.periodSelect}
-                                    onClick={() => {
-                                        if (options.length === 0) return;
-                                        const next = options[(currentIndex + 1) % options.length];
-                                        updateFilter(f.dimension, next?.value ?? value);
-                                    }}
-                                >
-                                    <span>{current?.label || current?.value || "Select"}</span>
-                                    <ChevronDown size={14} />
-                                </div>
+                            <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
+                                <Select
+                                    size="middle"
+                                    value={current?.value}
+                                    options={options.map((opt) => ({
+                                        label: opt.label || String(opt.value),
+                                        value: opt.value
+                                    }))}
+                                    onChange={(nextValue) => updateFilter(f.dimension, nextValue)}
+                                />
                             </div>
                         </div>
                     );

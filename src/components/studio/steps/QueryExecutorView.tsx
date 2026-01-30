@@ -149,7 +149,10 @@ export const QueryExecutorView: React.FC = () => {
         });
 
         try {
-            const data = await runQueryExecutor(queryMap, postgresUrl || undefined);
+            const data = await runQueryExecutor(queryMap, postgresUrl || undefined, {
+                connectorInstructions: schemaData?.connectorInstructions || "",
+                connectorType: schemaData?.connectorType || ""
+            });
             // Convert Record to array for display
             const resultsList = Object.entries(data).map(([id, result]: [string, any]) => ({
                 id,
@@ -200,7 +203,10 @@ export const QueryExecutorView: React.FC = () => {
                             setUserQueries(workingQueries);
 
                             // Re-execute repaired query
-                            const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined);
+                            const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined, {
+                                connectorInstructions: schemaData?.connectorInstructions || "",
+                                connectorType: schemaData?.connectorType || ""
+                            });
                             const fixed = rerun[res.id];
 
                             // Merge result onto the latest result set to avoid overwriting prior repairs
@@ -295,7 +301,10 @@ export const QueryExecutorView: React.FC = () => {
             setUserQueries(updatedQueries);
 
             // Now execute the repaired query
-            const data = await runQueryExecutor({ [queryId]: repairResult.sql }, postgresUrl || undefined);
+            const data = await runQueryExecutor({ [queryId]: repairResult.sql }, postgresUrl || undefined, {
+                connectorInstructions: schemaData?.connectorInstructions || "",
+                connectorType: schemaData?.connectorType || ""
+            });
             const newItem = data[queryId];
 
             const finalResults = executionResults?.map((r: any) =>

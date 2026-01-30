@@ -34,7 +34,7 @@ const { Title, Text, Paragraph } = Typography;
 const { Panel } = Collapse;
 
 export const QueryGeneratorView: React.FC = () => {
-    const { postgresUrl } = useConfigStore();
+    const { postgresUrl, dataSources, selectedDataSourceId } = useConfigStore();
     const {
         userPlan,
         aiPlan,
@@ -67,6 +67,7 @@ export const QueryGeneratorView: React.FC = () => {
     const [streamError, setStreamError] = useState<string | null>(null);
     const [isStreamingExecution, setIsStreamingExecution] = useState(false);
     const [streamExecutionError, setStreamExecutionError] = useState<string | null>(null);
+    const [showAllFilters, setShowAllFilters] = useState(false);
     const [streamQueries, setStreamQueries] = useState<Record<string, {
         widgetId: string;
         widgetTitle: string;
@@ -174,12 +175,22 @@ export const QueryGeneratorView: React.FC = () => {
         setError(null);
 
         try {
+            const selectedConnector = dataSources.find(ds => ds.id === selectedDataSourceId) || dataSources.find(ds => ds.connectionString) || null;
+            const schemaWithConnector = {
+                ...schemaData,
+                connectorInstructions: selectedConnector?.instructions || schemaData?.connectorInstructions,
+                connectorType: selectedConnector?.type || schemaData?.connectorType,
+                connectionString: selectedConnector?.connectionString || schemaData?.connectionString || postgresUrl
+            };
             const response = await fetch('/api/sql/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     plan,
-                    schema: schemaData,
+                    schema: schemaWithConnector,
+                    connectorInstructions: selectedConnector?.instructions || "",
+                    connectorType: selectedConnector?.type || "",
+                    connectionString: selectedConnector?.connectionString || postgresUrl,
                     filters: Object.fromEntries(activeFilters),
                     applyFilters: filtersActivated,
                     errorLog: sqlErrorLog
@@ -295,6 +306,13 @@ export const QueryGeneratorView: React.FC = () => {
         executionResultsRef.current = {};
 
         try {
+            const selectedConnector = dataSources.find(ds => ds.id === selectedDataSourceId) || dataSources.find(ds => ds.connectionString) || null;
+            const schemaWithConnector = {
+                ...schemaData,
+                connectorInstructions: selectedConnector?.instructions || schemaData?.connectorInstructions,
+                connectorType: selectedConnector?.type || schemaData?.connectorType,
+                connectionString: selectedConnector?.connectionString || schemaData?.connectionString || postgresUrl
+            };
             const response = await fetch('/api/stream-sql-engineer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
@@ -302,7 +320,13 @@ export const QueryGeneratorView: React.FC = () => {
                     queryPlan: plan,
                     queryValidation: sqlMap,
                     securityClearance: { approved: true },
-                    context: { postgresUrl }
+                    schema: schemaWithConnector,
+                    context: {
+                        postgresUrl,
+                        connectionString: selectedConnector?.connectionString || postgresUrl,
+                        connectorInstructions: selectedConnector?.instructions || "",
+                        connectorType: selectedConnector?.type || ""
+                    }
                 })
             });
 
@@ -598,6 +622,20 @@ export const QueryGeneratorView: React.FC = () => {
         if (typeof value === 'object') return JSON.stringify(value);
         return String(value);
     };
+    const formatFilterValueShort = (value: any) => {
+        if (value === null || value === undefined) return '—';
+        if (Array.isArray(value)) {
+            if (value.length === 0) return '—';
+            const preview = value.slice(0, 3).join(', ');
+            return value.length > 3 ? `${preview} +${value.length - 3}` : preview;
+        }
+        if (typeof value === 'object') {
+            const json = JSON.stringify(value);
+            return json.length > 60 ? `${json.slice(0, 57)}…` : json;
+        }
+        const text = String(value);
+        return text.length > 60 ? `${text.slice(0, 57)}…` : text;
+    };
 
     return (
         <div style={{ padding: '24px', height: '100%', overflowY: 'auto' }}>
@@ -642,32 +680,50 @@ export const QueryGeneratorView: React.FC = () => {
                         <div style={{ display: 'flex', flexDirection: 'column', gap: 12 }}>
                             {defaultFilters.length > 0 && (
                                 <div>
-                                    <Text strong>Defaults</Text>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
-                                        {defaultFilters.map((filter: any, idx: number) => (
-                                            <div key={`${filter.dimension}-${idx}`} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                                                <Text>{filter.dimension}</Text>
-                                                <Space size={4}>
-                                                    <Tag color="blue">{filter.type}</Tag>
-                                                    <Tag color="geekblue">{formatFilterValue(filter.value)}</Tag>
-                                                </Space>
-                                            </div>
-                                        ))}
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                        <Text strong>Defaults</Text>
+                                        <Tag color="blue">{defaultFilters.length}</Tag>
+                                    </div>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                                        {defaultFilters
+                                            .slice(0, showAllFilters ? defaultFilters.length : 3)
+                                            .map((filter: any, idx: number) => (
+                                                <div key={`${filter.dimension}-${idx}`} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '6px 10px', borderRadius: 10, background: 'rgba(255,255,255,0.03)' }}>
+                                                    <Text style={{ fontSize: 12 }}>{filter.dimension}</Text>
+                                                    <Space size={6}>
+                                                        <Tag color="blue">{filter.type}</Tag>
+                                                        <Tag color="geekblue">{formatFilterValueShort(filter.value)}</Tag>
+                                                    </Space>
+                                                </div>
+                                            ))}
                                     </div>
                                 </div>
                             )}
                             {activeFilters.size > 0 && (
                                 <div>
-                                    <Text strong>Overrides</Text>
-                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 6, marginTop: 6 }}>
-                                        {Array.from(activeFilters.entries()).map(([dimension, value]) => (
-                                            <div key={dimension} style={{ display: 'flex', justifyContent: 'space-between', gap: 8 }}>
-                                                <Text>{dimension}</Text>
-                                                <Tag color="gold">{formatFilterValue(value)}</Tag>
-                                            </div>
-                                        ))}
+                                    <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                        <Text strong>Overrides</Text>
+                                        <Tag color="purple">{activeFilters.size}</Tag>
+                                    </div>
+                                    <div style={{ display: 'flex', flexDirection: 'column', gap: 8, marginTop: 8 }}>
+                                        {Array.from(activeFilters.entries())
+                                            .slice(0, showAllFilters ? activeFilters.size : 3)
+                                            .map(([dimension, value]) => (
+                                                <div key={dimension} style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', gap: 12, padding: '6px 10px', borderRadius: 10, background: 'rgba(255,255,255,0.03)' }}>
+                                                    <Text style={{ fontSize: 12 }}>{dimension}</Text>
+                                                    <Space size={6}>
+                                                        <Tag color="purple">override</Tag>
+                                                        <Tag color="geekblue">{formatFilterValueShort(value)}</Tag>
+                                                    </Space>
+                                                </div>
+                                            ))}
                                     </div>
                                 </div>
+                            )}
+                            {(defaultFilters.length > 3 || activeFilters.size > 3) && (
+                                <Button size="small" type="text" onClick={() => setShowAllFilters((prev) => !prev)}>
+                                    {showAllFilters ? 'Show less' : 'Show all filters'}
+                                </Button>
                             )}
                         </div>
                     ) : (

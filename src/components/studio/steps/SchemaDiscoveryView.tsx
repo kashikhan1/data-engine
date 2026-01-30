@@ -422,6 +422,18 @@ export const SchemaDiscoveryView: React.FC = () => {
         }
     }, [schemaData, connectionStatus, postgresUrl, isProcessing, localLoading, handleDiscover]);
 
+    useEffect(() => {
+        if (autoRefreshMissingRef.current) return;
+        if (schemaData?.tables?.length) return;
+        if (isProcessing || localLoading) return;
+        if (connectionStatus !== "Connected" || !postgresUrl) return;
+        const storedTablesRaw = localStorage.getItem(SELECTED_TABLES_KEY);
+        const selectedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+        if (!Array.isArray(selectedTables) || selectedTables.length === 0) return;
+        autoRefreshMissingRef.current = true;
+        handleDiscover();
+    }, [schemaData, connectionStatus, postgresUrl, isProcessing, localLoading, handleDiscover]);
+
     const updateOverridesForTable = (tableName: string, updates: Record<string, any>) => {
         const next = {
             ...insightOverrides,

@@ -9,9 +9,10 @@
     align-items: center;
     justify-content: space-between;
     padding: 10px 12px;
-    background: rgba(17, 24, 39, 0.6);
-    border: 1px solid rgba(148, 163, 184, 0.12);
-    border-radius: 10px;
+    background: linear-gradient(140deg, rgba(15, 23, 42, 0.85), rgba(2, 6, 23, 0.9));
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    border-radius: 12px;
+    box-shadow: 0 12px 26px rgba(2, 8, 23, 0.35);
 }
 
 .headerTitle {
@@ -23,6 +24,19 @@
     text-transform: uppercase;
     letter-spacing: 0.1em;
     color: rgba(226, 232, 240, 0.8);
+}
+
+.headerCount {
+    display: inline-flex;
+    align-items: center;
+    justify-content: center;
+    min-width: 20px;
+    height: 20px;
+    border-radius: 999px;
+    background: rgba(59, 130, 246, 0.2);
+    color: rgba(191, 219, 254, 0.95);
+    font-size: 10px;
+    letter-spacing: 0.08em;
 }
 
 .clearButton {
@@ -49,9 +63,15 @@
     flex-direction: column;
     gap: 10px;
     padding: 12px;
-    border-radius: 12px;
-    background: rgba(15, 23, 42, 0.35);
-    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 14px;
+    background: rgba(15, 23, 42, 0.4);
+    border: 1px solid rgba(148, 163, 184, 0.14);
+    transition: border-color 0.2s, box-shadow 0.2s;
+}
+
+.filterSectionActive {
+    border-color: rgba(59, 130, 246, 0.5);
+    box-shadow: 0 12px 22px rgba(15, 23, 42, 0.35);
 }
 
 .sectionHeader {
@@ -75,7 +95,7 @@
     font-weight: 700;
     text-transform: uppercase;
     letter-spacing: 0.08em;
-    padding: 2px 8px;
+    padding: 3px 10px;
     border-radius: 999px;
     background: rgba(59, 130, 246, 0.15);
     color: rgba(191, 219, 254, 0.9);
@@ -87,26 +107,44 @@
     gap: 8px;
 }
 
-/* Specific filter types */
-.periodSelect {
-    display: flex;
+.compactContainer {
+    gap: 10px;
+}
+
+.compactSection {
+    flex-direction: row;
     align-items: center;
-    justify-content: space-between;
     padding: 10px 12px;
-    background: rgba(15, 23, 42, 0.7);
-    border: 1px solid rgba(148, 163, 184, 0.2);
-    border-radius: 10px;
-    font-size: 13px;
-    color: rgba(226, 232, 240, 0.9);
-    cursor: pointer;
-    transition: all 0.2s;
+    gap: 12px;
+    background: linear-gradient(140deg, rgba(17, 25, 40, 0.92), rgba(10, 14, 22, 0.96));
+    border-radius: 14px;
 }
 
-.periodSelect:hover {
-    border-color: rgba(59, 130, 246, 0.5);
-    background: rgba(30, 41, 59, 0.8);
+.compactSection .sectionHeader {
+    flex: 1 1 auto;
+    min-width: 160px;
 }
 
+.compactContent {
+    flex-direction: row;
+    align-items: center;
+    gap: 10px;
+    min-width: 220px;
+}
+
+.compactContent :global(.ant-select-selector) {
+    height: 36px !important;
+    display: flex !important;
+    align-items: center !important;
+}
+
+.optionGrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(92px, 1fr));
+    gap: 8px;
+}
+
+/* Specific filter types */
 .dateRange {
     display: flex;
     gap: 8px;
@@ -117,35 +155,37 @@
     gap: 8px;
 }
 
-.customDateRange input {
-    flex: 1;
-    min-width: 0;
-    padding: 8px 10px;
-    border-radius: 8px;
-    border: 1px solid rgba(148, 163, 184, 0.2);
+.customDateRange :global(.ant-input) {
     background: rgba(15, 23, 42, 0.7);
+    border: 1px solid rgba(148, 163, 184, 0.2);
     color: rgba(226, 232, 240, 0.9);
     font-size: 12px;
+    border-radius: 10px;
 }
 
-.customDateRange input:focus {
-    outline: none;
+.customDateRange :global(.ant-input:focus),
+.customDateRange :global(.ant-input:hover) {
     border-color: rgba(59, 130, 246, 0.6);
+    box-shadow: none;
 }
 
-.checkboxItem {
-    display: flex;
-    align-items: center;
-    gap: 8px;
-    font-size: 13px;
-    color: var(--text-secondary);
-    cursor: pointer;
+.filterContent :global(.ant-select-selector) {
+    background: rgba(15, 23, 42, 0.7) !important;
+    border: 1px solid rgba(148, 163, 184, 0.2) !important;
+    border-radius: 10px !important;
+    color: rgba(226, 232, 240, 0.9) !important;
 }
 
-.checkboxItem input {
-    accent-color: var(--primary);
+.filterContent :global(.ant-select-selection-placeholder) {
+    color: rgba(148, 163, 184, 0.7) !important;
 }
 
-.checkboxItem:hover {
-    color: var(--text-primary);
+.filterContent :global(.ant-select-selection-item) {
+    color: rgba(226, 232, 240, 0.95) !important;
+}
+
+.filterContent :global(.ant-select-multiple .ant-select-selection-item) {
+    background: rgba(59, 130, 246, 0.18) !important;
+    border: 1px solid rgba(59, 130, 246, 0.5) !important;
+    color: #e2e8f0 !important;
 }

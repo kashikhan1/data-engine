@@ -45,7 +45,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const { isStreaming, steps, error: runError, startRun, handleEvent, endRun } = useRunStore();
-    const { recentQueries, addToRecentQueries, activeFilters, filtersActivated } = useDashboardStore();
+    const { recentQueries, addToRecentQueries, activeFilters, filtersActivated, setDashboard } = useDashboardStore();
     const {
         schemaData,
         userPlan,
@@ -98,6 +98,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const [planDraft, setPlanDraft] = useState('');
     const [sqlDrafts, setSqlDrafts] = useState<Record<string, string>>({});
     const [showConnectorPicker, setShowConnectorPicker] = useState(true);
+    const [pipelineLogs, setPipelineLogs] = useState<string[]>([]);
+    const [pipelineStageLogs, setPipelineStageLogs] = useState<{
+        sql: string[];
+        execute: string[];
+        dashboard: string[];
+    }>({ sql: [], execute: [], dashboard: [] });
+    const [showLivePanel, setShowLivePanel] = useState(true);
     const connectors = (dataSources || []).filter((ds) => {
         const type = ds.type?.toLowerCase() || "";
         return type.includes("mcp") || type.includes("postgres") || type.includes("mssql");
@@ -185,6 +192,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         const runId = `local_${Date.now()}`;
         const startedAt = new Date().toISOString();
         startRun(runId);
+        setDashboardConfig(null);
+        setDashboard(null);
         setIsPipelineRunning(true);
         setProcessing(true);
         setError(null);
@@ -380,7 +389,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             queryList.forEach((q) => {
                 execQueryMap[q.id] = q.sql;
             });
-            const execResults = await runQueryExecutor(execQueryMap, postgresUrl || undefined);
+            const execResults = await runQueryExecutor(execQueryMap, postgresUrl || undefined, {
+                connectorInstructions: selectedConnector?.instructions || "",
+                connectorType: selectedConnector?.type || ""
+            });
             const resultsList = Object.entries(execResults).map(([id, result]: [string, any]) => ({
                 id,
                 ...result,
@@ -572,6 +584,9 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 body: JSON.stringify({
                     plan: planToUse,
                     schema: schemaToUse,
+                    connectorInstructions: selectedConnector?.instructions || "",
+                    connectorType: selectedConnector?.type || "",
+                    connectionString: selectedConnector?.connectionString || postgresUrl,
                     filters: Object.fromEntries(activeFilters),
                     applyFilters: filtersActivated,
                     errorLog: sqlErrorLog
@@ -628,7 +643,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         queryList.forEach((q: any) => {
             queryMap[q.id] = q.sql;
         });
-        const execResults = await runQueryExecutor(queryMap, postgresUrl || undefined);
+        const execResults = await runQueryExecutor(queryMap, postgresUrl || undefined, {
+            connectorInstructions: selectedConnector?.instructions || "",
+            connectorType: selectedConnector?.type || ""
+        });
         const resultsList = Object.entries(execResults).map(([id, result]: [string, any]) => ({
             id,
             ...result,
@@ -660,7 +678,12 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                             widgetGoal: widgetInfo.goal,
                             originalSql,
                             errorMessage: res.error || 'Execution failed',
-                            schema: schemaData,
+                            schema: {
+                                ...schemaData,
+                                connectorInstructions: selectedConnector?.instructions || schemaData?.connectorInstructions,
+                                connectorType: selectedConnector?.type || schemaData?.connectorType,
+                                connectionString: selectedConnector?.connectionString || schemaData?.connectionString || postgresUrl
+                            },
                             errorLog: sqlErrorLog,
                             connectionString: postgresUrl || undefined
                         });
@@ -684,7 +707,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     .map(async (entry: any) => {
                         const { id, repairResult } = entry;
                         nextQueries = nextQueries.map((q: any) => q.id === id ? { ...q, sql: repairResult.sql } : q);
-                        const rerun = await runQueryExecutor({ [id]: repairResult.sql }, postgresUrl || undefined);
+                        const rerun = await runQueryExecutor({ [id]: repairResult.sql }, postgresUrl || undefined, {
+                            connectorInstructions: selectedConnector?.instructions || "",
+                            connectorType: selectedConnector?.type || ""
+                        });
                         return { id, fixed: rerun[id], repairResult };
                     });
 
@@ -718,6 +744,198 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         return finalDashboard;
     };
 
+    const streamSqlAndExecuteParallel = async (
+        planToUse: any,
+        schemaToUse: any,
+        sendStep?: (step: any, status: any, message?: string) => void
+    ) => {
+        setStep(3);
+        sendStep?.("sql", "running", "Generating SQL");
+        setActiveOutputTab('sql');
+        setShowPipelineOutput(true);
+        setPipelineLogs([]);
+        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
+
+        const response = await fetch('/api/widget-pipeline/stream', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({
+                plan: planToUse,
+                schema: schemaToUse,
+                filters: Object.fromEntries(activeFilters),
+                applyFilters: filtersActivated,
+                errorLog: sqlErrorLog,
+                connectorType: selectedConnector?.type || "",
+                connectorInstructions: selectedConnector?.instructions || "",
+                connectionString: selectedConnector?.connectionString || postgresUrl
+            })
+        });
+        if (!response.ok || !response.body) {
+            throw new Error("SQL generator connection failed.");
+        }
+
+        const reader = response.body.getReader();
+        const decoder = new TextDecoder();
+        let buffer = '';
+        const queryMap: Record<string, string> = {};
+        const resultsMap: Record<string, any> = {};
+        const inflight = new Map<string, Promise<any>>();
+        let executeStarted = false;
+        let dashboardStarted = false;
+
+        const upsertQueries = () => {
+            const queryList = Object.entries(queryMap).map(([id, sql]) => ({
+                id,
+                sql,
+                title: planToUse.widgets?.find((w: any) => w.id === id)?.title || id
+            }));
+            setAiQueries(queryList);
+            setUserQueries(queryList);
+            return queryList;
+        };
+
+        const upsertResults = (queryList: any[]) => {
+            const resultsList = Object.entries(resultsMap).map(([id, result]: [string, any]) => ({
+                id,
+                ...result,
+                title: queryList.find((q) => q.id === id)?.title || id
+            }));
+            setExecutionResults(resultsList);
+            return resultsList;
+        };
+
+        const updateDashboardPartial = async (queryList: any[], resultsList: any[]) => {
+            if (!dashboardStarted) {
+                dashboardStarted = true;
+                setStep(5);
+                sendStep?.("viz", "running", "Assembling dashboard");
+            }
+            const partial = await assembleFinalDashboard(planToUse, queryList, resultsList, [], schemaToUse?.filterCandidates);
+            setDashboardConfig(partial);
+            handleEvent({
+                type: "partial_dashboard",
+                dashboard: partial,
+                ts: new Date().toISOString()
+            } as any);
+        };
+
+        const validateSql = (sql: string) => {
+            const trimmed = String(sql || '').trim();
+            if (!trimmed.toLowerCase().startsWith('select')) {
+                return { ok: false, error: 'Validation failed: SQL must start with SELECT.' };
+            }
+            const isMssql = (() => {
+                const lower = String(postgresUrl || "").toLowerCase();
+                return lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
+            })();
+            const blocked = ['drop', 'delete', 'truncate', 'update', 'insert', 'alter'];
+            if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
+                return { ok: false, error: 'Validation failed: unsafe SQL detected.' };
+            }
+            if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
+                return { ok: false, error: 'Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH.' };
+            }
+            if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
+                return { ok: false, error: 'Validation failed: PostgreSQL does not support TOP. Use LIMIT.' };
+            }
+            return { ok: true };
+        };
+
+        while (true) {
+            const { done, value } = await reader.read();
+            if (done) break;
+            buffer += decoder.decode(value, { stream: true });
+            const lines = buffer.split('\n');
+            buffer = lines.pop() || '';
+            for (const line of lines) {
+                const trimmed = line.trim();
+                if (!trimmed.startsWith('data:')) continue;
+                const payload = JSON.parse(trimmed.slice(5).trim());
+                if (payload.status === 'error') {
+                    throw new Error(payload.message || 'Widget pipeline failed.');
+                }
+                const widgetId = payload.widgetId as string | undefined;
+                if (payload.status === 'sql_builder_running' && widgetId) {
+                    setPipelineLogs((prev) => [...prev, `SQL Builder → ${widgetId} started`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Builder: ${widgetId}`] }));
+                }
+                if (payload.status === 'sql_builder_done' && widgetId && payload.sql) {
+                    queryMap[widgetId] = payload.sql;
+                    upsertQueries();
+                    setPipelineLogs((prev) => [...prev, `SQL Builder → ${widgetId} done`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Built: ${widgetId}`] }));
+                }
+                if (payload.status === 'sql_validator_running' && widgetId) {
+                    setPipelineLogs((prev) => [...prev, `SQL Validator → ${widgetId} running`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Validate: ${widgetId}`] }));
+                }
+                if (payload.status === 'sql_validator_fixed' && widgetId && payload.sql) {
+                    queryMap[widgetId] = payload.sql;
+                    upsertQueries();
+                    setPipelineLogs((prev) => [...prev, `SQL Validator → ${widgetId} fixed`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Fixed: ${widgetId}`] }));
+                }
+                if (payload.status === 'execution_running' && !executeStarted) {
+                    executeStarted = true;
+                    setStep(4);
+                    sendStep?.("execute", "running", "Executing queries");
+                }
+                if (payload.status === 'execution_running' && widgetId) {
+                    setPipelineLogs((prev) => [...prev, `Executor → ${widgetId} running`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Running: ${widgetId}`] }));
+                }
+                if (payload.status === 'manual_required' && widgetId) {
+                    setPipelineLogs((prev) => [...prev, `Manual fix needed → ${widgetId}`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Manual: ${widgetId}`] }));
+                }
+                if (payload.status === 'execution_done' && widgetId && payload.result) {
+                    resultsMap[widgetId] = payload.result;
+                    const queryList = upsertQueries();
+                    const resultsList = upsertResults(queryList);
+                    const task = updateDashboardPartial(queryList, resultsList);
+                    inflight.set(widgetId, task);
+                    setPipelineLogs((prev) => [...prev, `Executor → ${widgetId} done`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Done: ${widgetId}`] }));
+                }
+                if (payload.status === 'formatter_done' && widgetId && payload.result) {
+                    resultsMap[widgetId] = payload.result;
+                    const queryList = upsertQueries();
+                    const resultsList = upsertResults(queryList);
+                    const task = updateDashboardPartial(queryList, resultsList);
+                    inflight.set(widgetId, task);
+                    setPipelineLogs((prev) => [...prev, `Formatter → ${widgetId} ready`]);
+                    setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, `Widget ready: ${widgetId}`] }));
+                }
+            }
+        }
+
+        await Promise.all(Array.from(inflight.values()));
+        sendStep?.("execute", "done", "Execution complete");
+        setPipelineLogs((prev) => [...prev, "Dashboard → assembling final output"]);
+        setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, "Assembling dashboard"] }));
+
+        const queryList = upsertQueries();
+        const resultsList = upsertResults(queryList);
+        let insights: string[] = [];
+        try {
+            insights = await runNarrativeGenerator(resultsList as any[]);
+            sendStep?.("narrative", "done", "Insights ready");
+        } catch {
+            insights = ["Data retrieval successful. Full analysis ready for inspection."];
+        }
+
+        const finalDashboard = await assembleFinalDashboard(planToUse, queryList, resultsList, insights, schemaToUse?.filterCandidates);
+        setDashboardConfig(finalDashboard);
+        handleEvent({
+            type: "partial_dashboard",
+            dashboard: finalDashboard,
+            ts: new Date().toISOString()
+        } as any);
+        sendStep?.("viz", "done", "Dashboard ready");
+        setPipelineLogs((prev) => [...prev, "Dashboard → ready"]);
+        setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, "Dashboard ready"] }));
+    };
+
     const rerunFromPlan = async () => {
         const schemaToUse = await ensureSchema();
         if (!schemaToUse) throw new Error("Schema context missing. Please run Schema Discovery first.");
@@ -731,14 +949,29 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         };
         setAiPlan(nextPlan);
         setUserPlan(nextPlan);
-        setStep(3);
-        const queryList = await generateSql(nextPlan, schemaToUse);
-        setAiQueries(queryList);
-        setUserQueries(queryList);
-        setStep(4);
-        const resultsList = await executeQueries(queryList);
-        setStep(5);
-        await assembleDashboard(nextPlan, queryList, resultsList, schemaToUse);
+        const runId = `local_continue_${Date.now()}`;
+        startRun(runId);
+        setDashboardConfig(null);
+        setDashboard(null);
+        setIsPipelineRunning(true);
+        setProcessing(true);
+        setError(null);
+        const sendStep = (step: any, status: any, message?: string) => {
+            handleEvent({
+                type: "step",
+                step,
+                status,
+                message,
+                ts: new Date().toISOString()
+            } as any);
+        };
+        try {
+            await streamSqlAndExecuteParallel(nextPlan, schemaToUse, sendStep);
+            endRun(true);
+        } finally {
+            setProcessing(false);
+            setIsPipelineRunning(false);
+        }
     };
 
     const continueToSql = async () => {
@@ -803,6 +1036,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         if (activeOutputTab === 'sql') {
             return (
                 <div className={styles.outputBody}>
+                    {pipelineLogs.length > 0 && (
+                        <div className={styles.outputLog}>
+                            {pipelineLogs.slice(-8).map((line, idx) => (
+                                <div key={`log-${idx}`} className={styles.outputLogLine}>{line}</div>
+                            ))}
+                        </div>
+                    )}
                     {queries.length > 0 ? (
                         <div className={styles.outputList}>
                             {queries.map((q: any) => (
@@ -829,6 +1069,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         if (activeOutputTab === 'execute') {
             return (
                 <div className={styles.outputBody}>
+                    {pipelineLogs.length > 0 && (
+                        <div className={styles.outputLog}>
+                            {pipelineLogs.slice(-8).map((line, idx) => (
+                                <div key={`log-exec-${idx}`} className={styles.outputLogLine}>{line}</div>
+                            ))}
+                        </div>
+                    )}
                     {executionSummary.length > 0 ? (
                         <div className={styles.outputList}>
                             {executionSummary.map((res: any) => (
@@ -852,6 +1099,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
         return (
             <div className={styles.outputBody}>
+                {pipelineLogs.length > 0 && (
+                    <div className={styles.outputLog}>
+                        {pipelineLogs.slice(-8).map((line, idx) => (
+                            <div key={`log-dash-${idx}`} className={styles.outputLogLine}>{line}</div>
+                        ))}
+                    </div>
+                )}
                 <div className={styles.outputMeta}>
                     <span>Dashboard: {dashboardConfig?.name || '—'}</span>
                     <span>Widgets: {dashboardConfig?.widgets?.length || 0}</span>
@@ -1050,6 +1304,50 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                         </button>
                                     ))}
                                 </div>
+                                <div className={styles.livePanelHeader}>
+                                    <span className={styles.livePanelTitle}>Live Stream</span>
+                                    <button
+                                        type="button"
+                                        className={styles.liveToggle}
+                                        onClick={() => setShowLivePanel((prev) => !prev)}
+                                    >
+                                        {showLivePanel ? 'Hide' : 'Show'}
+                                    </button>
+                                </div>
+                                {showLivePanel && (
+                                    <div className={styles.livePanel}>
+                                        <div className={styles.liveColumn}>
+                                            <div className={styles.liveTitle}>SQL</div>
+                                            {(pipelineStageLogs.sql.length === 0) ? (
+                                                <div className={styles.liveEmpty}>Waiting for SQL…</div>
+                                            ) : (
+                                                pipelineStageLogs.sql.slice(-5).map((line, idx) => (
+                                                    <div key={`sql-log-${idx}`} className={styles.liveLine}>{line}</div>
+                                                ))
+                                            )}
+                                        </div>
+                                        <div className={styles.liveColumn}>
+                                            <div className={styles.liveTitle}>Executor</div>
+                                            {(pipelineStageLogs.execute.length === 0) ? (
+                                                <div className={styles.liveEmpty}>Waiting for execution…</div>
+                                            ) : (
+                                                pipelineStageLogs.execute.slice(-5).map((line, idx) => (
+                                                    <div key={`exec-log-${idx}`} className={styles.liveLine}>{line}</div>
+                                                ))
+                                            )}
+                                        </div>
+                                        <div className={styles.liveColumn}>
+                                            <div className={styles.liveTitle}>Dashboard</div>
+                                            {(pipelineStageLogs.dashboard.length === 0) ? (
+                                                <div className={styles.liveEmpty}>Waiting for widgets…</div>
+                                            ) : (
+                                                pipelineStageLogs.dashboard.slice(-5).map((line, idx) => (
+                                                    <div key={`dash-log-${idx}`} className={styles.liveLine}>{line}</div>
+                                                ))
+                                            )}
+                                        </div>
+                                    </div>
+                                )}
                                 {renderPipelineOutput()}
                             </>
                         )}
@@ -1061,7 +1359,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
             {/* Suggestions */}
             <AnimatePresence>
-                {showSuggestions && messages.length <= 1 && (
+                {showSuggestions && !messages.some((m) => m.type === "user") && (
                     <motion.div
                         initial={{ opacity: 0, y: 10 }}
                         animate={{ opacity: 1, y: 0 }}

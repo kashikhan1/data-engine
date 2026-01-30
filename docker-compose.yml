@@ -10,3 +10,8 @@ services:
     environment:
       NODE_ENV: production
     restart: unless-stopped
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.smart-agent.rule=Host(`smart-agent.localhost`)"
+      - "traefik.http.routers.smart-agent.entrypoints=web"
+      - "traefik.http.services.smart-agent.loadbalancer.server.port=3000"

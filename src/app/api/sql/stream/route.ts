@@ -6,7 +6,7 @@ export const maxDuration = 900; // 15 minutes
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
-        const { plan, schema, filters, errorLog, applyFilters } = body;
+        const { plan, schema, filters, errorLog, applyFilters, connectorInstructions, connectorType, connectionString } = body;
 
         if (!plan || !schema) {
             return new Response("Missing plan or schema", { status: 400 });
@@ -20,7 +20,13 @@ export async function POST(request: NextRequest) {
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "started" })}\n\n`));
 
                     // Run generator
-                    const queries = await runQueryGenerator(plan, schema, filters || {}, errorLog || [], Boolean(applyFilters));
+                    const schemaForPrompt = {
+                        ...schema,
+                        connectorInstructions: connectorInstructions || schema?.connectorInstructions,
+                        connectorType: connectorType || schema?.connectorType,
+                        connectionString: schema?.connectionString || connectionString || schema?.dbUrl || schema?.postgresUrl || schema?.mssqlUrl
+                    };
+                    const queries = await runQueryGenerator(plan, schemaForPrompt, filters || {}, errorLog || [], Boolean(applyFilters));
 
                     const entries = Object.entries(queries || {});
                     if (entries.length > 0) {

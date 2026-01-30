@@ -16,7 +16,7 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
     const [isMcpModalOpen, setIsMcpModalOpen] = useState(false);
     const [isPgModalOpen, setIsPgModalOpen] = useState(false);
     const [dbType, setDbType] = useState<'PostgreSQL' | 'MSSQL'>('PostgreSQL');
-    const { dataSources, connectionStatus, discoveredTables, postgresUrl, setDiscoveredTables } = useConfigStore();
+    const { dataSources, connectionStatus, discoveredTables, postgresUrl, setDiscoveredTables, addDataSource } = useConfigStore();
     const [selectedTables, setSelectedTables] = useState<string[]>([]);
     const [activeTable, setActiveTable] = useState<string | null>(null);
     const [tableSchemas, setTableSchemas] = useState<Record<string, any>>({});
@@ -25,6 +25,8 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
     const [isSchemaSyncing, setIsSchemaSyncing] = useState(false);
     const [schemaError, setSchemaError] = useState<string | null>(null);
     const [schemaSearch, setSchemaSearch] = useState('');
+    const [showSchemaPanel, setShowSchemaPanel] = useState(true);
+    const [connectorInstructions, setConnectorInstructions] = useState('');
 
     const COLUMN_TOGGLES_KEY = 'schema_column_toggles';
     const SELECTED_TABLES_KEY = 'schema_selected_tables';
@@ -183,6 +185,11 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
 
     const healthyCount = dataSources.filter(ds => ds.status === 'Connected').length;
     const errorCount = dataSources.filter(ds => ds.status === 'Error' || ds.status === 'Auth Error').length;
+    const selectedDataSource = dataSources.find((ds) => ds.id === selectedId) || dataSources[0] || null;
+
+    useEffect(() => {
+        setConnectorInstructions(selectedDataSource?.instructions || '');
+    }, [selectedDataSource?.id]);
 
     return (
         <main className="flex-1 overflow-y-auto bg-[#0b0d11] p-10 canvas-grid custom-scrollbar">
@@ -267,11 +274,11 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                         </div>
                         <div className="divide-y divide-[#2d3748]/50">
                             {dataSources.map((ds) => (
-                                <div
-                                    key={ds.id}
-                                    onClick={() => onSelect(ds.id)}
-                                    className={`grid grid-cols-12 px-8 py-6 items-center cursor-pointer transition-all group ${selectedId === ds.id ? 'bg-[#135bec]/10 relative shadow-[inset_0_0_30px_rgba(19,91,236,0.05)]' : 'hover:bg-white/5'}`}
-                                >
+                                <div key={ds.id} className={`${selectedId === ds.id ? 'bg-[#135bec]/10 relative shadow-[inset_0_0_30px_rgba(19,91,236,0.05)]' : ''}`}>
+                                    <div
+                                        onClick={() => onSelect(ds.id)}
+                                        className={`grid grid-cols-12 px-8 py-6 items-center cursor-pointer transition-all group ${selectedId === ds.id ? 'relative' : 'hover:bg-white/5'}`}
+                                    >
                                     {selectedId === ds.id && <div className="absolute left-0 top-0 bottom-0 w-1 bg-[#135bec] shadow-[0_0_15px_rgba(19,91,236,0.8)]"></div>}
                                     <div className="col-span-4 flex items-center gap-4">
                                         <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all shadow-sm ${selectedId === ds.id ? 'bg-[#135bec]/20 text-[#135bec]' : 'bg-[#1a202c] text-slate-500 group-hover:text-white'}`}>
@@ -303,6 +310,35 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                         <span className="text-xs text-slate-500 font-bold tracking-tight">{ds.lastSync}</span>
                                     </div>
                                 </div>
+                                {selectedId === ds.id && ds.type.toLowerCase().includes('mcp') && (
+                                    <div className="px-8 pb-8">
+                                        <div className="bg-[#0f1218] border border-[#2d3748] rounded-[16px] p-5">
+                                            <div className="flex items-center justify-between mb-3">
+                                                <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">
+                                                    MCP Instructions
+                                                </div>
+                                                <button
+                                                    onClick={() => {
+                                                        addDataSource({ ...ds, instructions: connectorInstructions });
+                                                    }}
+                                                    className="px-3 py-1.5 rounded-lg bg-[#135bec] text-white text-[10px] font-black uppercase tracking-widest shadow-lg"
+                                                >
+                                                    Save
+                                                </button>
+                                            </div>
+                                            <textarea
+                                                value={connectorInstructions}
+                                                onChange={(e) => setConnectorInstructions(e.target.value)}
+                                                placeholder="Example: Use TOP for MSSQL. Always filter by DATUM_START. Avoid JSON columns."
+                                                className="w-full min-h-[120px] bg-[#0b0f16] border border-[#1b2230] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
+                                            />
+                                            <div className="text-[11px] text-slate-500 mt-3">
+                                                These instructions are injected into the SQL Engineer prompt for this connector.
+                                            </div>
+                                        </div>
+                                    </div>
+                                )}
+                            </div>
                             ))}
                             {dataSources.length === 0 && (
                                 <div className="px-8 py-12 text-center text-slate-500">
@@ -313,6 +349,42 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                     </div>
                 </div>
 
+                <div className="space-y-4">
+                        <div className="flex items-center justify-between">
+                            <div>
+                                <h2 className="text-2xl font-extrabold text-white tracking-tight">MCP Instructions</h2>
+                                <p className="text-xs text-slate-500 mt-1">Guidance for SQL generation on the selected connector.</p>
+                            </div>
+                            {selectedDataSource ? (
+                                <button
+                                    onClick={() => {
+                                        addDataSource({ ...selectedDataSource, instructions: connectorInstructions });
+                                    }}
+                                    className="px-4 py-2 rounded-lg bg-[#135bec] text-white text-[11px] font-black uppercase tracking-widest shadow-lg"
+                                >
+                                    Save Instructions
+                                </button>
+                            ) : (
+                                <span className="text-[11px] text-slate-500">Select a connection above</span>
+                            )}
+                        </div>
+                        <div className="bg-[#111318] border border-[#2d3748] rounded-[18px] p-6">
+                            <label className="block text-[10px] text-slate-500 font-black uppercase tracking-[3px] mb-3">
+                                {selectedDataSource ? `${selectedDataSource.name} • ${selectedDataSource.type}` : 'No connector selected'}
+                            </label>
+                            <textarea
+                                value={connectorInstructions}
+                                onChange={(e) => setConnectorInstructions(e.target.value)}
+                                placeholder="Example: Use TOP for MSSQL. Always filter by DATUM_START. Avoid JSON columns."
+                                className="w-full min-h-[140px] bg-[#0b0f16] border border-[#1b2230] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
+                                disabled={!selectedDataSource}
+                            />
+                            <div className="text-[11px] text-slate-500 mt-3">
+                                These instructions are injected into the SQL Engineer prompt for this connector.
+                            </div>
+                        </div>
+                    </div>
+
                 {/* Connected Schema */}
                 <div className="space-y-6">
                     <div className="flex items-center justify-between">
@@ -321,6 +393,12 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                             <p className="text-xs text-slate-500 mt-1">Selected tables are prioritized for planning and SQL generation.</p>
                         </div>
                         <div className="flex items-center gap-3">
+                            <button
+                                onClick={() => setShowSchemaPanel((prev) => !prev)}
+                                className="px-3 py-2 rounded-lg border border-[#2d3748] text-[11px] font-black uppercase tracking-widest text-slate-400 hover:text-white hover:border-[#4b5563] transition-all"
+                            >
+                                {showSchemaPanel ? 'Collapse' : 'Expand'}
+                            </button>
                             <button
                                 onClick={saveSelection}
                                 disabled={isSchemaSyncing || selectedTables.length === 0}
@@ -336,25 +414,27 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                             </span>
                         </div>
                     </div>
-                    <div className="bg-[#0f1218] border border-[#242a36] rounded-[18px] px-4 py-3 flex items-center justify-between">
-                        <div className="flex items-center gap-3 text-xs text-slate-400 font-bold uppercase tracking-widest">
-                            <span>Selected: {selectedTables.length}</span>
-                            <span className="text-slate-600">•</span>
-                            <span>Other: {otherTables.length}</span>
-                            <span className="text-slate-600">•</span>
-                            <span>Total: {discoveredTables.length}</span>
-                        </div>
-                        <div className="relative w-64">
-                            <span className="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-slate-600 text-[16px]">search</span>
-                            <input
-                                value={schemaSearch}
-                                onChange={(e) => setSchemaSearch(e.target.value)}
-                                placeholder="Search tables..."
-                                className="w-full pl-9 pr-3 py-2 text-xs bg-[#0b0f16] border border-[#1b2230] rounded-lg text-slate-300 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
-                            />
-                        </div>
-                    </div>
-                    <div className="grid grid-cols-12 gap-6">
+                    {showSchemaPanel && (
+                        <>
+                            <div className="bg-[#0f1218] border border-[#242a36] rounded-[18px] px-4 py-3 flex items-center justify-between">
+                                <div className="flex items-center gap-3 text-xs text-slate-400 font-bold uppercase tracking-widest">
+                                    <span>Selected: {selectedTables.length}</span>
+                                    <span className="text-slate-600">•</span>
+                                    <span>Other: {otherTables.length}</span>
+                                    <span className="text-slate-600">•</span>
+                                    <span>Total: {discoveredTables.length}</span>
+                                </div>
+                                <div className="relative w-64">
+                                    <span className="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-slate-600 text-[16px]">search</span>
+                                    <input
+                                        value={schemaSearch}
+                                        onChange={(e) => setSchemaSearch(e.target.value)}
+                                        placeholder="Search tables..."
+                                        className="w-full pl-9 pr-3 py-2 text-xs bg-[#0b0f16] border border-[#1b2230] rounded-lg text-slate-300 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
+                                    />
+                                </div>
+                            </div>
+                            <div className="grid grid-cols-12 gap-6">
                         <div className="col-span-12 lg:col-span-5 bg-[#0f1218] border border-[#242a36] rounded-[22px] p-6">
                             <div className="flex items-center justify-between mb-4">
                                 <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">Selected Tables</div>
@@ -491,7 +571,9 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                 <div className="mt-4 text-sm text-red-400">{schemaError}</div>
                             )}
                         </div>
-                    </div>
+                            </div>
+                        </>
+                    )}
                 </div>
 
                 {/* Available Integrations Section */}

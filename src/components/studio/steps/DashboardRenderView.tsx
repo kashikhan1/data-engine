@@ -100,6 +100,24 @@ export const DashboardRenderView: React.FC = () => {
         queue.forEach((fn) => fn());
     }, [messageTick]);
 
+    const cardShellStyle = {
+        borderRadius: 16,
+        border: '1px solid rgba(148, 163, 184, 0.12)',
+        background: 'linear-gradient(135deg, rgba(15, 23, 42, 0.85), rgba(2, 6, 23, 0.9))',
+        boxShadow: '0 18px 38px rgba(2, 8, 23, 0.45)'
+    } as const;
+
+    const dateFilters = useMemo(() => {
+        return (dashboard?.filters || []).filter((f: any) => f.type === "date-range");
+    }, [dashboard]);
+
+    const statCardStyle = {
+        padding: 16,
+        borderRadius: 14,
+        background: 'rgba(15, 23, 42, 0.7)',
+        border: '1px solid rgba(148,163,184,0.12)'
+    } as const;
+
     // Compute layout and widgets for the canvas
     const widgets = useMemo(() => {
         if (!dashboard?.widgets) return [];
@@ -295,7 +313,10 @@ export const DashboardRenderView: React.FC = () => {
                 queryMap[q.id] = q.sql;
             });
 
-            const data = await runQueryExecutor(queryMap, postgresUrl || undefined);
+            const data = await runQueryExecutor(queryMap, postgresUrl || undefined, {
+                connectorInstructions: schemaData?.connectorInstructions || "",
+                connectorType: schemaData?.connectorType || ""
+            });
             let resultsList = Object.entries(data).map(([id, result]: [string, any]) => ({
                 id,
                 ...result,
@@ -331,7 +352,10 @@ export const DashboardRenderView: React.FC = () => {
                         connectionString: postgresUrl || undefined
                     });
                     query.sql = repairResult.sql;
-                    const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined);
+                    const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined, {
+                        connectorInstructions: schemaData?.connectorInstructions || "",
+                        connectorType: schemaData?.connectorType || ""
+                    });
                     const fixed = rerun[res.id];
                     resultsList = resultsList.map((r: any) =>
                         r.id === res.id ? { ...fixed, id: res.id, title: res.title } : r
@@ -428,25 +452,30 @@ export const DashboardRenderView: React.FC = () => {
             {contextHolder}
             {messageContextHolder}
             <Header style={{ background: 'transparent', padding: '0 24px', height: 'auto', marginBottom: 16 }}>
-                <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', padding: '16px 20px', borderRadius: 16, border: '1px solid #242a36', background: '#0f1218' }}>
+                <div style={{ ...cardShellStyle, padding: '18px 22px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
                     <div>
                         <Title level={4} style={{ margin: 0, display: 'flex', alignItems: 'center', gap: 12 }}>
                             <LayoutOutlined />
                             {dashboard?.name || 'Executive Dashboard'}
                         </Title>
-                        <Space separator={<Text type="secondary">|</Text>}>
-                            <Text type="secondary">
+                        <Space size={10} wrap>
+                            <Text type="secondary" style={{ fontSize: 12 }}>
                                 Last updated: {dashboard?.updatedAt ? new Date(dashboard.updatedAt).toLocaleTimeString() : '—'}
                             </Text>
                             <Tag color="blue">Live Data</Tag>
-                            <Tag color="blue">Step 5 of 5</Tag>
+                            <Tag color="geekblue">Step 5 of 5</Tag>
+                            <Tag color="cyan">Widgets {widgetStats.total}</Tag>
                         </Space>
                     </div>
-                    <Space>
-                        <Button
-                            icon={isEditMode ? <UndoOutlined /> : <EditOutlined />}
-                            onClick={() => setIsEditMode(!isEditMode)}
-                        >
+                    <div style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
+                        {dateFilters.length > 0 && (
+                            <FilterBar filters={dateFilters} variant="compact" />
+                        )}
+                        <Space>
+                            <Button
+                                icon={isEditMode ? <UndoOutlined /> : <EditOutlined />}
+                                onClick={() => setIsEditMode(!isEditMode)}
+                            >
                             {isEditMode ? 'Exit Edit Mode' : 'Edit Layout'}
                         </Button>
                         <Button
@@ -467,13 +496,24 @@ export const DashboardRenderView: React.FC = () => {
                         }}>
                             <Button icon={<MoreOutlined />} />
                         </Dropdown>
-                    </Space>
+                        </Space>
+                    </div>
                 </div>
             </Header>
 
             <Layout className="bg-transparent overflow-hidden">
-                <Sider width={280} style={{ background: '#11141d' }} className="border-r border-white/5 p-4" collapsible reverseArrow>
-                    <div style={{ marginBottom: 24 }}>
+                <Sider
+                    width={300}
+                    style={{
+                        background: 'linear-gradient(180deg, rgba(10,14,20,0.95), rgba(7,10,15,0.98))',
+                        borderRight: '1px solid rgba(148,163,184,0.12)',
+                        order: 2
+                    }}
+                    className="p-4"
+                    collapsible
+                    reverseArrow
+                >
+                    <div style={{ ...cardShellStyle, padding: 16, marginBottom: 16 }}>
                         <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
                             <Title level={5} style={{ margin: 0 }}>Active Filters</Title>
                             <Button
@@ -490,37 +530,53 @@ export const DashboardRenderView: React.FC = () => {
                                 Filters are staged. Click Apply to refresh results.
                             </Text>
                         )}
-                        <FilterBar filters={dashboard.filters || []} />
+                        <div style={{ marginTop: 12 }}>
+                            <FilterBar filters={dashboard.filters || []} />
+                        </div>
                     </div>
-                    <Divider />
-                    <Title level={5}>Quick Stats</Title>
-                    <Space orientation="vertical" style={{ width: '100%' }}>
-                        <div className="flex justify-between">
-                            <Text type="secondary">Widgets</Text>
-                            <Text strong>{widgets.length}</Text>
-                        </div>
-                        <div className="flex justify-between">
-                            <Text type="secondary">Data Sources</Text>
-                            <Tag color="cyan">Postgres</Tag>
-                        </div>
-                    </Space>
+                    <div style={{ ...cardShellStyle, padding: 16 }}>
+                        <Title level={5} style={{ marginTop: 0 }}>Quick Stats</Title>
+                        <Space orientation="vertical" style={{ width: '100%' }} size={10}>
+                            <div className="flex justify-between">
+                                <Text type="secondary">Widgets</Text>
+                                <Text strong>{widgets.length}</Text>
+                            </div>
+                            <div className="flex justify-between">
+                                <Text type="secondary">KPIs</Text>
+                                <Text strong>{widgetStats.kpis}</Text>
+                            </div>
+                            <div className="flex justify-between">
+                                <Text type="secondary">Charts</Text>
+                                <Text strong>{widgetStats.charts}</Text>
+                            </div>
+                            <div className="flex justify-between">
+                                <Text type="secondary">Filters</Text>
+                                <Text strong>{activeFilters.size}</Text>
+                            </div>
+                            <Divider style={{ margin: '8px 0' }} />
+                            <div className="flex justify-between">
+                                <Text type="secondary">Data Source</Text>
+                                <Tag color="cyan">Postgres</Tag>
+                            </div>
+                        </Space>
+                    </div>
                 </Sider>
 
-                <Content className="overflow-auto p-4 relative">
+                <Content className="overflow-auto p-4 relative" style={{ order: 1 }}>
                     <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16, marginBottom: 20 }}>
-                        <div style={{ padding: 16, borderRadius: 14, background: 'rgba(17, 24, 39, 0.7)', border: '1px solid rgba(148,163,184,0.12)' }}>
+                        <div style={statCardStyle}>
                             <Text type="secondary">Total Widgets</Text>
                             <Title level={3} style={{ margin: 0 }}>{widgetStats.total}</Title>
                         </div>
-                        <div style={{ padding: 16, borderRadius: 14, background: 'rgba(17, 24, 39, 0.7)', border: '1px solid rgba(148,163,184,0.12)' }}>
+                        <div style={statCardStyle}>
                             <Text type="secondary">KPI Cards</Text>
                             <Title level={3} style={{ margin: 0 }}>{widgetStats.kpis}</Title>
                         </div>
-                        <div style={{ padding: 16, borderRadius: 14, background: 'rgba(17, 24, 39, 0.7)', border: '1px solid rgba(148,163,184,0.12)' }}>
+                        <div style={statCardStyle}>
                             <Text type="secondary">Charts</Text>
                             <Title level={3} style={{ margin: 0 }}>{widgetStats.charts}</Title>
                         </div>
-                        <div style={{ padding: 16, borderRadius: 14, background: 'rgba(17, 24, 39, 0.7)', border: '1px solid rgba(148,163,184,0.12)' }}>
+                        <div style={statCardStyle}>
                             <Text type="secondary">Active Filters</Text>
                             <Title level={3} style={{ margin: 0 }}>{activeFilters.size}</Title>
                         </div>

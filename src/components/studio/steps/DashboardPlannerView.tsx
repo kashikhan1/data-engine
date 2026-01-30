@@ -342,13 +342,11 @@ export const DashboardPlannerView: React.FC = () => {
                                                 <Text strong>{widget.title}</Text>
                                                 <Space size={8}>
                                                     <Tag color="cyan">{widget.type}</Tag>
-                                                    {widget.type === 'kpi' && (
-                                                        <Switch
-                                                            size="small"
-                                                            checked={enabledWidgetIds.has(widget.id)}
-                                                            onChange={(checked) => toggleWidget(widget.id, checked)}
-                                                        />
-                                                    )}
+                                                    <Switch
+                                                        size="small"
+                                                        checked={enabledWidgetIds.has(widget.id)}
+                                                        onChange={(checked) => toggleWidget(widget.id, checked)}
+                                                    />
                                                 </Space>
                                             </div>
                                             <Text type="secondary" style={{ fontSize: 12 }}>

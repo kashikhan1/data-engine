@@ -1,6 +1,6 @@
 "use client";
 
-import React, { useMemo, useState } from "react";
+import React, { useEffect, useMemo, useState } from "react";
 import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
 import styles from "./TableWidget.module.css";
 
@@ -22,6 +22,15 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
     const [sortField, setSortField] = useState<string | null>(null);
     const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
     const [currentPage, setCurrentPage] = useState(0);
+    const [columnToggles] = useState(() => {
+        if (typeof window === "undefined") return null;
+        try {
+            const raw = localStorage.getItem("schema_column_toggles");
+            return raw ? JSON.parse(raw) : null;
+        } catch {
+            return null;
+        }
+    });
 
     // Auto-generate columns if not provided
     const finalColumns = useMemo(() => {
@@ -36,6 +45,41 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
             width: undefined,
         } as Column));
     }, [columns, data]);
+
+    const allowedColumns = useMemo(() => {
+        if (!columnToggles || data.length === 0) return null;
+        const dataKeys = Object.keys(data[0] || {}).filter(k => k !== "__rowKey");
+        let best: { table: string; overlap: number } | null = null;
+        Object.entries(columnToggles as Record<string, any>).forEach(([table, cols]) => {
+            const visibleCols = Object.entries(cols || {})
+                .filter(([, settings]: any) => settings?.show !== false)
+                .map(([name]) => name);
+            const overlap = visibleCols.filter((col) => dataKeys.includes(col)).length;
+            if (overlap > 0 && (!best || overlap > best.overlap)) {
+                best = { table, overlap };
+            }
+        });
+        if (!best) return null;
+        const bestTable = (best as { table: string; overlap: number }).table;
+        const visible = Object.entries((columnToggles as Record<string, any>)[bestTable] || {})
+            .filter(([, settings]: any) => settings?.show !== false)
+            .map(([name]) => name);
+        return new Set(visible);
+    }, [columnToggles, data]);
+
+    const filteredColumns = useMemo(() => {
+        if (!allowedColumns) return finalColumns;
+        return finalColumns.filter((col) => allowedColumns.has(col.field));
+    }, [allowedColumns, finalColumns]);
+
+    const visibleColumns = filteredColumns.length > 0 ? filteredColumns : finalColumns;
+
+    useEffect(() => {
+        if (!sortField) return;
+        if (!visibleColumns.some((col) => col.field === sortField)) {
+            setSortField(null);
+        }
+    }, [sortField, visibleColumns]);
 
     // Sort data
     const sortedData = useMemo(() => {
@@ -117,7 +161,7 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
                 <table className={styles.table}>
                     <thead>
                         <tr>
-                            {finalColumns.map((col) => (
+                            {visibleColumns.map((col) => (
                                 <th
                                     key={col.field}
                                     className={col.sortable !== false ? styles.sortable : ""}
@@ -143,7 +187,7 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
                     <tbody>
                         {paginatedData.map((row, i) => (
                             <tr key={i}>
-                                {finalColumns.map((col) => {
+                                {visibleColumns.map((col) => {
                                     const value = row[col.field];
                                     const isNumeric = typeof value === "number" || col.format === "currency" || col.format === "percent" || col.format === "number";
                                     const isGrowth = col.field.toLowerCase().includes("growth") || col.field.toLowerCase().includes("delta");

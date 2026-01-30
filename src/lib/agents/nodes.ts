@@ -1121,6 +1121,7 @@ export async function* runDashboardPlannerStream(query: string, schema: any) {
 
     const rawAnalysis = truncateText(schemaForPrompt.rawAnalysis || 'No previous analysis available.', 2000);
     const filterSummary = truncateText(schemaForPrompt.filterSummary || 'No filter candidates detected.', 1200);
+    const connectorInstructions = truncateText(schemaForPrompt.connectorInstructions || '', 1200);
     const trimmedProjectContext = truncateText(projectContext, 1200);
     const trimmedSchema = truncateText(simplifiedSchema, 3000);
     const trimmedRelationships = truncateText(relationships, 1200);
@@ -1155,6 +1156,7 @@ ${dateContext.summary}
 FILTERABLE DIMENSIONS:
 ${filterSummary}
 ${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
+${connectorInstructions ? `\nCONNECTOR INSTRUCTIONS:\n${connectorInstructions}` : ''}
 
 ### Your Mission
 Transform database schema and sample data into a complete dashboard widget plan that tells a story.
@@ -1282,6 +1284,75 @@ export async function finalizePlan(planText: string) {
  * Expert PostgreSQL database developer and query optimizer.
  * Generates optimized, safe, and high-performance SQL for every widget.
  */
+function validateSqlAgainstInstructions(sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) {
+    const trimmed = String(sql || "").trim();
+    if (!trimmed.toLowerCase().startsWith("select")) {
+        return { ok: false, error: "Validation failed: SQL must start with SELECT." };
+    }
+    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter"];
+    if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
+        return { ok: false, error: "Validation failed: unsafe SQL detected." };
+    }
+    const lower = String(connectionString || "").toLowerCase();
+    const typeLower = String(connectorType || "").toLowerCase();
+    const isMssql =
+        lower.startsWith("mssql://") ||
+        lower.startsWith("sqlserver://") ||
+        lower.includes("server=") ||
+        lower.includes("data source=") ||
+        typeLower.includes("mssql") ||
+        typeLower.includes("sql server");
+    if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
+        return { ok: false, error: "Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH." };
+    }
+    if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
+        return { ok: false, error: "Validation failed: PostgreSQL does not support TOP. Use LIMIT." };
+    }
+    const bans = new Set<string>();
+    const requires = new Set<string>();
+    if (connectorInstructions) {
+        const normalized = connectorInstructions
+            .replace(/```[\s\S]*?```/g, " ")
+            .replace(/[^\w\s().\[\]]+/g, " ")
+            .toLowerCase();
+        const banPatterns = [/(:?do not use|don't use|avoid|never use|no)\s+([a-z0-9_().\[\]]+)/gi];
+        const requirePatterns = [/(:?must use|always use|required)\s+([a-z0-9_().\[\]]+)/gi];
+        let match: RegExpExecArray | null;
+        for (const pattern of banPatterns) {
+            while ((match = pattern.exec(normalized)) !== null) {
+                if (match?.[2]) bans.add(match[2].toLowerCase());
+            }
+        }
+        for (const pattern of requirePatterns) {
+            while ((match = pattern.exec(normalized)) !== null) {
+                if (match?.[2]) requires.add(match[2].toLowerCase());
+            }
+        }
+        if (normalized.includes("never use limit") || normalized.includes("do not use limit")) {
+            bans.add("limit");
+        }
+        if (normalized.includes("never generate current_date") || normalized.includes("no current_date")) {
+            bans.add("current_date");
+        }
+        if (normalized.includes("never generate date_trunc") || normalized.includes("no date_trunc")) {
+            bans.add("date_trunc");
+        }
+    }
+    for (const banned of bans) {
+        const pattern = new RegExp(`\\b${banned.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+        if (pattern.test(trimmed)) {
+            return { ok: false, error: `Validation failed: SQL violates connector instruction (avoid "${banned}").` };
+        }
+    }
+    for (const required of requires) {
+        const pattern = new RegExp(`\\b${required.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+        if (!pattern.test(trimmed)) {
+            return { ok: false, error: `Validation failed: SQL must include "${required}".` };
+        }
+    }
+    return { ok: true };
+}
+
 export async function runQueryGenerator(
     plan: any,
     schema: any,
@@ -1292,11 +1363,57 @@ export async function runQueryGenerator(
     console.log("[AGENT] Engineering SQL Queries (Pro Mode)...");
     const filteredSchema = filterSchemaForNonEmptyTables(schema);
     const schemaForPrompt = filteredSchema || schema;
-    const connectionString = schemaForPrompt?.connectionString || schemaForPrompt?.dbUrl || schemaForPrompt?.postgresUrl || "";
+    const connectionString = schemaForPrompt?.connectionString || schemaForPrompt?.dbUrl || schemaForPrompt?.postgresUrl || schemaForPrompt?.mssqlUrl || "";
+    const connectorInstructions = schemaForPrompt?.connectorInstructions || "";
+    const connectorType = String(schemaForPrompt?.connectorType || schemaForPrompt?.connector?.type || "").toLowerCase();
     const isMssql = (() => {
         const lower = String(connectionString || "").toLowerCase();
-        return lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
+        if (lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=")) {
+            return true;
+        }
+        return connectorType.includes("mssql") || connectorType.includes("sql server");
     })();
+    const enforceQueries = async (input: Record<string, string>) => {
+        const output: Record<string, string> = { ...input };
+        const tasks = Object.entries(output).map(async ([id, sql]) => {
+            const widget = (effectiveWidgets || []).find((w: any) => w.id === id);
+            let attempt = 0;
+            let currentSql = sql;
+            while (attempt < 2) {
+                const validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+                if (validation.ok) break;
+                attempt += 1;
+                try {
+                    const repair = await repairFailedQuery({
+                        widgetId: id,
+                        widgetTitle: widget?.title || id,
+                        widgetType: widget?.type || "unknown",
+                        widgetGoal: widget?.goal,
+                        originalSql: currentSql,
+                        errorMessage: validation.error || "Connector instruction violation",
+                        schema: schemaForPrompt,
+                        errorLog,
+                        connectionString
+                    });
+                    if (repair?.sql) {
+                        currentSql = repair.sql;
+                    } else {
+                        break;
+                    }
+                } catch {
+                    break;
+                }
+            }
+            const finalCheck = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+            if (!finalCheck.ok) {
+                output[id] = `SELECT 'SQL violates connector rules' as status, '${(finalCheck.error || '').replace(/'/g, "''")}' as message`;
+            } else {
+                output[id] = currentSql;
+            }
+        });
+        await Promise.all(tasks);
+        return output;
+    };
 
     const escapeSqlLiteral = (value: string) => value.replace(/'/g, "''");
     const getQualifiedColumnType = (qualified: string) => {
@@ -1537,7 +1654,13 @@ export async function runQueryGenerator(
             return `TABLE "${table}" [${cols}]`;
         }).join('\n');
 
-    const widgets = truncate(JSON.stringify((effectiveWidgets || []).slice(0, 6)), 1200);
+    const widgetSummaryLines = (effectiveWidgets || []).map((w: any, idx: number) => {
+        const title = w?.title ? String(w.title).slice(0, 80) : '';
+        const metric = w?.metric ? String(w.metric).slice(0, 40) : '';
+        const dim = w?.dim ? String(w.dim).slice(0, 40) : '';
+        return `${idx + 1}) ${w.id} | ${w.type} | ${title} | metric=${metric} | dim=${dim}`;
+    });
+    const widgets = truncate(widgetSummaryLines.join('\n'), 4000);
     const relationships = truncate((schemaForPrompt.relationships || [])
         .slice(0, 3)
         .map((r: any) => {
@@ -1555,6 +1678,7 @@ export async function runQueryGenerator(
             .map(([k, v]: [any, any]) => [k, (v || []).slice(0, 1)])
     )), 500);
     const recentErrors = truncate(JSON.stringify((errorLog || []).slice(0, 15)), 1200);
+    const connectorInstructionsTrimmed = truncate(String(schemaForPrompt.connectorInstructions || ''), 1200);
 
     // Data-Aware Time Anchoring
     const referenceDate = findLatestDate(sampleData);
@@ -1615,6 +1739,7 @@ export async function runQueryGenerator(
     };
 
     const systemPrompt = isMssql ? `You are SQL Agent, a Senior SQL Server (MSSQL) Engineer and query optimizer.
+Connector instructions are mandatory and override any conflicting guidance.
 
 ### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
 1. **NO LIMIT** - Use TOP or OFFSET/FETCH.
@@ -1641,6 +1766,8 @@ ${dateContext.summary}
 
 ### DATA MODEL HINTS
 ${sqlHints.summary}
+
+${connectorInstructionsTrimmed ? `### CONNECTOR INSTRUCTIONS\n${connectorInstructionsTrimmed}\n` : ''}
 
 ### DATA PREVIEW (SAMPLE RECORDS)
 ${sampleDataText}
@@ -1745,6 +1872,8 @@ ${dateContext.summary}
 ### DATA MODEL HINTS
 ${sqlHints.summary}
 
+${connectorInstructionsTrimmed ? `### CONNECTOR INSTRUCTIONS\n${connectorInstructionsTrimmed}\n` : ''}
+
 ### DATA PREVIEW (SAMPLE RECORDS)
 ${sampleDataText}
 
@@ -1835,6 +1964,19 @@ Example:
 ]`;
 
     const maxPromptChars = 18000;
+    const fillMissingQueries = (queries: Record<string, string>) => {
+        const missing = (effectiveWidgets || []).filter((w: any) => !queries[w.id]);
+        if (missing.length === 0) return queries;
+        const fallbackSql = buildFallbackSql(plan, schemaForPrompt);
+        missing.forEach((w: any) => {
+            if (fallbackSql?.sqlMap?.[w.id]) {
+                queries[w.id] = fallbackSql.sqlMap[w.id];
+            } else {
+                queries[w.id] = `SELECT 'SQL generation missing for ${w.id}' AS status`;
+            }
+        });
+        return queries;
+    };
     if (systemPrompt.length > maxPromptChars) {
         const dbLabel = isMssql ? "SQL Server (MSSQL)" : "PostgreSQL";
         const compactPrompt = [
@@ -1844,6 +1986,7 @@ Example:
             clampSection("RELATIONSHIPS:", relationships || "[]", 400),
             clampSection("FILTERS:", activeFilters || "{}", 600),
             clampSection("REQUIRED_WHERE:", filterSqlHints || "NONE", 600),
+            connectorInstructionsTrimmed ? clampSection("CONNECTOR_INSTRUCTIONS:", connectorInstructionsTrimmed, 600) : "",
             clampSection("WIDGETS:", widgets || "[]", 1200),
             clampSection("ERRORS:", recentErrors || "[]", 800),
         ].join("\n\n");
@@ -1867,11 +2010,13 @@ Example:
                     queries[item.id] = item.sql;
                 }
             });
-            return applyFiltersToQueries(polishQueries(queries));
+            const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
+            return await enforceQueries(prepared);
         }
         const fallback = parseSQLOutput(content, effectiveWidgets);
         if (fallback && Object.keys(fallback).length > 0) {
-            return applyFiltersToQueries(polishQueries(fallback));
+            const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(fallback)));
+            return await enforceQueries(prepared);
         }
         return {};
     }
@@ -1910,20 +2055,23 @@ Example:
                 queries[item.id] = item.sql;
             }
         });
-        return applyFiltersToQueries(polishQueries(queries));
+        const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
+        return await enforceQueries(prepared);
     }
 
     // Fallback to old parser just in case
     const fallback = parseSQLOutput(content, effectiveWidgets);
     if (fallback && Object.keys(fallback).length > 0) {
-        return applyFiltersToQueries(polishQueries(fallback));
+        const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(fallback)));
+        return await enforceQueries(prepared);
     }
 
     // Absolute fallback: generate stub queries so UI remains functional
     effectiveWidgets.forEach((w: any) => {
         queries[w.id] = `SELECT 'SQL generation missing for ${w.id}' AS status`;
     });
-    return polishQueries(queries);
+    const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
+    return await enforceQueries(prepared);
 
 
 
@@ -2217,7 +2365,64 @@ function parseSQLOutput(output: string, widgets: any[]): Record<string, string> 
  * STEP 4: QUERY EXECUTOR
  * Executes generated SQL in parallel with performance tracking.
  */
-export async function runQueryExecutor(queries: Record<string, string>, connectionString?: string) {
+const extractInstructionBans = (instructions: string) => {
+    const bans = new Set<string>();
+    if (!instructions) return bans;
+    const lines = instructions.split(/\r?\n/);
+    const patterns = [
+        /(?:do not use|don't use|avoid|never use|no)\s+([a-z0-9_().\[\]]+)/i
+    ];
+    lines.forEach((line) => {
+        patterns.forEach((pattern) => {
+            const match = line.match(pattern);
+            if (match?.[1]) {
+                bans.add(match[1].toLowerCase());
+            }
+        });
+    });
+    return bans;
+};
+
+const detectIsMssql = (connectionString?: string, connectorType?: string) => {
+    const lower = String(connectionString || "").toLowerCase();
+    if (lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=")) {
+        return true;
+    }
+    const typeLower = String(connectorType || "").toLowerCase();
+    return typeLower.includes("mssql") || typeLower.includes("sql server");
+};
+
+const validateSqlWithInstructions = (sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) => {
+    const trimmed = String(sql || "").trim();
+    if (!trimmed.toLowerCase().startsWith("select")) {
+        return { ok: false, error: "Validation failed: SQL must start with SELECT." };
+    }
+    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter"];
+    if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
+        return { ok: false, error: "Validation failed: unsafe SQL detected." };
+    }
+    const isMssql = detectIsMssql(connectionString, connectorType);
+    if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
+        return { ok: false, error: "Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH." };
+    }
+    if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
+        return { ok: false, error: "Validation failed: PostgreSQL does not support TOP. Use LIMIT." };
+    }
+    const bans = extractInstructionBans(connectorInstructions || "");
+    for (const banned of bans) {
+        const pattern = new RegExp(`\\b${banned.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
+        if (pattern.test(trimmed)) {
+            return { ok: false, error: `Validation failed: SQL violates connector instruction (avoid \"${banned}\").` };
+        }
+    }
+    return { ok: true };
+};
+
+export async function runQueryExecutor(
+    queries: Record<string, string>,
+    connectionString?: string,
+    options?: { connectorInstructions?: string; connectorType?: string }
+) {
     console.log("[AGENT] Executing optimized query set...");
     const results: Record<string, any> = {};
 
@@ -2225,6 +2430,17 @@ export async function runQueryExecutor(queries: Record<string, string>, connecti
         const start = Date.now();
         try {
             console.log(`[EXEC] Running Widget ${id}...`);
+            const validation = validateSqlWithInstructions(sql, connectionString, options?.connectorInstructions, options?.connectorType);
+            if (!validation.ok) {
+                const duration = Date.now() - start;
+                results[id] = {
+                    error: validation.error,
+                    status: "error",
+                    sql,
+                    executionTime: `${duration}ms`
+                };
+                return;
+            }
             const data = await dbGateway.runQuery(sql, connectionString);
             const duration = Date.now() - start;
 
@@ -2320,13 +2536,19 @@ export async function repairFailedQuery(context: {
 
     const compactSchema = truncate(buildCompactSchema(), 1200);
 
+    const connectorType = String(context.schema?.connectorType || context.schema?.connector?.type || "").toLowerCase();
     const isMssql = (() => {
         const lower = (context.connectionString || "").toLowerCase();
-        return lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
+        if (lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=")) {
+            return true;
+        }
+        return connectorType.includes("mssql") || connectorType.includes("sql server");
     })();
+    const connectorInstructions = String(context.schema?.connectorInstructions || "").trim();
 
     const systemPrompt = isMssql
         ? `You are **SQL Repair Agent**, a Senior SQL Server (MSSQL) debugger.
+Connector instructions are mandatory and override any conflicting guidance.
 
 ### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
 1. **NO LIMIT** - Use \`TOP\` or \`OFFSET ... FETCH\`.
@@ -2334,6 +2556,8 @@ export async function repairFailedQuery(context: {
 3. **DATE TRUNCATION** - Use \`DATEADD(day, DATEDIFF(day, 0, col), 0)\` for day, \`DATEADD(month, DATEDIFF(month, 0, col), 0)\` for month.
 4. **TEXT TYPE** - If comparing text/ntext, CAST to NVARCHAR(MAX) before equality.
 5. **IDENTIFIERS** - Use brackets \`[Table]\` and \`[Column]\` when needed.
+
+${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ''}
 
 ### FAILED QUERY CONTEXT
 - **Widget Goal:** ${context.widgetGoal || 'Display relevant data'}
@@ -2349,6 +2573,8 @@ ${compactSchema}
 2. Use ONLY columns that exist in the schema.
 3. Fix any syntax errors and handle type mismatches.
 4. Do NOT repeat any patterns from recent SQL errors.
+5. **Never** claim the error is "misleading" or "already valid" — you must change the SQL to address the error.
+6. If the error mentions LIMIT, DATE_TRUNC, CURRENT_DATE, or GROUP BY aliasing, you MUST replace with SQL Server equivalents.
 
 ### OUTPUT FORMAT (MANDATORY)
 Return ONLY a valid JSON object. No conversation.
@@ -2357,6 +2583,7 @@ Return ONLY a valid JSON object. No conversation.
   "explanation": "Brief fix summary"
 }`
         : `You are **SQL Repair Agent**, a Senior PostgreSQL debugger.
+Connector instructions are mandatory and override any conflicting guidance.
 
 ### CRITICAL: POSTGRESQL SYNTAX RULES (MANDATORY)
 1. **NO DATEDIFF()** - This function DOES NOT EXIST in PostgreSQL.
@@ -2364,6 +2591,8 @@ Return ONLY a valid JSON object. No conversation.
    - Example: \`(CURRENT_DATE - first_used_at)\`
 2. **NO window functions inside aggregates** - You cannot do \`SUM(count(*) OVER (...))\`.
 3. **DATE_TRUNC** - Always cast to timestamp: \`DATE_TRUNC('day', col::timestamp)\`.
+
+${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ''}
 
 ### FAILED QUERY CONTEXT
 - **Widget Goal:** ${context.widgetGoal || 'Display relevant data'}
@@ -2379,6 +2608,7 @@ ${compactSchema}
 2. Use ONLY columns that exist in the schema.
 3. Fix any syntax errors and handle type mismatches.
 4. Do NOT repeat any patterns from recent SQL errors.
+5. **Never** claim the error is "misleading" or "already valid" — you must change the SQL to address the error.
 
 ### OUTPUT FORMAT (MANDATORY)
 Return ONLY a valid JSON object. No conversation.
@@ -2474,7 +2704,7 @@ export async function assembleFinalDashboard(plan: any, queries: any[], results:
     let kpiCount = 0;
     let chartCount = 0;
 
-    const widgets = plan.widgets.map((w: any) => {
+    const widgetsWithResults = plan.widgets.map((w: any) => {
         // Prefer a direct match on widget ID; fall back to explicit queryId, then to query->widget mapping, then title match
         const q = queries.find((query: any) =>
             query.id === w.id ||
@@ -2512,8 +2742,37 @@ export async function assembleFinalDashboard(plan: any, queries: any[], results:
             goal: w.goal,
             data: res?.data || [],
             sql: q?.sql,
-            position: pos
+            position: pos,
+            __resultStatus: res?.status,
+            __hasData: Array.isArray(res?.data) ? res.data.length > 0 : false
         };
+    });
+
+    const filtered = widgetsWithResults
+        .filter((w: any) => w.__resultStatus !== "error")
+        .filter((w: any) => w.__hasData || w.type === "markdown")
+        .map((w: any) => {
+            const { __resultStatus, __hasData, ...rest } = w;
+            return rest;
+        });
+
+    kpiCount = 0;
+    chartCount = 0;
+    const widgets = filtered.map((w: any) => {
+        let pos = { x: 0, y: 0, w: 6, h: 4 };
+        if (w.type === 'kpi') {
+            pos = { x: (kpiCount % 4) * 3, y: 0, w: 3, h: 2 };
+            kpiCount++;
+        } else if (w.type === 'line' && (w.layoutHint === 'row2-full' || chartCount === 0)) {
+            pos = { x: 0, y: 2, w: 12, h: 4 };
+            chartCount++;
+        } else if (w.type === 'table') {
+            pos = { x: 0, y: 10, w: 12, h: 6 };
+        } else if (['bar', 'donut', 'pie', 'line'].includes(w.type)) {
+            pos = { x: (chartCount % 2) * 6, y: 6, w: 6, h: 4 };
+            chartCount++;
+        }
+        return { ...w, position: pos };
     });
 
     return {
@@ -3323,7 +3582,18 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
     }
 
     const sqlMap = state.queryValidation;
-    const connectionString = state.context?.connectionString || state.context?.dbUrl || state.context?.postgresUrl || state.context?.mssqlUrl || undefined;
+    const connectionString =
+        state.context?.connectionString ||
+        state.context?.dbUrl ||
+        state.context?.postgresUrl ||
+        state.context?.mssqlUrl ||
+        state.schema?.connectionString ||
+        state.schema?.dbUrl ||
+        state.schema?.postgresUrl ||
+        state.schema?.mssqlUrl ||
+        undefined;
+    const connectorInstructions = state.schema?.connectorInstructions || state.context?.connectorInstructions || "";
+    const connectorType = state.schema?.connectorType || state.context?.connectorType || "";
     const totalQueries = Object.keys(sqlMap).length;
     let completedQueries = 0;
 
@@ -3373,8 +3643,46 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
                 sql: sql  // Include the actual SQL query
             };
 
+            let currentSql = sql as string;
+            let validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+            let attempts = 0;
+            while (!validation.ok && attempts < 2) {
+                attempts += 1;
+                try {
+                    const repair = await repairFailedQuery({
+                        widgetId: id,
+                        widgetTitle: wInfo?.title || "Metric",
+                        widgetType: wInfo?.type || "table",
+                        widgetGoal: (wInfo as any)?.goal,
+                        originalSql: currentSql,
+                        errorMessage: validation.error || "Connector instruction violation",
+                        schema: { ...(state.schema || {}), connectorInstructions, connectorType },
+                        errorLog: [],
+                        connectionString
+                    });
+                    if (repair?.sql) {
+                        currentSql = repair.sql;
+                    }
+                } catch {
+                    break;
+                }
+                validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+            }
+            if (!validation.ok) {
+                yield {
+                    type: "query_error",
+                    widgetId: id,
+                    widgetTitle: wInfo?.title || "Metric",
+                    error: validation.error,
+                    message: `SQL violates connector rules: ${validation.error}`,
+                    sql: currentSql
+                };
+                completedQueries++;
+                continue;
+            }
+
             console.log(`[EXECUTOR] Running widget ${id}...`);
-            const data = await dbGateway.runQuery(sql as string, connectionString);
+            const data = await dbGateway.runQuery(currentSql, connectionString);
 
             const result = {
                 widgetId: id,
@@ -3385,7 +3693,7 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
                 plan_dim: (wInfo as any)?.dim,
                 data: Array.isArray(data) && !(data as any).error ? data : [],
                 columns: (Array.isArray(data) && data.length > 0 && !(data as any).error) ? Object.keys(data[0]) : [],
-                sql: sql,
+                sql: currentSql,
                 error: (data as any)?.error || null
             };
 

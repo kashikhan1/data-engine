@@ -360,4 +360,5 @@ export interface DataSource {
     lastSync: string;
     icon: string;
     connectionString?: string;
+    instructions?: string;
 }

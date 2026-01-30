@@ -5,13 +5,28 @@ import { AgentState } from '@/lib/agents/state';
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
-        const { query, schema, queryPlan, queryValidation, securityClearance, context } = body;
+        const { query, schema, queryPlan, queryValidation, securityClearance, context, connectorInstructions, connectorType, connectionString } = body;
 
         // Build initial state for streaming workflow
+        const mergedSchema = schema
+            ? {
+                ...schema,
+                connectorInstructions: connectorInstructions || schema?.connectorInstructions,
+                connectorType: connectorType || schema?.connectorType,
+                connectionString: connectionString || schema?.connectionString || schema?.dbUrl || schema?.postgresUrl || schema?.mssqlUrl
+            }
+            : schema;
+        const mergedContext = {
+            ...(context || {}),
+            connectorInstructions: connectorInstructions || context?.connectorInstructions,
+            connectorType: connectorType || context?.connectorType,
+            connectionString: connectionString || context?.connectionString || context?.postgresUrl || context?.mssqlUrl
+        };
+
         const state: Partial<typeof AgentState.State> = {
             intent: query,
-            context,
-            schema,
+            context: mergedContext,
+            schema: mergedSchema,
             queryPlan,
             queryValidation,
             securityClearance,

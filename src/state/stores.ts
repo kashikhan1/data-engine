@@ -766,6 +766,10 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     // This fixes the issue where rerunning the plan appeared to wipe subsequent steps
                     state.staleStep = 3;
 
+                    // Clear prior dashboard data so new plan doesn't render old widgets
+                    state.executionResults = null;
+                    state.dashboardConfig = null;
+
                     // Explicitly preserve downstream data (redundant with Immer but explicit for safety)
                     // state.aiQueries and state.executionResults remain untouched
                 }),
@@ -844,7 +848,6 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     aiQueries: state.aiQueries,
                     userQueries: state.userQueries,
                     sqlErrorLog: state.sqlErrorLog,
-                    dashboardConfig: state.dashboardConfig,
                     // EXCLUDE: schemaData (too big), executionResults (too big)
                 })
             }
