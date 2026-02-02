@@ -18,7 +18,7 @@ const Header: React.FC = () => {
                     </div>
                     <div className="flex flex-col">
                         <h1 className="text-[12px] font-black leading-none tracking-[1.5px] text-white uppercase font-sans">
-                            LUMEN AI DATA ENGINE 
+                            LUMAN AI DATA ENGINE 
                         </h1>
                         <span className="text-[8px] text-slate-500 font-bold mt-1 tracking-widest uppercase font-sans">
                             PRO EDITION v2.4

@@ -530,6 +530,7 @@ export interface ConfigState {
     discoveredTables: string[];
     canonicalPlan: string | null;
     projectContext: string;
+    disabledWidgetTypes: string[];
 }
 
 interface ConfigStore extends ConfigState {
@@ -541,6 +542,7 @@ interface ConfigStore extends ConfigState {
     setSelectedDataSourceId: (id: string | null) => void;
     setCanonicalPlan: (plan: string | null) => void;
     setProjectContext: (context: string) => void;
+    setDisabledWidgetTypes: (types: string[]) => void;
 }
 
 const initialConfigState: ConfigState = {
@@ -561,6 +563,7 @@ const initialConfigState: ConfigState = {
     discoveredTables: [],
     canonicalPlan: null,
     projectContext: "",
+    disabledWidgetTypes: [],
 };
 
 export const useConfigStore = create<ConfigStore>()(
@@ -607,6 +610,9 @@ export const useConfigStore = create<ConfigStore>()(
                 }),
                 setProjectContext: (context) => set((state) => {
                     state.projectContext = context;
+                }),
+                setDisabledWidgetTypes: (types) => set((state) => {
+                    state.disabledWidgetTypes = types;
                 }),
             })),
             {

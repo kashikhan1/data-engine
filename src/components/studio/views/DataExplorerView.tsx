@@ -8,7 +8,7 @@ import { AgentTimeline } from '@/components/chat/AgentTimeline';
 import { runSchemaDiscovery } from '@/lib/agents/nodes';
 
 const DataExplorerView: React.FC = () => {
-    const { setDiscoveredTables, connectionStatus, discoveredTables, postgresUrl, canonicalPlan, setCanonicalPlan, projectContext } = useConfigStore();
+    const { setDiscoveredTables, connectionStatus, discoveredTables, postgresUrl, canonicalPlan, setCanonicalPlan, projectContext, disabledWidgetTypes } = useConfigStore();
     const [tables, setTables] = useState<string[]>(discoveredTables || []);
     const [selectedTable, setSelectedTable] = useState<string | null>(null);
     const [records, setRecords] = useState<any[]>([]);
@@ -136,7 +136,8 @@ const DataExplorerView: React.FC = () => {
                     mode: 'exhaustive_profiling',
                     focusTable: focusTable,
                     projectContext,
-                    postgresUrl
+                    postgresUrl,
+                    disabledWidgetTypes
                 }
             });
 
@@ -300,7 +301,8 @@ const DataExplorerView: React.FC = () => {
                     mode: 'build_from_plan',
                     canonicalPlan: actionablePlan,
                     projectContext,
-                    postgresUrl
+                    postgresUrl,
+                    disabledWidgetTypes
                 }
             });
         } catch (err: any) {

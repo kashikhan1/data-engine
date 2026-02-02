@@ -34,7 +34,7 @@ const { Title, Text, Paragraph } = Typography;
 const { Panel } = Collapse;
 
 export const QueryGeneratorView: React.FC = () => {
-    const { postgresUrl, dataSources, selectedDataSourceId } = useConfigStore();
+    const { postgresUrl, dataSources, selectedDataSourceId, disabledWidgetTypes } = useConfigStore();
     const {
         userPlan,
         aiPlan,
@@ -160,12 +160,27 @@ export const QueryGeneratorView: React.FC = () => {
         }
     }, [schemaData, setSchemaData]);
 
+    const filterPlanByVisibility = useCallback((plan: any) => {
+        if (!plan) return plan;
+        const allowedTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
+        (disabledWidgetTypes || []).forEach((t) => allowedTypes.delete(t));
+        if (!Array.isArray(plan.widgets)) return plan;
+        return {
+            ...plan,
+            widgets: plan.widgets.filter((w: any) => allowedTypes.has(w?.type)),
+        };
+    }, [disabledWidgetTypes]);
+
     const handleGenerateSql = async (source: 'manual' | 'auto' | React.MouseEvent<HTMLElement> = 'manual') => {
         if (typeof source !== 'string') {
             source = 'manual';
         }
-        const plan = userPlan || aiPlan;
+        const plan = filterPlanByVisibility(userPlan || aiPlan);
         if (!plan || !schemaData) return;
+        if (Array.isArray(plan.widgets) && plan.widgets.length === 0) {
+            setError('All widget types are disabled. Enable at least one widget type in settings.');
+            return;
+        }
         if (isGeneratingRef.current) return;
         isGeneratingRef.current = true;
         setProcessing(true);
@@ -289,7 +304,7 @@ export const QueryGeneratorView: React.FC = () => {
     };
 
     const handleStreamExecution = async () => {
-        const plan = userPlan || aiPlan;
+        const plan = filterPlanByVisibility(userPlan || aiPlan);
         const queries = userQueries || aiQueries;
         if (!plan || !queries || queries.length === 0) return;
         if (isStreamingExecution) return;
@@ -471,7 +486,7 @@ export const QueryGeneratorView: React.FC = () => {
     // Auto-generate SQL when arriving on step 3 with stale or missing queries.
     useEffect(() => {
         if ((!aiQueries || staleStep === 3) && !isProcessing && (userPlan || aiPlan)) {
-            const plan = userPlan || aiPlan;
+            const plan = filterPlanByVisibility(userPlan || aiPlan);
             const autoKey = `${(plan?.rawPlan || '').slice(0, 500)}::${schemaTimestamp || ''}`;
             if (lastAutoKeyRef.current === autoKey) return;
             lastAutoKeyRef.current = autoKey;
@@ -505,7 +520,7 @@ export const QueryGeneratorView: React.FC = () => {
             const result: any = await executeQuery(`EXPLAIN (FORMAT JSON) ${sql}`, postgresUrl || undefined);
             if (result && result.error) {
                 // Auto-repair on validation error if we have context
-                const plan = userPlan || aiPlan;
+                const plan = filterPlanByVisibility(userPlan || aiPlan);
                 const widgetInfo = plan?.widgets?.find((w: any) => w.id === id);
                 if (plan && widgetInfo && schemaData) {
                     try {
@@ -592,7 +607,7 @@ export const QueryGeneratorView: React.FC = () => {
     }
 
     const currentQueries = userQueries || aiQueries;
-    const plan = userPlan || aiPlan;
+    const plan = filterPlanByVisibility(userPlan || aiPlan);
     const defaultFilters = (() => {
         if (Array.isArray(plan?.filters) && plan.filters.length > 0) return plan.filters;
         const candidates = schemaData?.filterCandidates;

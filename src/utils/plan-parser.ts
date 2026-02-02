@@ -27,6 +27,11 @@ export function extractDashboardTitle(planText: string): string | null {
 export function parseNaturalLanguagePlan(planText: string): any[] {
     const widgets: any[] = [];
     let widgetId = 1;
+    const coerceTypeByText = (current: string, title: string, goal: string) => {
+        const text = `${title} ${goal}`.toLowerCase();
+        if (/kpi|key performance|stat|metric/.test(text)) return 'kpi';
+        return current;
+    };
 
     // Clean markdown formatting that might confuse parsing
     const cleaned = planText.replace(/\*\*|\*|__|#/g, '');
@@ -73,9 +78,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             let type = 'bar';
             if (/kpi|stat|metric/.test(typeText)) type = 'kpi';
             else if (/line|trend/.test(typeText)) type = 'line';
-            else if (/area/.test(typeText)) type = 'line';
+            else if (/area/.test(typeText)) type = 'area';
             else if (/bar|column|stacked/.test(typeText)) type = 'bar';
-            else if (/pie|donut/.test(typeText)) type = 'donut';
+            else if (/donut/.test(typeText)) type = 'donut';
+            else if (/pie/.test(typeText)) type = 'pie';
+            else if (/funnel/.test(typeText)) type = 'funnel';
+            else if (/cohort|retention/.test(typeText)) type = 'cohort';
+            else if (/scatter|correlation/.test(typeText)) type = 'scatter';
+            else if (/map|geo|geography|region/.test(typeText)) type = 'map';
+            else if (/markdown|text|note|narrative/.test(typeText)) type = 'markdown';
             else if (/table/.test(typeText)) type = 'table';
 
             let primaryTable: string | undefined;
@@ -84,14 +95,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
                 if (tableColMatch) primaryTable = tableColMatch[1];
             }
 
+            const finalType = coerceTypeByText(type, title, goal);
             widgets.push({
                 id: `w${widgetId++}`,
-                type,
+                type: finalType,
                 title,
                 goal,
                 primaryTable,
                 notes: notesMatch?.[1]?.trim(),
-                layoutHint: type === 'kpi' ? 'row1' : (type === 'table' ? 'row4' : 'row2')
+                layoutHint: finalType === 'kpi' ? 'row1' : (finalType === 'table' ? 'row4' : 'row2')
             });
         });
 
@@ -143,9 +155,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             let type = 'bar';
             if (/kpi|stat|metric/.test(rawType)) type = 'kpi';
             else if (/line|trend/.test(rawType)) type = 'line';
-            else if (/area/.test(rawType)) type = 'line';
+            else if (/area/.test(rawType)) type = 'area';
             else if (/bar|column|stacked/.test(rawType)) type = 'bar';
-            else if (/pie|donut/.test(rawType)) type = 'donut';
+            else if (/donut/.test(rawType)) type = 'donut';
+            else if (/pie/.test(rawType)) type = 'pie';
+            else if (/funnel/.test(rawType)) type = 'funnel';
+            else if (/cohort|retention/.test(rawType)) type = 'cohort';
+            else if (/scatter|correlation/.test(rawType)) type = 'scatter';
+            else if (/map|geo|geography|region/.test(rawType)) type = 'map';
+            else if (/markdown|text|note|narrative/.test(rawType)) type = 'markdown';
             else if (/table/.test(rawType)) type = 'table';
 
             let primaryTable: string | undefined;
@@ -154,14 +172,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
                 if (tableColMatch) primaryTable = tableColMatch[1];
             }
 
+            const finalType = coerceTypeByText(type, title, goal);
             widgets.push({
                 id: `w${widgetId++}`,
-                type,
+                type: finalType,
                 title,
                 goal,
                 primaryTable,
                 notes: notesMatch?.[1]?.trim(),
-                layoutHint: type === 'kpi' ? 'row1' : (type === 'table' ? 'row4' : 'row2')
+                layoutHint: finalType === 'kpi' ? 'row1' : (finalType === 'table' ? 'row4' : 'row2')
             });
         });
 
@@ -219,18 +238,18 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             if (lines.length === 0) return;
 
             const title = lines[0]?.trim() || "Chart";
-            const typeMatch = block.match(/Chart type[:\s]*(line|area|bar|stacked bar|donut|pie)/i);
+            const typeMatch = block.match(/Chart type[:\s]*(line|area|bar|stacked bar|donut|pie|funnel|cohort|scatter|map)/i);
             const metricMatch = block.match(/Metric[:\s]*([^\n]+)/i);
             const dimMatch = block.match(/Dimension[:\s]*([^\n]+)/i);
             const tableMatch = block.match(/Primary table[:\s]*([^\n]+)/i);
 
             let chartType = typeMatch?.[1]?.toLowerCase() || 'bar';
             if (chartType === 'stacked bar') chartType = 'bar';
-            if (chartType === 'area') chartType = 'line';
 
+            const finalType = coerceTypeByText(chartType, title, `${metricMatch?.[1] || ''} ${dimMatch?.[1] || ''}`);
             widgets.push({
                 id: `w${widgetId++}`,
-                type: chartType,
+                type: finalType,
                 title: title.replace(/chart$/i, '').trim(),
                 goal: `${metricMatch?.[1]?.trim() || ''} by ${dimMatch?.[1]?.trim() || ''}`.trim() || "Visualization",
                 dimension: dimMatch?.[1]?.trim(),
@@ -289,11 +308,19 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
                 if (/chart|trend|breakdown|over time|distribution/i.test(titleLower)) {
                     type = 'bar';
                     if (/trend|line|time/i.test(titleLower + descLower)) type = 'line';
-                    else if (/pie|donut|breakdown/i.test(titleLower + descLower)) type = 'donut';
+                    else if (/donut|breakdown/i.test(titleLower + descLower)) type = 'donut';
+                    else if (/pie/.test(titleLower + descLower)) type = 'pie';
+                    else if (/funnel/i.test(titleLower + descLower)) type = 'funnel';
+                    else if (/cohort|retention/i.test(titleLower + descLower)) type = 'cohort';
+                    else if (/scatter|correlation/i.test(titleLower + descLower)) type = 'scatter';
+                    else if (/map|geo|geography|region/i.test(titleLower + descLower)) type = 'map';
                 } else if (/table|list|detail|record/i.test(titleLower)) {
                     type = 'table';
+                } else if (/markdown|note|narrative|insight|summary/i.test(titleLower)) {
+                    type = 'markdown';
                 }
 
+                type = coerceTypeByText(type, title, desc);
                 widgets.push({
                     id: `w${widgetId++}`,
                     type,

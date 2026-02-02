@@ -1,7 +1,7 @@
 'use client';
 
 import React, { useState, useEffect, useRef } from 'react';
-import { useWorkflowStore } from '@/state/stores';
+import { useConfigStore, useWorkflowStore } from '@/state/stores';
 import { runDashboardPlanner } from '@/lib/agents/nodes';
 import {
     Button,
@@ -49,6 +49,7 @@ export const DashboardPlannerView: React.FC = () => {
         staleStep,
         setStaleStep
     } = useWorkflowStore();
+    const { disabledWidgetTypes } = useConfigStore();
 
     const [isEditing, setIsEditing] = useState(false);
     const [localPlanText, setLocalPlanText] = useState('');
@@ -58,6 +59,28 @@ export const DashboardPlannerView: React.FC = () => {
         const marker = "EVENT_STREAM:";
         const idx = text.indexOf(marker);
         return idx === -1 ? text : text.slice(0, idx).trim();
+    };
+    const buildFilteredPlanText = (title: string, widgets: any[]) => {
+        const lines: string[] = [];
+        lines.push(`DASHBOARD TITLE: ${title || "AI Analytics Dashboard"}`);
+        lines.push("PURPOSE: Auto-generated plan based on enabled widget types.");
+        lines.push("");
+        lines.push("FILTERS TO INCLUDE:");
+        lines.push("1) None");
+        lines.push("");
+        widgets.forEach((w: any, idx: number) => {
+            const widgetTitle = String(w?.title || `Widget ${idx + 1}`).trim();
+            const widgetType = String(w?.type || "chart").trim();
+            const goal = String(w?.goal || "Visualization").trim();
+            lines.push(`WIDGET ${idx + 1}: ${widgetType} - ${widgetTitle}`);
+            lines.push(`Shows: ${goal}`);
+            lines.push("Why: Enabled widget type per settings.");
+            lines.push("Uses: Not specified.");
+            lines.push("Filters applied: None.");
+            lines.push("Notes: Filtered to enabled widget types.");
+            lines.push("");
+        });
+        return lines.join("\n").trim();
     };
 
     const handlePlan = async (source: 'auto' | 'manual' | React.MouseEvent<HTMLElement> = 'manual') => {
@@ -76,7 +99,13 @@ export const DashboardPlannerView: React.FC = () => {
             const response = await fetch('/api/plan/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query, schema: schemaData })
+                body: JSON.stringify({
+                    query,
+                    schema: {
+                        ...schemaData,
+                        disabledWidgetTypes
+                    }
+                })
             });
 
             if (!response.ok) throw new Error('Planner connection failed. Please check if the LLM server is running.');
@@ -115,10 +144,17 @@ export const DashboardPlannerView: React.FC = () => {
             // Once streaming is done, finalize the plan structure (widgets, title, etc) client-side
             const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
             const cleanedPlanText = stripEventStream(fullText);
+            const allowedTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
+            (disabledWidgetTypes || []).forEach((t) => allowedTypes.delete(t));
+            const parsedWidgets = parseNaturalLanguagePlan(cleanedPlanText).filter((w: any) => allowedTypes.has(w?.type));
+            const title = extractDashboardTitle(cleanedPlanText) || "AI Analytics Dashboard";
+            const normalizedPlanText = (disabledWidgetTypes || []).length > 0
+                ? buildFilteredPlanText(title, parsedWidgets)
+                : cleanedPlanText;
             const finalizedData = {
-                title: extractDashboardTitle(cleanedPlanText) || "AI Analytics Dashboard",
-                rawPlan: cleanedPlanText,
-                widgets: parseNaturalLanguagePlan(cleanedPlanText)
+                title,
+                rawPlan: normalizedPlanText,
+                widgets: parsedWidgets
             };
             setAiPlan(finalizedData);
             if (source === 'auto') {
@@ -149,11 +185,13 @@ export const DashboardPlannerView: React.FC = () => {
     const handleSave = async () => {
         if (!aiPlan) return;
         const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
+        const allowedTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
+        (disabledWidgetTypes || []).forEach((t) => allowedTypes.delete(t));
         setUserPlan({
             ...aiPlan,
             title: extractDashboardTitle(stripEventStream(localPlanText)) || aiPlan.title,
             rawPlan: stripEventStream(localPlanText),
-            widgets: parseNaturalLanguagePlan(stripEventStream(localPlanText))
+            widgets: parseNaturalLanguagePlan(stripEventStream(localPlanText)).filter((w: any) => allowedTypes.has(w?.type))
         });
         setIsEditing(false);
     };
@@ -179,7 +217,10 @@ export const DashboardPlannerView: React.FC = () => {
     const currentPlan = userPlan || aiPlan;
     const showPlan = currentPlan || localPlanText;
     const baseWidgets = aiPlan?.widgets || currentPlan?.widgets || [];
-    const enabledWidgetIds = new Set((currentPlan?.widgets || []).map((w: any) => w.id));
+    const allowedWidgetTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
+    (disabledWidgetTypes || []).forEach((t) => allowedWidgetTypes.delete(t));
+    const filteredBaseWidgets = baseWidgets.filter((w: any) => allowedWidgetTypes.has(w?.type));
+    const enabledWidgetIds = new Set((currentPlan?.widgets || []).filter((w: any) => allowedWidgetTypes.has(w?.type)).map((w: any) => w.id));
     const filterCandidates = schemaData?.filterCandidates;
     const nonEmptyTables = (() => {
         const counts = schemaData?.tableCounts;
@@ -211,16 +252,16 @@ export const DashboardPlannerView: React.FC = () => {
     const toggleWidget = (widgetId: string, nextEnabled: boolean) => {
         const sourcePlan = userPlan || aiPlan;
         if (!sourcePlan) return;
-        const currentWidgets = currentPlan?.widgets || [];
+        const currentWidgets = (currentPlan?.widgets || []).filter((w: any) => allowedWidgetTypes.has(w?.type));
         let nextWidgets = currentWidgets;
 
         if (!nextEnabled) {
             nextWidgets = currentWidgets.filter((w: any) => w.id !== widgetId);
         } else {
-            const toAdd = baseWidgets.find((w: any) => w.id === widgetId);
+            const toAdd = filteredBaseWidgets.find((w: any) => w.id === widgetId);
             if (!toAdd) return;
             const merged = [...currentWidgets, toAdd];
-            const order = baseWidgets.map((w: any) => w.id);
+            const order = filteredBaseWidgets.map((w: any) => w.id);
             merged.sort((a: any, b: any) => order.indexOf(a.id) - order.indexOf(b.id));
             nextWidgets = merged;
         }
@@ -332,9 +373,9 @@ export const DashboardPlannerView: React.FC = () => {
                     <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
                         <Card title="Widgets Overview" size="small">
                             <div style={{ display: 'flex', flexDirection: 'column' }}>
-                                {baseWidgets.map((widget: any, index: number) => (
+                                {filteredBaseWidgets.map((widget: any, index: number) => (
                                     <div key={index} style={{
-                                        borderBottom: index < baseWidgets.length - 1 ? '1px solid rgba(255, 255, 255, 0.08)' : 'none',
+                                        borderBottom: index < filteredBaseWidgets.length - 1 ? '1px solid rgba(255, 255, 255, 0.08)' : 'none',
                                         padding: '12px 0'
                                     }}>
                                         <div style={{ width: '100%' }}>

@@ -6,7 +6,7 @@ import { useConfigStore } from '@/state/stores';
 const SettingsView: React.FC = () => {
     const [activeTab, setActiveTab] = useState('Admin & Security');
     const [theme, setTheme] = useState<'dark' | 'light' | 'high-contrast'>('dark');
-    const { projectContext, setProjectContext } = useConfigStore();
+    const { projectContext, setProjectContext, disabledWidgetTypes, setDisabledWidgetTypes } = useConfigStore();
     const [projectDraft, setProjectDraft] = useState(projectContext || '');
     const [projectSavedAt, setProjectSavedAt] = useState<string | null>(null);
 
@@ -34,6 +34,31 @@ const SettingsView: React.FC = () => {
             ]
         }
     ];
+
+    const widgetTypes = [
+        { key: 'kpi', label: 'KPI Cards', desc: 'Single metric cards' },
+        { key: 'line', label: 'Line Charts', desc: 'Time-series trends' },
+        { key: 'area', label: 'Area Charts', desc: 'Filled trend charts' },
+        { key: 'bar', label: 'Bar Charts', desc: 'Comparisons across categories' },
+        { key: 'pie', label: 'Pie Charts', desc: 'Proportional breakdown' },
+        { key: 'donut', label: 'Donut Charts', desc: 'Ring breakdowns' },
+        { key: 'scatter', label: 'Scatter Charts', desc: 'Correlation analysis' },
+        { key: 'map', label: 'Map Charts', desc: 'Geographic metrics' },
+        { key: 'funnel', label: 'Funnel Charts', desc: 'Stage conversion' },
+        { key: 'cohort', label: 'Cohort Charts', desc: 'Retention analysis' },
+        { key: 'table', label: 'Tables', desc: 'Detailed records' },
+        { key: 'markdown', label: 'Markdown', desc: 'Narrative blocks' },
+    ];
+
+    const toggleWidgetType = (type: string) => {
+        const current = new Set(disabledWidgetTypes || []);
+        if (current.has(type)) {
+            current.delete(type);
+        } else {
+            current.add(type);
+        }
+        setDisabledWidgetTypes(Array.from(current));
+    };
 
     return (
         <div className="flex flex-1 h-full overflow-hidden">
@@ -133,6 +158,46 @@ const SettingsView: React.FC = () => {
                                     <span>Stored locally in this browser</span>
                                     <span>{projectSavedAt ? `Saved ${projectSavedAt}` : 'Not saved yet'}</span>
                                 </div>
+                            </div>
+                        </div>
+                    ) : activeTab === 'General' ? (
+                        <div className="bg-[#111318] border border-[#2d3748] rounded-2xl overflow-hidden shadow-xl">
+                            <div className="p-6 border-b border-[#2d3748] flex items-center justify-between">
+                                <div>
+                                    <h2 className="text-lg font-bold text-white">Widget Visibility</h2>
+                                    <p className="text-xs text-slate-500 mt-0.5">
+                                        Disable widget types to prevent the planner from using them.
+                                    </p>
+                                </div>
+                                <button
+                                    onClick={() => setDisabledWidgetTypes([])}
+                                    className="px-3 py-1.5 rounded-lg border border-[#2d3748] text-[11px] font-bold text-slate-300 hover:text-white hover:bg-white/5 transition-all"
+                                >
+                                    Enable All
+                                </button>
+                            </div>
+                            <div className="p-8 grid grid-cols-2 gap-4">
+                                {widgetTypes.map((item) => {
+                                    const disabled = (disabledWidgetTypes || []).includes(item.key);
+                                    return (
+                                        <button
+                                            key={item.key}
+                                            onClick={() => toggleWidgetType(item.key)}
+                                            className={`p-4 rounded-xl border text-left transition-all ${disabled
+                                                ? 'border-red-500/40 bg-red-500/5 text-red-200'
+                                                : 'border-[#2d3748] bg-[#0f1218] text-white hover:border-[#135bec]/60'
+                                                }`}
+                                        >
+                                            <div className="flex items-center justify-between">
+                                                <span className="text-sm font-bold">{item.label}</span>
+                                                <span className={`text-[10px] font-black uppercase tracking-widest ${disabled ? 'text-red-300' : 'text-emerald-300'}`}>
+                                                    {disabled ? 'Disabled' : 'Enabled'}
+                                                </span>
+                                            </div>
+                                            <p className="text-[11px] text-slate-400 mt-2">{item.desc}</p>
+                                        </button>
+                                    );
+                                })}
                             </div>
                         </div>
                     ) : (

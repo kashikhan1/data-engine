@@ -516,16 +516,32 @@ function formatTableInsightsForPrompt(tableInsights: Record<string, TableInsight
     return JSON.stringify(trimmed).slice(0, 6000);
 }
 
-function normalizePlannedWidgets(widgets: any[], schemaInfo: Record<string, any>) {
-    const allowedTypes = new Set(["kpi", "line", "bar", "donut", "table"]);
+function normalizePlannedWidgets(widgets: any[], schemaInfo: Record<string, any>, allowedTypesOverride?: string[]) {
+    const defaultAllowedTypes = [
+        "kpi",
+        "line",
+        "area",
+        "bar",
+        "pie",
+        "donut",
+        "table",
+        "cohort",
+        "funnel",
+        "map",
+        "scatter",
+        "markdown",
+    ];
+    const allowedTypes = new Set(allowedTypesOverride && allowedTypesOverride.length > 0
+        ? allowedTypesOverride
+        : defaultAllowedTypes);
     const tableNames = new Set(Object.keys(schemaInfo || {}));
     const seenIds = new Set<string>();
-    const seenTitles = new Set<string>();
+    const titleCounts = new Map<string, number>();
 
     const cleaned = widgets
         .map((w: any, idx: number) => {
             const type = allowedTypes.has(w?.type) ? w.type : "bar";
-            const title = String(w?.title || w?.name || `Widget ${idx + 1}`).trim();
+            let title = String(w?.title || w?.name || `Widget ${idx + 1}`).trim();
             const idBase = String(w?.id || `w${idx + 1}`).replace(/\s+/g, '_');
             let id = idBase;
             let counter = 1;
@@ -533,10 +549,12 @@ function normalizePlannedWidgets(widgets: any[], schemaInfo: Record<string, any>
                 id = `${idBase}_${counter++}`;
             }
             seenIds.add(id);
-            if (seenTitles.has(title.toLowerCase())) {
-                return null;
+            const titleKey = title.toLowerCase();
+            const nextTitleCount = (titleCounts.get(titleKey) || 0) + 1;
+            titleCounts.set(titleKey, nextTitleCount);
+            if (nextTitleCount > 1) {
+                title = `${title} (${nextTitleCount})`;
             }
-            seenTitles.add(title.toLowerCase());
             const primaryTable = w?.primaryTable && tableNames.has(w.primaryTable) ? w.primaryTable : undefined;
             return {
                 ...w,
@@ -551,7 +569,11 @@ function normalizePlannedWidgets(widgets: any[], schemaInfo: Record<string, any>
     const kpis = cleaned.filter((w) => w.type === "kpi");
     const nonKpis = cleaned.filter((w) => w.type !== "kpi");
     const reordered = [...kpis, ...nonKpis];
-    return reordered.slice(0, 8);
+    const allowedList = allowedTypesOverride && allowedTypesOverride.length > 0
+        ? allowedTypesOverride
+        : defaultAllowedTypes;
+    const maxWidgets = allowedList.length + (allowedList.includes("kpi") ? 3 : 0);
+    return reordered.slice(0, maxWidgets);
 }
 
 function filterSchemaForNonEmptyTables(schema: any) {
@@ -922,6 +944,24 @@ export async function runDashboardPlanner(query: string, schema: any) {
     const schemaForPrompt = filteredSchema || schema;
 
     const tables = Object.keys(schemaForPrompt.schemaInfo || {});
+    const disabledTypes = Array.isArray(schemaForPrompt.disabledWidgetTypes) ? schemaForPrompt.disabledWidgetTypes : [];
+    const allowedTypes = [
+        "kpi",
+        "line",
+        "area",
+        "bar",
+        "pie",
+        "donut",
+        "table",
+        "cohort",
+        "funnel",
+        "map",
+        "scatter",
+        "markdown",
+    ].filter((t) => !disabledTypes.includes(t));
+    const widgetTypeOrder = ["kpi", "line", "area", "bar", "pie", "donut", "scatter", "map", "funnel", "cohort", "markdown", "table"];
+    const orderedAllowedTypes = widgetTypeOrder.filter((t) => allowedTypes.includes(t));
+    const requiredWidgetCount = orderedAllowedTypes.length + (allowedTypes.includes("kpi") ? 3 : 0);
     const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
     const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
     const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
@@ -962,6 +1002,17 @@ ${simplifiedSchema}
 
 RELATIONSHIPS:
 ${relationships}
+
+ALLOWED WIDGET TYPES (STRICT):
+${allowedTypes.join(", ")}
+
+DO NOT include any widget types outside this list.
+You MUST include every allowed widget type at least once.
+${allowedTypes.includes("kpi") ? "Include exactly 4 KPI cards if KPI is allowed." : "Do not include KPI cards if KPI is not allowed."}
+${allowedTypes.includes("table") ? "If table is allowed, the final widget must be a table." : "Do not include tables if table is not allowed."}
+Order widgets using this preferred type order (repeat KPI cards first if enabled):
+${orderedAllowedTypes.join(", ")}
+Total widgets must be exactly ${requiredWidgetCount}.
 
 SAMPLE DATA:
 ${sampleDataText}
@@ -1004,12 +1055,11 @@ If you see support/ticket tables:
 If you see user/session tables:
 - Active users, session duration, bounce rate, conversion rate, retention
 
-### Step 3: Plan Widget Types (Always 6-8 Widgets)
-Widgets 1-4: KPI Cards (4 cards)
-Widget 5: Main Trend Chart (1 line chart)
-Widget 6: Breakdown Chart (1 bar chart)
-Widget 7: Distribution Chart (1 pie/donut chart)
-Widget 8: Detail Table (1 table)
+### Step 3: Plan Widget Types (Cover All Enabled Types)
+- Include every allowed widget type at least once.
+- If KPI is allowed, include exactly 4 KPI cards.
+- Keep table as the final widget if table is allowed.
+- Use the preferred type order listed above.
 
 ### Step 4: Use Relationships Intelligently
 - Use joins to show customer/product performance when relationships exist
@@ -1050,11 +1100,13 @@ WIDGET 2: [Type] - [Title]
 ...
 
 Critical Rules:
-- Always plan exactly 6-8 widgets
-- Always include 4 KPI cards first
-- Always include at least 1 trend chart (line chart)
-- Always include at least 1 breakdown chart (bar or pie)
-- Always include 1 detail table at the end
+- Always include every allowed widget type at least once
+- Total widgets must be exactly ${requiredWidgetCount}
+- If KPI is allowed, include 4 KPI cards first
+- If line is allowed, include at least 1 trend chart
+- If bar is allowed, include at least 1 breakdown chart
+- If pie or donut is allowed, include at least 1 distribution chart
+- If table is allowed, include 1 detail table at the end
 - Identify filters (date range, categorical, entity) and note which widgets each filter affects
 - Use exact column names from the schema
 - Mention which tables need joins
@@ -1076,7 +1128,7 @@ EVENT_STREAM:
     const planText = response.content as string;
 
     const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
-    const widgets = normalizePlannedWidgets(parseNaturalLanguagePlan(planText), schemaForPrompt.schemaInfo || {});
+    const widgets = normalizePlannedWidgets(parseNaturalLanguagePlan(planText), schemaForPrompt.schemaInfo || {}, allowedTypes);
 
     return {
         title: extractDashboardTitle(planText) || "AI Analytics Dashboard",
@@ -1102,6 +1154,24 @@ export async function* runDashboardPlannerStream(query: string, schema: any) {
     const schemaForPrompt = filteredSchema || schema;
 
     const tables = Object.keys(schemaForPrompt.schemaInfo || {});
+    const disabledTypes = Array.isArray(schemaForPrompt.disabledWidgetTypes) ? schemaForPrompt.disabledWidgetTypes : [];
+    const allowedTypes = [
+        "kpi",
+        "line",
+        "area",
+        "bar",
+        "pie",
+        "donut",
+        "table",
+        "cohort",
+        "funnel",
+        "map",
+        "scatter",
+        "markdown",
+    ].filter((t) => !disabledTypes.includes(t));
+    const widgetTypeOrder = ["kpi", "line", "area", "bar", "pie", "donut", "scatter", "map", "funnel", "cohort", "markdown", "table"];
+    const orderedAllowedTypes = widgetTypeOrder.filter((t) => allowedTypes.includes(t));
+    const requiredWidgetCount = orderedAllowedTypes.length + (allowedTypes.includes("kpi") ? 3 : 0);
     const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
     const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
     // Cap to top 12 tables to keep prompts small for large schemas
@@ -1158,6 +1228,17 @@ ${filterSummary}
 ${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
 ${connectorInstructions ? `\nCONNECTOR INSTRUCTIONS:\n${connectorInstructions}` : ''}
 
+ALLOWED WIDGET TYPES (STRICT):
+${allowedTypes.join(", ")}
+
+DO NOT include any widget types outside this list.
+You MUST include every allowed widget type at least once.
+${allowedTypes.includes("kpi") ? "Include exactly 4 KPI cards if KPI is allowed." : "Do not include KPI cards if KPI is not allowed."}
+${allowedTypes.includes("table") ? "If table is allowed, the final widget must be a table." : "Do not include tables if table is not allowed."}
+Order widgets using this preferred type order (repeat KPI cards first if enabled):
+${orderedAllowedTypes.join(", ")}
+Total widgets must be exactly ${requiredWidgetCount}.
+
 ### Your Mission
 Transform database schema and sample data into a complete dashboard widget plan that tells a story.
 
@@ -1180,12 +1261,11 @@ If you see support/ticket tables:
 If you see user/session tables:
 - Active users, session duration, bounce rate, conversion rate, retention
 
-### Step 3: Plan Widget Types (Always 6-8 Widgets)
-Widgets 1-4: KPI Cards (4 cards)
-Widget 5: Main Trend Chart (1 line chart)
-Widget 6: Breakdown Chart (1 bar chart)
-Widget 7: Distribution Chart (1 pie/donut chart)
-Widget 8: Detail Table (1 table)
+### Step 3: Plan Widget Types (Cover All Enabled Types)
+- Include every allowed widget type at least once.
+- If KPI is allowed, include exactly 4 KPI cards.
+- Keep table as the final widget if table is allowed.
+- Use the preferred type order listed above.
 
 ### Step 4: Use Relationships Intelligently
 - Use joins to show customer/product performance when relationships exist
@@ -1226,11 +1306,13 @@ WIDGET 2: [Type] - [Title]
 ...
 
 Critical Rules:
-- Always plan exactly 6-8 widgets
-- Always include 4 KPI cards first
-- Always include at least 1 trend chart (line chart)
-- Always include at least 1 breakdown chart (bar or pie)
-- Always include 1 detail table at the end
+- Always include every allowed widget type at least once
+- Total widgets must be exactly ${requiredWidgetCount}
+- If KPI is allowed, include 4 KPI cards first
+- If line is allowed, include at least 1 trend chart
+- If bar is allowed, include at least 1 breakdown chart
+- If pie or donut is allowed, include at least 1 distribution chart
+- If table is allowed, include 1 detail table at the end
 - Identify filters (date range, categorical, entity) and note which widgets each filter affects
 - Use exact column names from the schema
 - Mention which tables need joins
@@ -1284,8 +1366,29 @@ export async function finalizePlan(planText: string) {
  * Expert PostgreSQL database developer and query optimizer.
  * Generates optimized, safe, and high-performance SQL for every widget.
  */
+function normalizeSqlForValidation(sql: string) {
+    let text = String(sql || "");
+    if (!text) return "";
+    text = text.replace(/^\uFEFF/, "");
+    text = text.replace(/```/g, "");
+    text = text.replace(/^\s*sql\s*:/i, "");
+    text = text.trimStart();
+    while (text.startsWith("--") || text.startsWith("#") || text.startsWith("/*")) {
+        if (text.startsWith("--") || text.startsWith("#")) {
+            text = text.replace(/^(--|#)[^\n]*\n?/, "").trimStart();
+            continue;
+        }
+        if (text.startsWith("/*")) {
+            text = text.replace(/^\/\*[\s\S]*?\*\//, "").trimStart();
+            continue;
+        }
+        break;
+    }
+    return text.trim();
+}
+
 function validateSqlAgainstInstructions(sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) {
-    const trimmed = String(sql || "").trim();
+    const trimmed = normalizeSqlForValidation(sql);
     if (!trimmed.toLowerCase().startsWith("select")) {
         return { ok: false, error: "Validation failed: SQL must start with SELECT." };
     }
@@ -2393,7 +2496,7 @@ const detectIsMssql = (connectionString?: string, connectorType?: string) => {
 };
 
 const validateSqlWithInstructions = (sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) => {
-    const trimmed = String(sql || "").trim();
+    const trimmed = normalizeSqlForValidation(sql);
     if (!trimmed.toLowerCase().startsWith("select")) {
         return { ok: false, error: "Validation failed: SQL must start with SELECT." };
     }
@@ -3137,6 +3240,21 @@ export async function dashboardPlannerAgent(state: typeof AgentState.State) {
     const focusTable = state.context?.focusTable;
     const tableInsightsText = formatTableInsightsForPrompt(state.dataProfile || null);
     const projectContext = state.context?.projectContext || state.context?.projectAbout || "";
+    const disabledTypes = Array.isArray(state.context?.disabledWidgetTypes) ? state.context?.disabledWidgetTypes : [];
+    const allowedTypes = [
+        "kpi",
+        "line",
+        "area",
+        "bar",
+        "pie",
+        "donut",
+        "table",
+        "cohort",
+        "funnel",
+        "map",
+        "scatter",
+        "markdown",
+    ].filter((t) => !disabledTypes.includes(t));
     const prompt = `Role: Senior Software Architect (15+ years in AI, backend engineering, data analytics, scalable system design).
     TASK: Design a dynamic, efficient, analytics-driven dashboard directly from the schema.
     
@@ -3147,6 +3265,11 @@ export async function dashboardPlannerAgent(state: typeof AgentState.State) {
     SAMPLES_CONEXT: ${JSON.stringify(state.sampleData || {})}
     ${tableInsightsText ? `TABLE_INSIGHTS: ${tableInsightsText}` : ''}
     ${focusTable ? `PRIMARY_ENTITY: Targeting table '${focusTable}'.` : ''}
+
+    ALLOWED WIDGET TYPES (STRICT):
+    ${allowedTypes.join(", ")}
+
+    DO NOT include any widget types outside this list.
 
     ARCHITECTURE & DESIGN PRINCIPLES:
     1) Data Discovery & Context: Inspect schema, types, constraints, and latest records to validate assumptions.
@@ -3190,6 +3313,26 @@ export async function dashboardPlannerAgent(state: typeof AgentState.State) {
     const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
     let plan = extractJSON(response.content as string) || { title: "AI Dashboard", widgets: [] };
 
+    const filterWidgetsByType = (value: any) => {
+        if (!value || !Array.isArray(value.widgets) || allowedTypes.length === 0) return value;
+        const allowedSet = new Set(allowedTypes);
+        return {
+            ...value,
+            widgets: value.widgets.filter((w: any) => allowedSet.has(w?.type)),
+        };
+    };
+    const buildWidgetOverviewText = (widgets: any[]) => {
+        const lines: string[] = ["Widgets Overview"];
+        widgets.forEach((w) => {
+            const title = String(w?.title || w?.name || "Widget").trim();
+            const type = String(w?.type || "chart").trim();
+            const goal = String(w?.goal || "").trim();
+            lines.push(`${title} (${type})`);
+            if (goal) lines.push(goal);
+        });
+        return lines.join("\n");
+    };
+
     // Demo-ready fallback: ensure we always have widgets to drive SQL/visualization
     if (!plan.widgets || plan.widgets.length < 4) {
         const fallbackPlan = buildFallbackPlanFromSchema(state.schemaInfo);
@@ -3199,6 +3342,23 @@ export async function dashboardPlannerAgent(state: typeof AgentState.State) {
             // As a last resort, synthesize a demo plan so the UI always renders
             plan = buildDemoPlan(intent?.intent || "Demo Analytics Overview") as any;
         }
+    }
+
+    plan = filterWidgetsByType(plan);
+    if (disabledTypes.length > 0) {
+        plan = {
+            ...plan,
+            actionable_plan: buildWidgetOverviewText(plan.widgets || []),
+        };
+    }
+
+    if (allowedTypes.length === 0) {
+        return {
+            queryPlan: { ...plan, widgets: [] },
+            errors: ["All widget types are disabled in settings."],
+            status: "No widget types enabled. Update Widget Visibility settings and retry.",
+            messages: [new AIMessage("[PLANNER] All widget types are disabled; cannot generate a plan.")],
+        };
     }
 
     return {

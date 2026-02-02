@@ -34,8 +34,29 @@ const extractInstructionRules = (instructions: string) => {
     return { bans, requires };
 };
 
+const normalizeSqlForValidation = (sql: string) => {
+    let text = String(sql || "");
+    if (!text) return "";
+    text = text.replace(/^\uFEFF/, "");
+    text = text.replace(/```/g, "");
+    text = text.replace(/^\s*sql\s*:/i, "");
+    text = text.trimStart();
+    while (text.startsWith("--") || text.startsWith("#") || text.startsWith("/*")) {
+        if (text.startsWith("--") || text.startsWith("#")) {
+            text = text.replace(/^(--|#)[^\n]*\n?/, "").trimStart();
+            continue;
+        }
+        if (text.startsWith("/*")) {
+            text = text.replace(/^\/\*[\s\S]*?\*\//, "").trimStart();
+            continue;
+        }
+        break;
+    }
+    return text.trim();
+};
+
 const validateSql = (sql: string, connectionString?: string, connectorInstructions?: string) => {
-    const trimmed = String(sql || "").trim();
+    const trimmed = normalizeSqlForValidation(sql);
     if (!trimmed.toLowerCase().startsWith("select")) {
         return { ok: false, error: "Validation failed: SQL must start with SELECT." };
     }

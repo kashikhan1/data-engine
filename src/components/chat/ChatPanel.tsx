@@ -90,7 +90,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         }
     }, [runError]);
 
-    const { projectContext, postgresUrl, dataSources, selectedDataSourceId, setSelectedDataSourceId, setPostgresUrl } = useConfigStore();
+    const { projectContext, postgresUrl, dataSources, selectedDataSourceId, setSelectedDataSourceId, setPostgresUrl, disabledWidgetTypes } = useConfigStore();
     const [isPipelineRunning, setIsPipelineRunning] = useState(false);
     const [showPipelineOutput, setShowPipelineOutput] = useState(true);
     const [activeOutputTab, setActiveOutputTab] = useState<'schema' | 'plan' | 'sql' | 'execute' | 'dashboard'>('schema');
@@ -263,7 +263,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             const planResponse = await fetch('/api/plan/stream', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({ query, schema: resolvedSchema })
+                body: JSON.stringify({
+                    query,
+                    schema: {
+                        ...resolvedSchema,
+                        disabledWidgetTypes
+                    }
+                })
             });
             if (!planResponse.ok || !planResponse.body) {
                 throw new Error("Planner connection failed.");
@@ -299,10 +305,39 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             }
             const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
             const cleanedPlanText = planText.split("EVENT_STREAM:")[0]?.trim() || planText.trim();
+            const allowedTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
+            (disabledWidgetTypes || []).forEach((t) => allowedTypes.delete(t));
+            const buildFilteredPlanText = (title: string, widgets: any[]) => {
+                const lines: string[] = [];
+                lines.push(`DASHBOARD TITLE: ${title || "AI Analytics Dashboard"}`);
+                lines.push("PURPOSE: Auto-generated plan based on enabled widget types.");
+                lines.push("");
+                lines.push("FILTERS TO INCLUDE:");
+                lines.push("1) None");
+                lines.push("");
+                widgets.forEach((w: any, idx: number) => {
+                    const widgetTitle = String(w?.title || `Widget ${idx + 1}`).trim();
+                    const widgetType = String(w?.type || "chart").trim();
+                    const goal = String(w?.goal || "Visualization").trim();
+                    lines.push(`WIDGET ${idx + 1}: ${widgetType} - ${widgetTitle}`);
+                    lines.push(`Shows: ${goal}`);
+                    lines.push("Why: Enabled widget type per settings.");
+                    lines.push("Uses: Not specified.");
+                    lines.push("Filters applied: None.");
+                    lines.push("Notes: Filtered to enabled widget types.");
+                    lines.push("");
+                });
+                return lines.join("\n").trim();
+            };
+            const parsedWidgets = parseNaturalLanguagePlan(cleanedPlanText).filter((w: any) => allowedTypes.has(w?.type));
+            const title = extractDashboardTitle(cleanedPlanText) || "AI Analytics Dashboard";
+            const normalizedPlanText = (disabledWidgetTypes || []).length > 0
+                ? buildFilteredPlanText(title, parsedWidgets)
+                : cleanedPlanText;
             const finalizedPlan = {
-                title: extractDashboardTitle(cleanedPlanText) || "AI Analytics Dashboard",
-                rawPlan: cleanedPlanText,
-                widgets: parseNaturalLanguagePlan(cleanedPlanText)
+                title,
+                rawPlan: normalizedPlanText,
+                widgets: parsedWidgets
             };
             setAiPlan(finalizedPlan);
             setUserPlan(finalizedPlan);
@@ -819,8 +854,29 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             } as any);
         };
 
+        const normalizeSqlForValidation = (sql: string) => {
+            let text = String(sql || '');
+            if (!text) return '';
+            text = text.replace(/^\uFEFF/, '');
+            text = text.replace(/```/g, '');
+            text = text.replace(/^\s*sql\s*:/i, '');
+            text = text.trimStart();
+            while (text.startsWith('--') || text.startsWith('#') || text.startsWith('/*')) {
+                if (text.startsWith('--') || text.startsWith('#')) {
+                    text = text.replace(/^(--|#)[^\n]*\n?/, '').trimStart();
+                    continue;
+                }
+                if (text.startsWith('/*')) {
+                    text = text.replace(/^\/\*[\s\S]*?\*\//, '').trimStart();
+                    continue;
+                }
+                break;
+            }
+            return text.trim();
+        };
+
         const validateSql = (sql: string) => {
-            const trimmed = String(sql || '').trim();
+            const trimmed = normalizeSqlForValidation(sql);
             if (!trimmed.toLowerCase().startsWith('select')) {
                 return { ok: false, error: 'Validation failed: SQL must start with SELECT.' };
             }
