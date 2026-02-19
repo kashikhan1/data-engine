@@ -40,27 +40,34 @@ export async function POST(req: NextRequest) {
         const encoder = new TextEncoder();
         const readableStream = new ReadableStream({
             async start(controller) {
-                for await (const chunk of stream) {
-                    // Identify which node produced the update
-                    const nodeName = Object.keys(chunk)[0];
-                    const update = (chunk as any)[nodeName];
+                try {
+                    for await (const chunk of stream) {
+                        // Identify which node produced the update
+                        const nodeName = Object.keys(chunk)[0];
+                        const update = (chunk as any)[nodeName];
 
-                    if (update.status) {
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "status", content: update.status })}\n\n`));
-                    }
+                        if (update.status) {
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "status", content: update.status })}\n\n`));
+                        }
 
-                    if (update.dashboard) {
-                        controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "dashboard", content: update.dashboard })}\n\n`));
-                    }
+                        if (update.dashboard) {
+                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "dashboard", content: update.dashboard })}\n\n`));
+                        }
 
-                    if (update.messages && update.messages.length > 0) {
-                        const lastMsg = update.messages[update.messages.length - 1];
-                        if (lastMsg._getType() === "ai") {
-                            controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message", content: lastMsg.content })}\n\n`));
+                        if (update.messages && update.messages.length > 0) {
+                            const lastMsg = update.messages[update.messages.length - 1];
+                            if (lastMsg._getType() === "ai") {
+                                controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "message", content: lastMsg.content })}\n\n`));
+                            }
                         }
                     }
+                } catch (error: any) {
+                    const message = error?.message || "Chat stream failed";
+                    console.error("Chat API Stream Error:", error);
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ type: "error", content: message })}\n\n`));
+                } finally {
+                    controller.close();
                 }
-                controller.close();
             },
         });
 

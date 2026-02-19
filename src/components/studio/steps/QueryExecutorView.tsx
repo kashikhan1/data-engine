@@ -1,9 +1,13 @@
 'use client';
 
-import React, { useState, useEffect, useRef, useCallback } from 'react';
+import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useWorkflowStore, useDashboardStore, useConfigStore } from '@/state/stores';
-import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery, runSchemaDiscovery } from '@/lib/agents/nodes';
+import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from '@/lib/agents/nodes';
+import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
+import { buildExecutionContext as buildSharedExecutionContext } from '@/lib/execution-context';
+import { getPaginationForId, toRecordFromFilterMap } from '@/lib/pagination';
 import {
+    App,
     Button,
     Card,
     Typography,
@@ -13,7 +17,6 @@ import {
     Tag,
     Table,
     Progress,
-    message,
     Tooltip
 } from 'antd';
 import {
@@ -30,7 +33,7 @@ import {
 const { Title, Text } = Typography;
 
 export const QueryExecutorView: React.FC = () => {
-    const { postgresUrl, projectContext } = useConfigStore();
+    const { postgresUrl, projectContext, dataSources, selectedDataSourceId } = useConfigStore();
     const {
         userPlan,
         aiPlan,
@@ -52,7 +55,7 @@ export const QueryExecutorView: React.FC = () => {
         sqlErrorLog
     } = useWorkflowStore();
 
-    const [messageApi, contextHolder] = message.useMessage();
+    const { message: messageApi } = App.useApp();
     const messageQueueRef = useRef<Array<() => void>>([]);
     const [messageTick, setMessageTick] = useState(0);
     const enqueueMessage = useCallback((fn: () => void) => {
@@ -60,7 +63,17 @@ export const QueryExecutorView: React.FC = () => {
         setMessageTick((tick) => tick + 1);
     }, []);
     const [repairingIds, setRepairingIds] = useState<Set<string>>(new Set());
-    const { setDashboard } = useDashboardStore();
+    const { setDashboard, activeFilters } = useDashboardStore();
+    const selectedConnector = useMemo(() => {
+        const connectors = (dataSources || []).filter((ds) => {
+            const type = String(ds?.type || "").toLowerCase();
+            return type.includes("postgres") || type.includes("mssql") || type.includes("sql") || type.includes("mcp");
+        });
+        return connectors.find((ds) => ds.id === selectedDataSourceId) || connectors.find((ds) => Boolean(ds.connectionString)) || null;
+    }, [dataSources, selectedDataSourceId]);
+    const resolvedConnectionString = selectedConnector?.connectionString || postgresUrl || schemaData?.connectionString || undefined;
+    const resolvedConnectorType = selectedConnector?.type || schemaData?.connectorType || "";
+    const resolvedConnectorInstructions = selectedConnector?.instructions || schemaData?.connectorInstructions || "";
     const normalizeError = (err: any) => {
         if (!err) return 'Execution failed';
         if (typeof err === 'string') return err;
@@ -125,7 +138,7 @@ export const QueryExecutorView: React.FC = () => {
                 sampleData,
                 tableCounts,
                 relationships,
-                connectionString: postgresUrl,
+                connectionString: resolvedConnectionString,
                 filterCandidates: null,
                 rawAnalysis: "Loaded schema from local selection.",
                 filterSummary: ""
@@ -133,11 +146,16 @@ export const QueryExecutorView: React.FC = () => {
         } catch {
             // ignore localStorage parse errors
         }
-    }, [schemaData, setSchemaData]);
+    }, [schemaData, setSchemaData, resolvedConnectionString]);
 
     const handleExecute = async () => {
         const queriesToRun = userQueries || aiQueries;
         if (!queriesToRun) return;
+        const plan = userPlan || aiPlan;
+        if (!resolvedConnectionString) {
+            setError("No SQL connection found. Connect a data source first.");
+            return;
+        }
 
         setProcessing(true);
         setError(null);
@@ -147,11 +165,22 @@ export const QueryExecutorView: React.FC = () => {
         queriesToRun.forEach((q: any) => {
             queryMap[q.id] = q.sql;
         });
+        const executionContext = buildSharedExecutionContext({
+            planFilters: plan?.filters || [],
+            activeFilters,
+            candidateWidgets: plan?.widgets || [],
+            includeTotal: true,
+            allowGlobalFallback: true
+        });
+        const tablePagination = executionContext.tablePagination;
+        const runtimeParams = executionContext.runtimeParams;
 
         try {
-            const data = await runQueryExecutor(queryMap, postgresUrl || undefined, {
-                connectorInstructions: schemaData?.connectorInstructions || "",
-                connectorType: schemaData?.connectorType || ""
+            const data = await runQueryExecutor(queryMap, resolvedConnectionString, {
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                tablePagination,
+                runtimeParams
             });
             // Convert Record to array for display
             const resultsList = Object.entries(data).map(([id, result]: [string, any]) => ({
@@ -194,7 +223,7 @@ export const QueryExecutorView: React.FC = () => {
                                 errorMessage: res.error || 'Execution failed',
                                 schema: schemaData,
                                 errorLog: sqlErrorLog,
-                                connectionString: postgresUrl || undefined
+                                connectionString: resolvedConnectionString
                             });
                             // Update queries with repaired SQL using latest edits
                             workingQueries = (workingQueries || []).map((q: any) =>
@@ -203,9 +232,13 @@ export const QueryExecutorView: React.FC = () => {
                             setUserQueries(workingQueries);
 
                             // Re-execute repaired query
-                            const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined, {
-                                connectorInstructions: schemaData?.connectorInstructions || "",
-                                connectorType: schemaData?.connectorType || ""
+                            const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, resolvedConnectionString, {
+                                connectorInstructions: resolvedConnectorInstructions,
+                                connectorType: resolvedConnectorType,
+                                tablePagination: tablePagination[res.id]
+                                    ? { [res.id]: tablePagination[res.id] }
+                                    : undefined,
+                                runtimeParams
                             });
                             const fixed = rerun[res.id];
 
@@ -257,7 +290,10 @@ export const QueryExecutorView: React.FC = () => {
                 console.log("[SQL_REPAIR] Schema missing from state, re-fetching...");
                 const storedTablesRaw = localStorage.getItem('schema_selected_tables');
                 const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                currentSchema = await runSchemaDiscovery(postgresUrl, { projectContext }, allowedTables);
+                if (!resolvedConnectionString) {
+                    throw new Error("No SQL connection string available.");
+                }
+                currentSchema = await runSchemaDiscovery(resolvedConnectionString, { projectContext }, allowedTables);
                 setSchemaData(currentSchema);
                 enqueueMessage(() => messageApi.success({ content: 'Schema context restored.', key: 'schema_sync' }));
             } catch (err: any) {
@@ -288,7 +324,8 @@ export const QueryExecutorView: React.FC = () => {
                 originalSql: originalSql,
                 errorMessage: errorMessage,
                 schema: currentSchema,
-                errorLog: sqlErrorLog
+                errorLog: sqlErrorLog,
+                connectionString: resolvedConnectionString
             });
 
             enqueueMessage(() => messageApi.success({ content: `Fixed: ${repairResult.explanation}`, key: queryId, duration: 3 }));
@@ -301,9 +338,27 @@ export const QueryExecutorView: React.FC = () => {
             setUserQueries(updatedQueries);
 
             // Now execute the repaired query
-            const data = await runQueryExecutor({ [queryId]: repairResult.sql }, postgresUrl || undefined, {
-                connectorInstructions: schemaData?.connectorInstructions || "",
-                connectorType: schemaData?.connectorType || ""
+            const data = await runQueryExecutor({ [queryId]: repairResult.sql }, resolvedConnectionString, {
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                tablePagination: (() => {
+                    return {
+                        [queryId]: {
+                            ...getPaginationForId(toRecordFromFilterMap(activeFilters), queryId, {
+                                includeTotal: true,
+                                allowGlobalFallback: true
+                            }),
+                            includeTotal: true
+                        }
+                    };
+                })(),
+                runtimeParams: buildSharedExecutionContext({
+                    planFilters: (userPlan || aiPlan)?.filters || [],
+                    activeFilters,
+                    candidateWidgets: [],
+                    includeTotal: true,
+                    allowGlobalFallback: true
+                }).runtimeParams
             });
             const newItem = data[queryId];
 
@@ -414,7 +469,6 @@ export const QueryExecutorView: React.FC = () => {
 
     return (
         <div style={{ padding: '24px', height: '100%', overflowY: 'auto' }}>
-            {contextHolder}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, padding: '16px 20px', borderRadius: 16, border: '1px solid #242a36', background: '#0f1218' }}>
                 <div>
                     <Title level={2} style={{ margin: 0 }}>
@@ -444,11 +498,11 @@ export const QueryExecutorView: React.FC = () => {
 
             {error && (
                 <Alert
-                    title="Execution Error"
-                    description={error}
+                    title={<span style={{ color: '#fff' }}>Execution Alert</span>}
+                    description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{error}</span>}
                     type="error"
                     showIcon
-                    style={{ marginBottom: 24 }}
+                    style={{ marginBottom: 24, background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                 />
             )}
 
@@ -489,15 +543,15 @@ export const QueryExecutorView: React.FC = () => {
                                     columns={Object.keys(res.data?.[0] || {})
                                         .filter(key => key !== '__rowKey')
                                         .map(key => ({
-                                        title: key,
-                                        dataIndex: key,
-                                        key: key,
-                                        render: (val: any) => (
-                                            <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>
-                                                {String(val)}
-                                            </div>
-                                        )
-                                    }))}
+                                            title: key,
+                                            dataIndex: key,
+                                            key: key,
+                                            render: (val: any) => (
+                                                <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>
+                                                    {String(val)}
+                                                </div>
+                                            )
+                                        }))}
                                     rowKey="__rowKey"
                                 />
                             </div>
@@ -508,14 +562,14 @@ export const QueryExecutorView: React.FC = () => {
                             </div>
                         ) : (
                             <Alert
-                                title="Query Failed"
+                                title={<span style={{ color: '#fff' }}>Query Failed</span>}
                                 description={
                                     <div>
-                                        <div>{res.error}</div>
+                                        <div style={{ color: 'rgba(255, 255, 255, 0.8)' }}>{res.error}</div>
                                         {res.sql && (
                                             <div style={{ marginTop: 8 }}>
-                                                <Text type="secondary" style={{ fontSize: 11 }}>Original SQL:</Text>
-                                                <pre style={{ fontSize: 10, maxHeight: 60, overflow: 'auto', background: '#0a0c10', padding: 8, borderRadius: 4, marginTop: 4 }}>
+                                                <Text style={{ fontSize: 11, color: 'rgba(255, 255, 255, 0.5)' }}>Original SQL:</Text>
+                                                <pre style={{ fontSize: 10, maxHeight: 60, overflow: 'auto', background: '#0a0c10', padding: 8, borderRadius: 4, marginTop: 4, color: '#e6edf3' }}>
                                                     {res.sql}
                                                 </pre>
                                             </div>
@@ -524,6 +578,7 @@ export const QueryExecutorView: React.FC = () => {
                                 }
                                 type="error"
                                 showIcon
+                                style={{ background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                                 action={
                                     <Button
                                         size="small"

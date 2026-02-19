@@ -5,7 +5,9 @@ import { useWorkflowStore, useDashboardStore, useEditorStore, useRunStore, useCo
 import { DashboardCanvas } from '@/components/canvas/DashboardCanvas';
 import { FilterBar } from '@/components/canvas/FilterBar';
 import { assembleFinalDashboard, runNarrativeGenerator, runQueryExecutor, repairFailedQuery } from '@/lib/agents/nodes';
+import { buildExecutionContext as buildSharedExecutionContext } from '@/lib/execution-context';
 import {
+    App,
     Button,
     Typography,
     Space,
@@ -13,8 +15,6 @@ import {
     Layout,
     Menu,
     Dropdown,
-    message,
-    Modal,
     Result,
     Tag,
     Spin
@@ -37,7 +37,7 @@ const { Header, Content, Sider } = Layout;
 const { Title, Text } = Typography;
 
 export const DashboardRenderView: React.FC = () => {
-    const { postgresUrl } = useConfigStore();
+    const { postgresUrl, dataSources, selectedDataSourceId } = useConfigStore();
     const {
         setStep,
         reset: resetWorkflow,
@@ -76,6 +76,7 @@ export const DashboardRenderView: React.FC = () => {
     const [assembleError, setAssembleError] = useState<string | null>(null);
     const assemblingRef = useRef(false);
     const lastAppliedFiltersRef = useRef<string>('');
+    const autoApplyTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const [filtersDirty, setFiltersDirty] = useState(false);
     const {
         userPlan,
@@ -84,9 +85,20 @@ export const DashboardRenderView: React.FC = () => {
         aiQueries,
         executionResults
     } = useWorkflowStore();
+    const plan = userPlan || aiPlan;
+    const queries = userQueries || aiQueries;
+    const selectedConnector = useMemo(() => {
+        const connectors = (dataSources || []).filter((ds) => {
+            const type = String(ds?.type || "").toLowerCase();
+            return type.includes("postgres") || type.includes("mssql") || type.includes("sql") || type.includes("mcp");
+        });
+        return connectors.find((ds) => ds.id === selectedDataSourceId) || connectors.find((ds) => Boolean(ds.connectionString)) || null;
+    }, [dataSources, selectedDataSourceId]);
+    const resolvedConnectionString = selectedConnector?.connectionString || postgresUrl || schemaData?.connectionString || undefined;
+    const resolvedConnectorType = selectedConnector?.type || schemaData?.connectorType || "";
+    const resolvedConnectorInstructions = selectedConnector?.instructions || schemaData?.connectorInstructions || "";
 
-    const [modal, contextHolder] = Modal.useModal();
-    const [messageApi, messageContextHolder] = message.useMessage();
+    const { modal, message: messageApi } = App.useApp();
     const messageQueueRef = useRef<Array<() => void>>([]);
     const [messageTick, setMessageTick] = useState(0);
     const enqueueMessage = useCallback((fn: () => void) => {
@@ -131,7 +143,9 @@ export const DashboardRenderView: React.FC = () => {
         return localLayout || dashboard?.layout || [];
     }, [localLayout, dashboard?.layout]);
 
-    const filterKey = useMemo(() => JSON.stringify(Object.fromEntries(activeFilters)), [activeFilters]);
+    // Important: activeFilters is a Map that may mutate without reference changes.
+    // Build the key from entries on every render so pagination/search updates always trigger auto-apply.
+    const filterKey = JSON.stringify(Object.fromEntries(Array.from(activeFilters.entries())));
 
     const widgetStats = useMemo(() => {
         const total = widgets.length;
@@ -141,7 +155,7 @@ export const DashboardRenderView: React.FC = () => {
         return { total, kpis, charts, tables };
     }, [widgets]);
 
-    const getWidgetData = (widgetId: string) => {
+    const findWidgetResult = (widgetId: string) => {
         // Prefer fresh executor results so KPIs/charts stay live
         const widgetMeta = dashboard?.widgets?.find((w: any) => w.id === widgetId);
         const latestResult = executionResults?.find((r: any) =>
@@ -149,28 +163,43 @@ export const DashboardRenderView: React.FC = () => {
             r.id === widgetMeta?.queryId ||
             (widgetMeta?.title && r.title && r.title.toLowerCase() === widgetMeta.title.toLowerCase())
         );
-        if (latestResult?.data) return latestResult.data;
+        if (latestResult) return latestResult;
 
         // Fallback: match via query mapping
         const mappedQuery = dashboard?.queries?.find((q: any) => q.widgetIds?.includes?.(widgetId));
         if (mappedQuery) {
             const mappedResult = executionResults?.find((r: any) => r.id === mappedQuery.id);
-            if (mappedResult?.data) return mappedResult.data;
+            if (mappedResult) return mappedResult;
         }
 
         // 1. Check live partial results (streaming)
         const streamResults = partialResults.get(`q_${widgetId}`) || partialResults.get(widgetId);
-        if (streamResults) return streamResults;
+        if (streamResults) {
+            return { data: streamResults };
+        }
 
         // 2. Check query-mapped results
         const query = dashboard?.queries?.find((q: any) => q.widgetIds.includes(widgetId));
         if (query?.id && partialResults.has(query.id)) {
-            return partialResults.get(query.id);
+            return { data: partialResults.get(query.id) };
         }
 
         // 3. Fallback to data already in the widget object
         const widget = dashboard?.widgets?.find((w: any) => w.id === widgetId);
-        return widget?.data;
+        return { data: widget?.data };
+    };
+
+    const getWidgetData = (widgetId: string) => {
+        const result = findWidgetResult(widgetId);
+        return result?.data;
+    };
+
+    const getWidgetMeta = (widgetId: string) => {
+        const result = findWidgetResult(widgetId);
+        if (typeof result?.totalRows === "number" && Number.isFinite(result.totalRows)) {
+            return { totalRows: result.totalRows };
+        }
+        return undefined;
     };
 
     const handleSaveDashboard = () => {
@@ -188,10 +217,10 @@ export const DashboardRenderView: React.FC = () => {
     };
 
     // Auto-assemble when arriving on step 5 with stale or missing dashboard.
+    const needsAssemble = !dashboard || staleStep === 5;
+
     useEffect(() => {
-        if ((dashboard && staleStep !== 5) || assemblingRef.current) return;
-        const plan = userPlan || aiPlan;
-        const queries = userQueries || aiQueries;
+        if (!needsAssemble || assemblingRef.current) return;
         if (!plan || !queries || !executionResults) return;
 
         assemblingRef.current = true;
@@ -217,7 +246,7 @@ export const DashboardRenderView: React.FC = () => {
         };
 
         assemble();
-    }, [dashboard, staleStep, userPlan, aiPlan, userQueries, aiQueries, executionResults, setDashboard, setStaleStep, schemaData]);
+    }, [needsAssemble, plan, queries, executionResults, setDashboard, setStaleStep, schemaData]);
 
     const handleRefreshSchema = () => {
         modal.confirm({
@@ -247,6 +276,10 @@ export const DashboardRenderView: React.FC = () => {
     const regenerateWithFilters = useCallback(async () => {
         const plan = userPlan || aiPlan;
         if (!plan || !schemaData) return;
+        if (!resolvedConnectionString) {
+            enqueueMessage(() => messageApi.error({ content: 'No SQL connection found. Connect a data source first.', key: 'filter-refresh', duration: 4 }));
+            return;
+        }
 
         try {
             markFiltersActivated();
@@ -261,7 +294,10 @@ export const DashboardRenderView: React.FC = () => {
                     schema: schemaData,
                     filters: Object.fromEntries(activeFilters),
                     applyFilters: true,
-                    errorLog: sqlErrorLog
+                    errorLog: sqlErrorLog,
+                    connectorInstructions: resolvedConnectorInstructions,
+                    connectorType: resolvedConnectorType,
+                    connectionString: resolvedConnectionString
                 })
             });
 
@@ -313,9 +349,19 @@ export const DashboardRenderView: React.FC = () => {
                 queryMap[q.id] = q.sql;
             });
 
-            const data = await runQueryExecutor(queryMap, postgresUrl || undefined, {
-                connectorInstructions: schemaData?.connectorInstructions || "",
-                connectorType: schemaData?.connectorType || ""
+            const executionContext = buildSharedExecutionContext({
+                planFilters: plan?.filters || [],
+                activeFilters,
+                candidateWidgets: (dashboard?.widgets && dashboard.widgets.length > 0) ? dashboard.widgets : (plan.widgets || []),
+                includeTotal: true,
+                allowGlobalFallback: true
+            });
+
+            const data = await runQueryExecutor(queryMap, resolvedConnectionString, {
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                tablePagination: executionContext.tablePagination,
+                runtimeParams: executionContext.runtimeParams
             });
             let resultsList = Object.entries(data).map(([id, result]: [string, any]) => ({
                 id,
@@ -349,12 +395,14 @@ export const DashboardRenderView: React.FC = () => {
                         errorMessage: res.error || 'Execution failed',
                         schema: schemaData,
                         errorLog: sqlErrorLog,
-                        connectionString: postgresUrl || undefined
+                        connectionString: resolvedConnectionString
                     });
                     query.sql = repairResult.sql;
-                    const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, postgresUrl || undefined, {
-                        connectorInstructions: schemaData?.connectorInstructions || "",
-                        connectorType: schemaData?.connectorType || ""
+                    const rerun = await runQueryExecutor({ [res.id]: repairResult.sql }, resolvedConnectionString, {
+                        connectorInstructions: resolvedConnectorInstructions,
+                        connectorType: resolvedConnectorType,
+                        tablePagination: executionContext.tablePagination,
+                        runtimeParams: executionContext.runtimeParams
                     });
                     const fixed = rerun[res.id];
                     resultsList = resultsList.map((r: any) =>
@@ -364,12 +412,6 @@ export const DashboardRenderView: React.FC = () => {
                     // keep original error result
                 }
             }
-            const hasData = resultsList.some((r: any) => r.status === 'success' && Array.isArray(r.data) && r.data.length > 0);
-                if (!hasData) {
-                enqueueMessage(() => messageApi.warning({ content: 'Filters returned no data. Keeping previous results.', key: 'filter-refresh', duration: 4 }));
-                return;
-            }
-
             setAiQueries(queryList);
             setUserQueries(queryList);
             setExecutionResults(resultsList);
@@ -408,7 +450,90 @@ export const DashboardRenderView: React.FC = () => {
         setStaleStep,
         filterKey,
         enqueueMessage,
-        messageApi
+        messageApi,
+        resolvedConnectionString,
+        resolvedConnectorInstructions,
+        resolvedConnectorType,
+        markFiltersActivated
+    ]);
+
+    const reexecuteCurrentQueries = useCallback(async () => {
+        const plan = userPlan || aiPlan;
+        const queriesList = userQueries || aiQueries;
+        if (!plan || !queriesList || !schemaData) return;
+        if (!resolvedConnectionString) {
+            enqueueMessage(() => messageApi.error({ content: 'No SQL connection found. Connect a data source first.', key: 'filter-refresh', duration: 4 }));
+            return;
+        }
+
+        try {
+            markFiltersActivated();
+            setProcessing(true);
+            enqueueMessage(() => messageApi.loading({ content: 'Applying pagination...', key: 'filter-refresh', duration: 0 }));
+
+            const queryMap: Record<string, string> = {};
+            queriesList.forEach((q: any) => {
+                queryMap[q.id] = q.sql;
+            });
+
+            const executionContext = buildSharedExecutionContext({
+                planFilters: plan?.filters || [],
+                activeFilters,
+                candidateWidgets: (dashboard?.widgets && dashboard.widgets.length > 0) ? dashboard.widgets : (plan.widgets || []),
+                includeTotal: true,
+                allowGlobalFallback: true
+            });
+
+            const data = await runQueryExecutor(queryMap, resolvedConnectionString, {
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                tablePagination: executionContext.tablePagination,
+                runtimeParams: executionContext.runtimeParams
+            });
+
+            const resultsList = Object.entries(data).map(([id, result]: [string, any]) => ({
+                id,
+                ...result,
+                title: queriesList.find((q: any) => q.id === id)?.title || id
+            }));
+
+            setExecutionResults(resultsList);
+            let insights: string[] = [];
+            try {
+                insights = await runNarrativeGenerator(resultsList as any[]);
+            } catch {
+                insights = [];
+            }
+            const finalDash = await assembleFinalDashboard(plan, queriesList as any[], resultsList as any[], insights, schemaData?.filterCandidates);
+            setDashboard(finalDash as any);
+            setStaleStep(null);
+            lastAppliedFiltersRef.current = filterKey;
+            setFiltersDirty(false);
+            enqueueMessage(() => messageApi.success({ content: 'Pagination applied.', key: 'filter-refresh' }));
+        } catch (err: any) {
+            enqueueMessage(() => messageApi.error({ content: `Pagination update failed: ${err.message}`, key: 'filter-refresh', duration: 4 }));
+        } finally {
+            setProcessing(false);
+        }
+    }, [
+        userPlan,
+        aiPlan,
+        userQueries,
+        aiQueries,
+        schemaData,
+        activeFilters,
+        dashboard?.widgets,
+        resolvedConnectionString,
+        resolvedConnectorInstructions,
+        resolvedConnectorType,
+        setProcessing,
+        enqueueMessage,
+        messageApi,
+        setExecutionResults,
+        setDashboard,
+        setStaleStep,
+        filterKey,
+        markFiltersActivated
     ]);
 
     useEffect(() => {
@@ -422,7 +547,73 @@ export const DashboardRenderView: React.FC = () => {
         setFiltersDirty(dirty);
     }, [filterKey, dashboard]);
 
-    if (!dashboard) {
+    useEffect(() => {
+        if (!dashboard || !filtersDirty) return;
+        const searchDimensions = new Set(
+            (dashboard.filters || [])
+                .filter((f: any) => f?.type === "search")
+                .map((f: any) => f?.dimension)
+                .filter(Boolean)
+        );
+        searchDimensions.add("__search");
+        searchDimensions.add("__searchColumn");
+
+        let currentFilters: Record<string, any> = {};
+        let lastApplied: Record<string, any> = {};
+        try {
+            currentFilters = JSON.parse(filterKey || "{}");
+            lastApplied = JSON.parse(lastAppliedFiltersRef.current || "{}");
+        } catch {
+            return;
+        }
+
+        const changedKeys = new Set<string>([
+            ...Object.keys(currentFilters || {}),
+            ...Object.keys(lastApplied || {})
+        ].filter((key) => JSON.stringify(currentFilters?.[key]) !== JSON.stringify(lastApplied?.[key])));
+
+        if (changedKeys.size === 0) return;
+
+        const isPaginationOnly = Array.from(changedKeys).every(
+            (key) => key.startsWith("__page:") || key.startsWith("__pageSize:") || key.startsWith("__offset:")
+        );
+        const hasSearchChange = Array.from(changedKeys).some((key) =>
+            searchDimensions.has(key) || key.startsWith("__searchColumn:")
+        );
+
+        if (!isPaginationOnly && !hasSearchChange) return;
+
+        if (autoApplyTimeoutRef.current) {
+            clearTimeout(autoApplyTimeoutRef.current);
+        }
+        autoApplyTimeoutRef.current = setTimeout(() => {
+            if (isPaginationOnly && !hasSearchChange) {
+                reexecuteCurrentQueries();
+                return;
+            }
+            regenerateWithFilters();
+        }, hasSearchChange ? 450 : 150);
+
+        return () => {
+            if (autoApplyTimeoutRef.current) {
+                clearTimeout(autoApplyTimeoutRef.current);
+            }
+        };
+    }, [dashboard, filterKey, filtersDirty, regenerateWithFilters, reexecuteCurrentQueries]);
+
+    const canAssemble = Boolean(plan && queries && executionResults);
+    if (!dashboard || staleStep === 5) {
+        if (canAssemble) {
+            return (
+                <div style={{ padding: '64px', display: 'flex', justifyContent: 'center' }}>
+                    <Result
+                        icon={<Spin size="large" />}
+                        title="Assembling dashboard..."
+                        subTitle="Crunching results and rendering widgets."
+                    />
+                </div>
+            );
+        }
         return (
             <div style={{ padding: '64px' }}>
                 <Result
@@ -449,8 +640,6 @@ export const DashboardRenderView: React.FC = () => {
 
     return (
         <Layout className="h-full bg-transparent overflow-hidden">
-            {contextHolder}
-            {messageContextHolder}
             <Header style={{ background: 'transparent', padding: '0 24px', height: 'auto', marginBottom: 16 }}>
                 <div style={{ ...cardShellStyle, padding: '18px 22px', display: 'flex', justifyContent: 'space-between', alignItems: 'center', gap: 16 }}>
                     <div>
@@ -476,26 +665,26 @@ export const DashboardRenderView: React.FC = () => {
                                 icon={isEditMode ? <UndoOutlined /> : <EditOutlined />}
                                 onClick={() => setIsEditMode(!isEditMode)}
                             >
-                            {isEditMode ? 'Exit Edit Mode' : 'Edit Layout'}
-                        </Button>
-                        <Button
-                            type="primary"
-                            icon={<SaveOutlined />}
-                            disabled={!isDirty && !isEditMode}
-                            onClick={handleSaveDashboard}
-                        >
-                            Save Dashboard
-                        </Button>
-                        <Dropdown menu={{
-                            items: [
-                                { key: 'regen', label: 'Regenerate Plan', icon: <ReloadOutlined />, onClick: handleRegeneratePlan },
-                                { key: 'refresh', label: 'Refresh Schema', icon: <DatabaseOutlined />, onClick: handleRefreshSchema },
-                                { type: 'divider' },
-                                { key: 'export', label: 'Export PDF', icon: <ExportOutlined /> }
-                            ]
-                        }}>
-                            <Button icon={<MoreOutlined />} />
-                        </Dropdown>
+                                {isEditMode ? 'Exit Edit Mode' : 'Edit Layout'}
+                            </Button>
+                            <Button
+                                type="primary"
+                                icon={<SaveOutlined />}
+                                disabled={!isDirty && !isEditMode}
+                                onClick={handleSaveDashboard}
+                            >
+                                Save Dashboard
+                            </Button>
+                            <Dropdown menu={{
+                                items: [
+                                    { key: 'regen', label: 'Regenerate Plan', icon: <ReloadOutlined />, onClick: handleRegeneratePlan },
+                                    { key: 'refresh', label: 'Refresh Schema', icon: <DatabaseOutlined />, onClick: handleRefreshSchema },
+                                    { type: 'divider' },
+                                    { key: 'export', label: 'Export PDF', icon: <ExportOutlined /> }
+                                ]
+                            }}>
+                                <Button icon={<MoreOutlined />} />
+                            </Dropdown>
                         </Space>
                     </div>
                 </div>
@@ -530,74 +719,20 @@ export const DashboardRenderView: React.FC = () => {
                                 Filters are staged. Click Apply to refresh results.
                             </Text>
                         )}
-                        <div style={{ marginTop: 12 }}>
+                        <div style={{ marginTop: 12, maxHeight: 360, overflowY: 'auto', paddingRight: 4 }}>
                             <FilterBar filters={dashboard.filters || []} />
                         </div>
-                    </div>
-                    <div style={{ ...cardShellStyle, padding: 16 }}>
-                        <Title level={5} style={{ marginTop: 0 }}>Quick Stats</Title>
-                        <Space orientation="vertical" style={{ width: '100%' }} size={10}>
-                            <div className="flex justify-between">
-                                <Text type="secondary">Widgets</Text>
-                                <Text strong>{widgets.length}</Text>
-                            </div>
-                            <div className="flex justify-between">
-                                <Text type="secondary">KPIs</Text>
-                                <Text strong>{widgetStats.kpis}</Text>
-                            </div>
-                            <div className="flex justify-between">
-                                <Text type="secondary">Charts</Text>
-                                <Text strong>{widgetStats.charts}</Text>
-                            </div>
-                            <div className="flex justify-between">
-                                <Text type="secondary">Filters</Text>
-                                <Text strong>{activeFilters.size}</Text>
-                            </div>
-                            <Divider style={{ margin: '8px 0' }} />
-                            <div className="flex justify-between">
-                                <Text type="secondary">Data Source</Text>
-                                <Tag color="cyan">Postgres</Tag>
-                            </div>
-                        </Space>
                     </div>
                 </Sider>
 
                 <Content className="overflow-auto p-4 relative" style={{ order: 1 }}>
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(200px, 1fr))', gap: 16, marginBottom: 20 }}>
-                        <div style={statCardStyle}>
-                            <Text type="secondary">Total Widgets</Text>
-                            <Title level={3} style={{ margin: 0 }}>{widgetStats.total}</Title>
-                        </div>
-                        <div style={statCardStyle}>
-                            <Text type="secondary">KPI Cards</Text>
-                            <Title level={3} style={{ margin: 0 }}>{widgetStats.kpis}</Title>
-                        </div>
-                        <div style={statCardStyle}>
-                            <Text type="secondary">Charts</Text>
-                            <Title level={3} style={{ margin: 0 }}>{widgetStats.charts}</Title>
-                        </div>
-                        <div style={statCardStyle}>
-                            <Text type="secondary">Active Filters</Text>
-                            <Title level={3} style={{ margin: 0 }}>{activeFilters.size}</Title>
-                        </div>
-                    </div>
-
-                    {dashboard.insights && dashboard.insights.length > 0 && (
-                        <div style={{ marginBottom: 20, padding: 16, borderRadius: 14, background: 'rgba(15, 23, 42, 0.6)', border: '1px solid rgba(148,163,184,0.12)' }}>
-                            <Title level={5} style={{ marginTop: 0 }}>Highlights</Title>
-                            <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
-                                {dashboard.insights.slice(0, 4).map((insight: string, idx: number) => (
-                                    <Text key={`insight-${idx}`} type="secondary">• {insight}</Text>
-                                ))}
-                            </div>
-                        </div>
-                    )}
                     <DashboardCanvas
                         widgets={widgets}
                         layout={layout as any}
                         isEditing={isEditMode}
                         onWidgetClick={(id) => isEditMode && selectWidget(id)}
                         getWidgetData={getWidgetData}
+                        getWidgetMeta={getWidgetMeta}
                     />
                 </Content>
             </Layout>

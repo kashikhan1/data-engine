@@ -4,14 +4,15 @@ import React, { useEffect, useMemo } from "react";
 import { Select, Input } from "antd";
 import {
     Calendar,
-    ChevronDown,
     MapPin,
     Layers,
-    Clock
+    Clock,
+    Search
 } from "lucide-react";
 import styles from "./FilterBar.module.css";
 import type { Filter } from "@/types/dashboard";
 import { useDashboardStore, useWorkflowStore } from "@/state/stores";
+import { normalizeFilterSet } from "@/lib/filter-contract";
 
 interface FilterBarProps {
     filters?: Filter[];
@@ -23,8 +24,8 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
     const { setStaleStep } = useWorkflowStore();
     const isCompact = variant === "compact";
 
-    const resolvedFilters = useMemo<Filter[]>(() => filters || [], [filters]);
-    const activeCount = useMemo(() => {
+    const resolvedFilters = useMemo<Filter[]>(() => normalizeFilterSet(filters || []) as Filter[], [filters]);
+        const activeCount = useMemo(() => {
         let count = 0;
         resolvedFilters.forEach((f) => {
             const value = activeFilters.get(f.dimension);
@@ -42,6 +43,7 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
         // clear filters not in current set
         const allowed = new Set(resolvedFilters.map(f => f.dimension));
         activeFilters.forEach((_v, key) => {
+            if (key.startsWith("__page:") || key.startsWith("__pageSize:") || key.startsWith("__offset:")) return;
             if (!allowed.has(key)) {
                 clearFilter(key);
             }
@@ -55,7 +57,9 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
                         ? f.value
                         : f.type === "multi-select"
                             ? (f.options || []).map(o => o.value)
-                            : (f.options || [])[0]?.value;
+                            : f.type === "select"
+                                ? null
+                                : (f.options || [])[0]?.value;
                 if (initialValue !== undefined) {
                     setFilter(f.dimension, initialValue);
                 }
@@ -68,14 +72,6 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
         setFilter(dimension, value);
         markFiltersActivated();
         setStaleStep(4); // mark query generation stale so SQL regenerates with new filters
-    };
-
-    const toggleMulti = (dimension: string, optionValue: string) => {
-        const current = (activeFilters.get(dimension) as string[] | undefined) || [];
-        const next = current.includes(optionValue)
-            ? current.filter(v => v !== optionValue)
-            : [...current, optionValue];
-        updateFilter(dimension, next);
     };
 
     const renderValue = (dimension: string) => activeFilters.get(dimension);
@@ -146,7 +142,7 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
                         </div>
                         <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
                             <Select
-                                size="middle"
+                                size="large"
                                 value={current?.value || current?.label || "custom"}
                                 options={options.map((opt) => ({
                                     label: opt.label || String(opt.value),
@@ -215,7 +211,7 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
                             <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
                                 <Select
                                     mode="multiple"
-                                    size="middle"
+                                    size="large"
                                     value={Array.isArray(value) ? value : []}
                                     options={(f.options || []).map((opt) => ({
                                         label: opt.label,
@@ -249,13 +245,41 @@ export function FilterBar({ filters = [], variant = "panel" }: FilterBarProps) {
                             </div>
                             <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
                                 <Select
-                                    size="middle"
+                                    size="large"
                                     value={current?.value}
                                     options={options.map((opt) => ({
                                         label: opt.label || String(opt.value),
                                         value: opt.value
                                     }))}
                                     onChange={(nextValue) => updateFilter(f.dimension, nextValue)}
+                                />
+                            </div>
+                        </div>
+                    );
+                }
+
+                if (f.type === "search") {
+                    return (
+                        <div
+                            key={f.id}
+                            className={`${styles.filterSection} ${isActive ? styles.filterSectionActive : ""} ${isCompact ? styles.compactSection : ""}`}
+                        >
+                            <div className={styles.sectionHeader}>
+                                <div className={styles.sectionTitle}>
+                                    <Search size={16} />
+                                    <span>{f.label || "Search"}</span>
+                                </div>
+                                {!isCompact && (
+                                    <span className={styles.valuePill}>{formatValue(value)}</span>
+                                )}
+                            </div>
+                            <div className={`${styles.filterContent} ${isCompact ? styles.compactContent : ""}`}>
+                                <Input.Search
+                                    size="large"
+                                    value={typeof value === "string" ? value : ""}
+                                    placeholder="Search"
+                                    onChange={(e) => updateFilter(f.dimension, e.target.value)}
+                                    allowClear
                                 />
                             </div>
                         </div>

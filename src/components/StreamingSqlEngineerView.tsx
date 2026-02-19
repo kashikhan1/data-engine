@@ -2,11 +2,11 @@
 
 import React, { useState, useEffect, useRef } from 'react';
 import { Card, Progress, Typography, List, Tag, Space, Alert, Button, Spin, Timeline, Badge, Divider } from 'antd';
-import { 
-    DatabaseOutlined, 
-    BarChartOutlined, 
-    BulbOutlined, 
-    CheckCircleOutlined, 
+import {
+    DatabaseOutlined,
+    BarChartOutlined,
+    BulbOutlined,
+    CheckCircleOutlined,
     ExclamationCircleOutlined,
     PlayCircleOutlined,
     RocketOutlined,
@@ -18,10 +18,10 @@ import type { WidgetSpec } from "@/types/dashboard";
 const { Title, Text, Paragraph } = Typography;
 
 interface StreamEvent {
-    type: "progress" | "query_progress" | "query_complete" | "query_error" | 
-          "widget_progress" | "widget_complete" | "widget_error" |
-          "analytics_progress" | "analytics_complete" | 
-          "viz_progress" | "viz_complete" | "viz_error" | "complete" | "error";
+    type: "progress" | "query_progress" | "query_complete" | "query_error" |
+    "widget_progress" | "widget_complete" | "widget_error" |
+    "analytics_progress" | "analytics_complete" |
+    "viz_progress" | "viz_complete" | "viz_error" | "complete" | "error";
     stage?: string;
     message: string;
     widgetId?: string;
@@ -90,7 +90,7 @@ export default function StreamingSqlEngineerView() {
         },
         {
             name: 'query_execution',
-            status: 'waiting', 
+            status: 'waiting',
             icon: <DatabaseOutlined />,
             color: '#52c41a',
             description: 'Executing SQL queries'
@@ -216,14 +216,14 @@ export default function StreamingSqlEngineerView() {
         const stage = event.stage || 'unknown';
         setCurrentPhase(stage);
 
-                        setPhases(prev => prev.map(phase => {
-                            if (phase.name === stage || (stage === 'query_complete_phase' && phase.name === 'query_execution')) {
-                                return { ...phase, status: 'complete', progress: 100 };
-                            } else if (phase.name === stage) {
-                                return { ...phase, status: 'running', progress: 50 };
-                            }
-                            return phase;
-                        }));
+        setPhases(prev => prev.map(phase => {
+            if (phase.name === stage || (stage === 'query_complete_phase' && phase.name === 'query_execution')) {
+                return { ...phase, status: 'complete', progress: 100 };
+            } else if (phase.name === stage) {
+                return { ...phase, status: 'running', progress: 50 };
+            }
+            return phase;
+        }));
 
         if (event.completed && event.total) {
             setOverallProgress(Math.round((event.completed / event.total) * 100));
@@ -233,7 +233,7 @@ export default function StreamingSqlEngineerView() {
     const handleQueryProgress = (event: StreamEvent) => {
         const widgetId = event.widgetId;
         if (!widgetId) return;
-        
+
         setQueryProgress(prev => {
             return {
                 ...prev,
@@ -256,7 +256,7 @@ export default function StreamingSqlEngineerView() {
         setQueryProgress(prev => {
             const widgetId = event.widgetId;
             if (!widgetId) return prev;
-            
+
             return {
                 ...prev,
                 [widgetId]: {
@@ -276,7 +276,7 @@ export default function StreamingSqlEngineerView() {
         setQueryProgress(prev => {
             const widgetId = event.widgetId;
             if (!widgetId) return prev;
-            
+
             return {
                 ...prev,
                 [widgetId]: {
@@ -411,8 +411,8 @@ export default function StreamingSqlEngineerView() {
             {/* Control Panel */}
             <Card style={{ marginBottom: 24 }}>
                 <Space>
-                    <Button 
-                        type="primary" 
+                    <Button
+                        type="primary"
                         size="large"
                         loading={isStreaming}
                         onClick={() => startStreaming()}
@@ -421,7 +421,7 @@ export default function StreamingSqlEngineerView() {
                         <PlayCircleOutlined />
                         Start Workflow
                     </Button>
-                    <Button 
+                    <Button
                         size="large"
                         onClick={stopStreaming}
                         disabled={!isStreaming}
@@ -435,7 +435,7 @@ export default function StreamingSqlEngineerView() {
             {/* Error Display */}
             {error && (
                 <Alert
-                    message="Error"
+                    title="Error"
                     description={error}
                     type="error"
                     showIcon
@@ -449,20 +449,20 @@ export default function StreamingSqlEngineerView() {
             <Card title="Workflow Phases" style={{ marginBottom: 24 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap' }}>
                     {phases.map((phase, index) => (
-                        <div 
+                        <div
                             key={phase.name}
-                            style={{ 
-                                textAlign: 'center', 
+                            style={{
+                                textAlign: 'center',
                                 minWidth: '180px',
                                 marginBottom: 16,
                                 opacity: phase.status === 'waiting' ? 0.5 : 1
                             }}
                         >
-                            <div 
-                                style={{ 
-                                    fontSize: 24, 
-                                    color: phase.status === 'complete' ? phase.color : 
-                                           phase.status === 'running' ? phase.color : '#d9d9d9',
+                            <div
+                                style={{
+                                    fontSize: 24,
+                                    color: phase.status === 'complete' ? phase.color :
+                                        phase.status === 'running' ? phase.color : '#d9d9d9',
                                     marginBottom: 8
                                 }}
                             >
@@ -475,9 +475,9 @@ export default function StreamingSqlEngineerView() {
                                 {phase.status === 'error' && <ExclamationCircleOutlined style={{ color: '#ff4d4f' }} />}
                             </div>
                             {phase.progress !== undefined && (
-                                <Progress 
-                                    percent={phase.progress} 
-                                    size="small" 
+                                <Progress
+                                    percent={phase.progress}
+                                    size="small"
                                     showInfo={false}
                                     strokeColor={phase.color}
                                 />
@@ -485,12 +485,12 @@ export default function StreamingSqlEngineerView() {
                         </div>
                     ))}
                 </div>
-                
+
                 {/* Overall Progress */}
                 <div style={{ marginTop: 24 }}>
                     <Text strong>Overall Progress</Text>
-                    <Progress 
-                        percent={overallProgress} 
+                    <Progress
+                        percent={overallProgress}
                         status={isStreaming ? 'active' : 'normal'}
                         strokeColor={{
                             '0%': '#108ee9',
@@ -509,11 +509,11 @@ export default function StreamingSqlEngineerView() {
                             <List.Item>
                                 <List.Item.Meta
                                     avatar={
-                                        query.status === 'complete' ? 
+                                        query.status === 'complete' ?
                                             <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 20 }} /> :
-                                        query.status === 'error' ? 
-                                            <ExclamationCircleOutlined style={{ color: '#ff4d4f', fontSize: 20 }} /> :
-                                        <Spin size="small" />
+                                            query.status === 'error' ?
+                                                <ExclamationCircleOutlined style={{ color: '#ff4d4f', fontSize: 20 }} /> :
+                                                <Spin size="small" />
                                     }
                                     title={
                                         <div>
@@ -530,18 +530,18 @@ export default function StreamingSqlEngineerView() {
                                 <div>
                                     <Tag color={
                                         query.status === 'complete' ? 'success' :
-                                        query.status === 'error' ? 'error' :
-                                        'processing'
+                                            query.status === 'error' ? 'error' :
+                                                'processing'
                                     }>
                                         {query.status}
                                     </Tag>
                                 </div>
                                 {/* Show SQL query when executing */}
                                 {query.status === 'executing' && query.sql && (
-                                    <div style={{ 
-                                        marginTop: 8, 
-                                        padding: 8, 
-                                        backgroundColor: '#f5f5f5', 
+                                    <div style={{
+                                        marginTop: 8,
+                                        padding: 8,
+                                        backgroundColor: '#f5f5f5',
                                         border: '1px solid #d9d9d9',
                                         borderRadius: 4,
                                         fontSize: 12,
@@ -550,8 +550,8 @@ export default function StreamingSqlEngineerView() {
                                         <div style={{ fontWeight: 'bold', marginBottom: 4, color: '#666' }}>
                                             SQL Query:
                                         </div>
-                                        <div style={{ 
-                                            whiteSpace: 'pre-wrap', 
+                                        <div style={{
+                                            whiteSpace: 'pre-wrap',
                                             wordBreak: 'break-all',
                                             color: '#333',
                                             backgroundColor: '#fff',
@@ -564,10 +564,10 @@ export default function StreamingSqlEngineerView() {
                                 )}
                                 {/* Show results when complete */}
                                 {query.status === 'complete' && query.result && (
-                                    <div style={{ 
-                                        marginTop: 8, 
-                                        padding: 8, 
-                                        backgroundColor: '#f6ffed', 
+                                    <div style={{
+                                        marginTop: 8,
+                                        padding: 8,
+                                        backgroundColor: '#f6ffed',
                                         border: '1px solid #b7eb8f',
                                         borderRadius: 4
                                     }}>
@@ -576,8 +576,8 @@ export default function StreamingSqlEngineerView() {
                                         </div>
                                         {/* Show sample data */}
                                         {query.result.data && query.result.data.length > 0 && (
-                                            <div style={{ 
-                                                maxHeight: 200, 
+                                            <div style={{
+                                                maxHeight: 200,
                                                 overflowY: 'auto',
                                                 backgroundColor: '#fff',
                                                 padding: 8,
@@ -588,8 +588,8 @@ export default function StreamingSqlEngineerView() {
                                                     <thead>
                                                         <tr style={{ backgroundColor: '#fafafa' }}>
                                                             {query.result.columns?.map((col: string) => (
-                                                                <th key={col} style={{ 
-                                                                    padding: '6px 8px', 
+                                                                <th key={col} style={{
+                                                                    padding: '6px 8px',
                                                                     textAlign: 'left',
                                                                     borderBottom: '1px solid #eee',
                                                                     fontWeight: 'bold',
@@ -604,8 +604,8 @@ export default function StreamingSqlEngineerView() {
                                                         {query.result.data.slice(0, 5).map((row: any, idx: number) => (
                                                             <tr key={idx}>
                                                                 {query.result.columns?.map((col: string) => (
-                                                                    <td key={col} style={{ 
-                                                                        padding: '6px 8px', 
+                                                                    <td key={col} style={{
+                                                                        padding: '6px 8px',
                                                                         borderBottom: '1px solid #eee',
                                                                         fontSize: 11
                                                                     }}>
@@ -617,9 +617,9 @@ export default function StreamingSqlEngineerView() {
                                                     </tbody>
                                                 </table>
                                                 {query.result.data.length > 5 && (
-                                                    <div style={{ 
-                                                        textAlign: 'center', 
-                                                        padding: 8, 
+                                                    <div style={{
+                                                        textAlign: 'center',
+                                                        padding: 8,
                                                         color: '#666',
                                                         fontStyle: 'italic'
                                                     }}>
@@ -630,8 +630,8 @@ export default function StreamingSqlEngineerView() {
                                         )}
                                         {/* Show error details */}
                                         {query.result.error && (
-                                            <div style={{ 
-                                                color: '#ff4d4f', 
+                                            <div style={{
+                                                color: '#ff4d4f',
                                                 backgroundColor: '#fff2f0',
                                                 padding: 8,
                                                 borderRadius: 2,
@@ -658,11 +658,11 @@ export default function StreamingSqlEngineerView() {
                             <List.Item>
                                 <List.Item.Meta
                                     avatar={
-                                        widget.status === 'complete' ? 
+                                        widget.status === 'complete' ?
                                             <CheckCircleOutlined style={{ color: '#52c41a', fontSize: 20 }} /> :
-                                        widget.status === 'error' ? 
-                                            <ExclamationCircleOutlined style={{ color: '#ff4d4f', fontSize: 20 }} /> :
-                                        <Spin size="small" />
+                                            widget.status === 'error' ?
+                                                <ExclamationCircleOutlined style={{ color: '#ff4d4f', fontSize: 20 }} /> :
+                                                <Spin size="small" />
                                     }
                                     title={
                                         <div>
@@ -679,8 +679,8 @@ export default function StreamingSqlEngineerView() {
                                 <div>
                                     <Tag color={
                                         widget.status === 'complete' ? 'success' :
-                                        widget.status === 'error' ? 'error' :
-                                        'processing'
+                                            widget.status === 'error' ? 'error' :
+                                                'processing'
                                     }>
                                         {widget.status}
                                     </Tag>
@@ -692,10 +692,10 @@ export default function StreamingSqlEngineerView() {
                     {Object.values(widgetProgress).some(w => w.status === 'complete' && w.result) && (
                         <>
                             <Divider>Widget Previews</Divider>
-                            <div style={{ 
-                                display: 'grid', 
-                                gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))', 
-                                gap: 16 
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(320px, 1fr))',
+                                gap: 16
                             }}>
                                 {Object.values(widgetProgress)
                                     .filter(w => w.status === 'complete' && w.result)
@@ -719,20 +719,20 @@ export default function StreamingSqlEngineerView() {
                     <div style={{ maxHeight: '300px', overflowY: 'auto' }}>
                         <Timeline>
                             {events.slice(-10).map((event, index) => (
-                                <Timeline.Item 
+                                <Timeline.Item
                                     key={index}
                                     color={
                                         event.type === 'complete' ? 'green' :
-                                        event.type.includes('error') ? 'red' :
-                                        event.type.includes('progress') ? 'blue' :
-                                        'gray'
+                                            event.type.includes('error') ? 'red' :
+                                                event.type.includes('progress') ? 'blue' :
+                                                    'gray'
                                     }
                                     dot={
                                         event.type === 'query_progress' ? <DatabaseOutlined /> :
-                                        event.type === 'query_complete' ? <CheckCircleOutlined /> :
-                                        event.type === 'viz_progress' ? <BarChartOutlined /> :
-                                        event.type === 'analytics_progress' ? <BulbOutlined /> :
-                                        null
+                                            event.type === 'query_complete' ? <CheckCircleOutlined /> :
+                                                event.type === 'viz_progress' ? <BarChartOutlined /> :
+                                                    event.type === 'analytics_progress' ? <BulbOutlined /> :
+                                                        null
                                     }
                                 >
                                     <Text>{event.message}</Text>
@@ -749,8 +749,8 @@ export default function StreamingSqlEngineerView() {
 
             {/* Final Results */}
             {finalResults && (
-                <Card 
-                    title="🎉 Workflow Complete!" 
+                <Card
+                    title="🎉 Workflow Complete!"
                     style={{ marginBottom: 24 }}
                     extra={<Badge count={finalResults.results?.length || 0} />}
                 >
@@ -763,7 +763,7 @@ export default function StreamingSqlEngineerView() {
                                 <li>Insights Found: {finalResults.insights?.length || 0}</li>
                             </ul>
                         </div>
-                        
+
                         {finalResults.insights && finalResults.insights.length > 0 && (
                             <div>
                                 <Text strong>Key Insights:</Text>

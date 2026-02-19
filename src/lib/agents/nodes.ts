@@ -1,181 +1,124 @@
 'use server';
 
-import { ChatOpenAI } from "@langchain/openai";
-import { ChatOllama } from "@langchain/ollama";
 import { AgentState } from "./state";
-import { QueryPlanSchema, DashboardLayoutSchema } from "../schemas";
-import { z } from "zod";
+import { QueryPlanSchema } from "../schemas";
+import { createDefaultChatModel } from "../llm/model";
+
 import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
-import { connectToPostgres } from "@/app/actions/mcp";
 import { dbGateway } from "../mcp/server";
-import { semanticService } from "../semantic/service";
+import { PLANNER_WIDGET_TYPE_ORDER } from "@/types/dashboard";
+import { AGENT_ROLES, SQL_GENERATION_RULES } from "./prompts";
+import { extractJSON, invokeModelWithRetry as invokeModelWithRetryUtil, streamModelWithRetry as streamModelWithRetryUtil } from "./llm-utils";
+import { categorizeDataType, getColumnName, isTemporalType, isTextType } from "./data-type-utils";
+import {
+    runSchemaDiscovery as runSchemaDiscoveryImpl,
+    schemaAgent as schemaAgentImpl,
+    type SchemaDiscoveryOptions,
+} from "./schema-discovery";
+import {
+    dashboardPlannerAgent as dashboardPlannerAgentImpl,
+} from "./dashboard-planner-runtime";
+import {
+    normalizeSqlForValidation,
+    stripSqlLiteralsAndComments,
+    detectIsMssql,
+
+    isPlaceholderSqlQuery,
+    renderDynamicSqlTemplate,
+    applyRuntimePaginationToSql,
+    resolveTablePaginationForId,
+    derivePaginationFromRuntimeParams,
+    runQueryExecutor as runQueryExecutorImpl,
+    repairFailedQuery as repairFailedQueryImpl,
+    assembleFinalDashboard as assembleFinalDashboardImpl,
+    runNarrativeGenerator as runNarrativeGeneratorImpl,
+} from "./query-runtime";
 
 // --- LLM Initialization ---
 
-// Detect configuration via STATIC access for Next.js bundler compatibility
-const openAIApiKey = process.env.OPENAI_API_KEY || process.env.NEXT_PUBLIC_OPENAI_API_KEY;
-const openAIModel = process.env.OPENAI_MODEL || process.env.NEXT_PUBLIC_OPENAI_MODEL || "gpt-4o-mini";
-
-const ollamaBaseUrl = process.env.OLLAMA_BASE_URL || process.env.NEXT_PUBLIC_OLLAMA_BASE_URL;
-const ollamaApiKey = process.env.OLLAMA_API_KEY || process.env.NEXT_PUBLIC_OLLAMA_API_KEY;
-const ollamaModel = process.env.OLLAMA_MODEL || process.env.NEXT_PUBLIC_OLLAMA_MODEL || "llama3.2";
-
-// Prefer Ollama if a base URL or Ollama key is provided OR if no OpenAI key is available.
-const useOllama = !!ollamaBaseUrl || !!ollamaApiKey || !openAIApiKey;
-
-const initializeModel = () => {
-    const isServer = typeof window === 'undefined';
-
-    if (useOllama) {
-        // Use ChatOllama directly so OPENAI_API_KEY is never required.
-        const m = ollamaModel || "llama3.2";
-        const base = ollamaBaseUrl || "http://localhost:11434";
-        if (isServer) console.log(`[LLM] Using Ollama endpoint: ${m} @ ${base}`);
-        return new ChatOllama({
-            model: m,
-            baseUrl: base,
-            temperature: 0,
-            numCtx: 32768,
-            headers: ollamaApiKey ? { Authorization: `Bearer ${ollamaApiKey}` } : undefined,
-        });
-    } else {
-        const m = openAIModel || "gpt-4-turbo-preview";
-        if (isServer) console.log(`[LLM] Using Real OpenAI: ${m}`);
-        return new ChatOpenAI({
-            modelName: m,
-            model: m,
-            temperature: 0,
-            openAIApiKey: openAIApiKey,
-            timeout: 900000,
-        });
-    }
-};
-
 const getModel = () => {
-    // Re-evaluate per-call so env changes or restart picks up the correct provider.
-    return initializeModel();
+    return createDefaultChatModel({ logPrefix: "[LLM]", timeoutMs: 900000 });
 };
 
-/**
- * Helper: Invoke LLM with retry logic for 429 errors
- */
-async function invokeModelWithRetry(messages: any[], maxRetries = 3, delay = 2000) {
-    let lastError: any;
-    for (let i = 0; i < maxRetries; i++) {
-        try {
-            return await getModel().invoke(messages, { timeout: 900000 });
-        } catch (err: any) {
-            lastError = err;
-            const errorMsg = err.message || "";
-            // Handle 429 or generic rate limit indicators
-            if (errorMsg.includes("429") || errorMsg.toLowerCase().includes("too many requests") || err.status === 429) {
-                console.warn(`[LLM_RETRY] Rate limited (429). Retrying in ${delay}ms... (Attempt ${i + 1}/${maxRetries})`);
-                await new Promise(resolve => setTimeout(resolve, delay));
-                delay *= 2; // Exponential backoff
-            } else {
-                throw err;
-            }
-        }
+const invokeModelWithRetry = (messages: any[], maxRetries = 3, delay = 2000) =>
+    invokeModelWithRetryUtil(getModel, messages, maxRetries, delay);
+
+const streamModelWithRetry = (
+    messages: any[],
+    onToken?: (token: string) => void,
+    maxRetries = 3,
+    delay = 2000
+) => streamModelWithRetryUtil(getModel, messages, onToken, maxRetries, delay);
+
+export async function runQueryExecutor(
+    queries: Record<string, string>,
+    connectionString?: string,
+    options?: {
+        connectorInstructions?: string;
+        connectorType?: string;
+        tablePagination?: Record<string, { page: number; pageSize: number; offset?: number; includeTotal?: boolean }>;
+        runtimeParams?: Record<string, any>;
     }
-    throw lastError;
+) {
+    return runQueryExecutorImpl(queries, connectionString, options);
 }
 
-// Helper function to extract JSON from LLM response
-function extractJSON(text: string): any {
-    try {
-        let cleaned = text.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-        const start = cleaned.indexOf('{');
-        const end = cleaned.lastIndexOf('}');
-        if (start !== -1 && end !== -1 && end > start) {
-            cleaned = cleaned.substring(start, end + 1);
-        }
-
-        // Handle unescaped newlines within strings in the JSON block
-        // LLMs often output multi-line SQL inside a JSON string field unescaped
-        // This regex tries to find text between quotes that contains newlines and escape them
-        cleaned = cleaned.replace(/"([^"]*)"/g, (match, group) => {
-            return '"' + group.replace(/\n/g, '\\n').replace(/\r/g, '\\r') + '"';
-        });
-
-        return JSON.parse(cleaned);
-    } catch (e) {
-        // Fallback: try to find any JSON-like structure
-        const match = text.match(/\{[\s\S]*\}/);
-        if (match) {
-            try {
-                return JSON.parse(match[0]);
-            } catch (e2) {
-                console.error("[JSON_PARSE_ERROR] Deep parse failed.");
-            }
-        }
-        return null;
-    }
+export async function repairFailedQuery(context: {
+    widgetId: string;
+    widgetTitle: string;
+    widgetType: string;
+    widgetGoal?: string;
+    originalSql: string;
+    errorMessage: string;
+    schema: any;
+    errorLog?: Array<{ id: string; title?: string; sql?: string; error: string; timestamp?: string }>;
+    connectionString?: string;
+}): Promise<{ sql: string; explanation: string }> {
+    return repairFailedQueryImpl(context);
 }
 
-/**
- * Helper: Categorize PostgreSQL data types for AI guidance
- */
-function categorizeDataType(dataType: string): string {
-    const lowerType = dataType.toLowerCase();
-
-    if (lowerType.includes('int') || lowerType.includes('numeric') ||
-        lowerType.includes('decimal') || lowerType.includes('float') ||
-        lowerType.includes('double') || lowerType.includes('real')) {
-        return 'numeric';
-    }
-
-    if (lowerType.includes('char') || lowerType.includes('text') ||
-        lowerType.includes('varchar') || lowerType.includes('string')) {
-        return 'text';
-    }
-
-    if (lowerType.includes('date') || lowerType.includes('time') ||
-        lowerType.includes('timestamp') || lowerType.includes('interval')) {
-        return 'temporal';
-    }
-
-    if (lowerType.includes('bool') || lowerType.includes('boolean')) {
-        return 'boolean';
-    }
-
-    if (lowerType.includes('json') || lowerType.includes('array')) {
-        return 'complex';
-    }
-
-    return 'other';
+export async function assembleFinalDashboard(
+    plan: any,
+    queries: any[],
+    results: any[],
+    insights: string[] = [],
+    filterCandidates?: any
+) {
+    return assembleFinalDashboardImpl(plan, queries, results, insights, filterCandidates);
 }
 
-/**
- * Helper: Check if data type is numeric (supports aggregation)
- */
-function isNumericType(dataType: string): boolean {
-    const category = categorizeDataType(dataType);
-    return category === 'numeric';
+export async function runNarrativeGenerator(resultsList: any[]) {
+    return runNarrativeGeneratorImpl(resultsList);
 }
 
-/**
- * Helper: Check if data type is temporal (supports time operations)
- */
-function isTemporalType(dataType: string): boolean {
-    const category = categorizeDataType(dataType);
-    return category === 'temporal';
+async function refinePlannerOutput(input: {
+    agentLabel: string;
+    draft: string;
+    formatSpec: string;
+    onToken?: (token: string) => void;
+}) {
+    const { agentLabel, draft, formatSpec, onToken } = input;
+    if (!draft || !draft.trim()) return draft;
+    const systemPrompt = `You are a strict format editor for ${agentLabel}.
+
+TASK:
+- Fix formatting, missing fields, and clarity issues.
+- Do NOT add new widgets or remove widgets.
+- Keep the same intent, but ensure compliance with the format spec.
+- Return ONLY the corrected output (no commentary).
+
+FORMAT SPEC:
+${formatSpec}`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage(draft)
+    ], onToken);
+
+    return (response.content as string) || draft;
 }
 
-/**
- * Helper: Check if data type is text (supports grouping/filtering)
- */
-function isTextType(dataType: string): boolean {
-    const category = categorizeDataType(dataType);
-    return category === 'text';
-}
-
-export interface SchemaDiscoveryOptions {
-    enableSemanticSearch?: boolean;
-    enableTableKpis?: boolean;
-    enableTableMatrix?: boolean;
-    enableTableFilters?: boolean;
-    projectContext?: string;
-}
+export type { SchemaDiscoveryOptions } from "./schema-discovery";
 
 interface TableKpi {
     id: string;
@@ -216,6 +159,15 @@ interface TableFilterSuggestion {
     targetTable?: string;
 }
 
+interface QueryExample {
+    id: string;
+    description: string;
+    sql: string;
+    results?: any[];
+    executionTime?: number;
+    error?: string;
+}
+
 interface TableInsight {
     semanticMatches?: {
         terms: string[];
@@ -225,10 +177,7 @@ interface TableInsight {
     kpis?: TableKpi[];
     dataMatrix?: TableDataMatrix;
     filters?: TableFilterSuggestion[];
-}
-
-function getColumnName(column: any): string {
-    return column?.name || column?.column_name || "";
+    queryExamples?: QueryExample[];
 }
 
 function buildTableKpis(tableName: string, columns: any[], rowCount?: number): TableKpi[] {
@@ -397,24 +346,97 @@ function buildTableFilters(tableName: string, tableSchema: any, sampleRows: any[
     return filters;
 }
 
+function computeVisibleColumns(tableSchema: any) {
+    const columns = Array.isArray(tableSchema?.columns) ? tableSchema.columns : [];
+    const scored = columns.map((col: any) => {
+        const name = String(getColumnName(col) || "").toLowerCase();
+        let score = 0;
+        if (col?.isPrimary) score += 3;
+        if (col?.isTemporal) score += 2.5;
+        if (col?.isNumeric) score += 2;
+        if (col?.isText) score += 1.5;
+        if (/(name|title|label|email|status|category|type|region|country)/i.test(name)) score += 3;
+        if (/(amount|total|revenue|cost|price|value|qty|count|score)/i.test(name)) score += 2;
+        if (/(json|metadata|payload|config|settings|blob|raw|token|secret)/i.test(name)) score -= 4;
+        if (/^id$|_id$/.test(name)) score -= 0.5;
+        return { name: getColumnName(col), score };
+    });
+    return scored
+        .filter((c: { name: string; score: number }) => c.name)
+        .sort((a: { name: string; score: number }, b: { name: string; score: number }) => b.score - a.score)
+        .map((c: { name: string; score: number }) => c.name);
+}
+
+function computeFilterableColumnsFromInsights(insight: TableInsight | null) {
+    if (!insight?.filters) return [];
+    const cols = insight.filters
+        .map((f) => f.column)
+        .filter(Boolean);
+    return Array.from(new Set(cols));
+}
+
+function buildFilterCandidatesFromColumns(
+    schemaInfo: Record<string, any>,
+    filterableColumns: Record<string, string[]>
+) {
+    const dateColumns: { table: string; column: string; type: string }[] = [];
+    const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
+    const entityColumns: { viaTable: string; from: string; to: string; count?: number }[] = [];
+    const searchColumns: { table: string; column: string; score: number }[] = [];
+    const searchSignals = /(name|title|email|username|user_name|phone|company|customer|client|account|code|number|id)$/i;
+
+    Object.entries(filterableColumns || {}).forEach(([table, columns]) => {
+        const info = schemaInfo?.[table];
+        const colInfo = info?.columns || [];
+        columns.forEach((column) => {
+            const match = colInfo.find((c: any) => getColumnName(c) === column);
+            const type = String(match?.type || match?.data_type || "");
+            if (isTemporalType(type)) {
+                dateColumns.push({ table, column, type });
+            } else if (isTextType(type) || type.toLowerCase().includes("enum")) {
+                categoricalColumns.push({ table, column, distinct: [] });
+                const scoreBase = searchSignals.test(String(column)) ? 4 : 1;
+                searchColumns.push({ table, column, score: scoreBase });
+            }
+        });
+    });
+
+    const primaryDate = dateColumns[0];
+    const primarySearch = searchColumns.sort((a, b) => b.score - a.score)[0];
+    const summaryLines: string[] = [];
+    if (primaryDate) {
+        summaryLines.push(`Date range filter: ${primaryDate.table}.${primaryDate.column}`);
+    }
+    if (categoricalColumns.length > 0) {
+        summaryLines.push(`Categorical filters: ${categoricalColumns.slice(0, 5).map(c => `${c.table}.${c.column}`).join(', ')}${categoricalColumns.length > 5 ? ' ...' : ''}`);
+    }
+    if (entityColumns.length > 0) {
+        summaryLines.push(`Entity filters: ${entityColumns.slice(0, 5).map(e => e.from).join(', ')}${entityColumns.length > 5 ? ' ...' : ''}`);
+    }
+    if (primarySearch?.table && primarySearch?.column) {
+        summaryLines.push(`Search field: ${primarySearch.table}.${primarySearch.column}`);
+    }
+
+    return {
+        dateColumns,
+        categoricalColumns,
+        entityColumns,
+        searchColumns,
+        primarySearch,
+        primaryDate,
+        summary: summaryLines.join('\n') || 'No filterable dimensions detected.'
+    };
+}
+
 async function buildSemanticMatches(tableName: string, tableSchema: any): Promise<TableInsight["semanticMatches"]> {
     const columns = Array.isArray(tableSchema?.columns) ? tableSchema.columns : [];
     const terms = [tableName, ...columns.map((col: any) => getColumnName(col)).filter(Boolean)];
-    const resolved = await semanticService.resolveMapping(terms);
 
+    // NOTE: Removed mock semanticService usage to enforce real schema grounding.
     return {
         terms,
-        metrics: resolved.metrics.map((metric) => ({
-            slug: metric.slug,
-            name: metric.name,
-            description: metric.description
-        })),
-        dimensions: resolved.dimensions.map((dim) => ({
-            slug: dim.slug,
-            name: dim.name,
-            type: dim.type,
-            table_name: dim.table_name
-        }))
+        metrics: [],
+        dimensions: []
     };
 }
 
@@ -478,6 +500,246 @@ async function buildTableInsights(
     return tableInsights;
 }
 
+function getAllowedWidgetTypes(schemaForPrompt: any) {
+    const disabledTypes = Array.isArray(schemaForPrompt?.disabledWidgetTypes) ? schemaForPrompt.disabledWidgetTypes : [];
+    const allowedTypes = [...PLANNER_WIDGET_TYPE_ORDER].filter((t) => !disabledTypes.includes(t));
+    const orderedAllowedTypes = PLANNER_WIDGET_TYPE_ORDER.filter((t) => allowedTypes.includes(t));
+    const requiredWidgetCount = orderedAllowedTypes.length + (allowedTypes.includes("kpi") ? 3 : 0);
+    return { allowedTypes, orderedAllowedTypes, requiredWidgetCount };
+}
+
+function buildPlannerRulesBlock(allowedTypes: string[], orderedAllowedTypes: string[], requiredWidgetCount: number) {
+    return [
+        "DO NOT include any widget types outside this list.",
+        "You MUST include every allowed widget type at least once.",
+        allowedTypes.includes("kpi")
+            ? "Include exactly 4 KPI cards if KPI is allowed."
+            : "Do not include KPI cards if KPI is not allowed.",
+        allowedTypes.includes("table")
+            ? "If table is allowed, the final widget must be a table."
+            : "Do not include tables if table is not allowed.",
+        "Order widgets using this preferred type order (repeat KPI cards first if enabled):",
+        orderedAllowedTypes.join(", "),
+        `Total widgets must be exactly ${requiredWidgetCount}.`,
+    ].join("\n");
+}
+
+function truncatePlannerText(value: string, maxChars: number) {
+    if (!value) return value;
+    return value.length <= maxChars ? value : `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
+}
+
+function buildPlannerFiltersText(schemaForPrompt: any) {
+    const explicitFilterable = schemaForPrompt?.filterableColumns || null;
+    const filterCandidates = schemaForPrompt?.filterCandidates;
+    const filterSummary = String(schemaForPrompt?.filterSummary || "").trim();
+    const tableInsightFilters = Object.values(schemaForPrompt?.tableInsights || {})
+        .flatMap((insight: any) => insight?.filters || [])
+        .filter((f: any) => f?.table && f?.column);
+    const schemaInfo = schemaForPrompt?.schemaInfo || {};
+    const lines: string[] = [];
+    let idx = 1;
+    if (explicitFilterable && typeof explicitFilterable === "object") {
+        Object.entries(explicitFilterable).forEach(([table, cols]) => {
+            (Array.isArray(cols) ? cols : []).slice(0, 4).forEach((col: any) => {
+                const colName = String(col);
+                if (!colName) return;
+                lines.push(`${idx++}) ${colName}, multi-select, default=all, ${table}.${colName}, all widgets`);
+            });
+        });
+    }
+    if (filterCandidates?.primaryDate?.table && filterCandidates?.primaryDate?.column) {
+        lines.push(`${idx++}) Date Range, date range, default=this_month, ${filterCandidates.primaryDate.table}.${filterCandidates.primaryDate.column}, all widgets`);
+    }
+    if (filterCandidates?.primarySearch?.table && filterCandidates?.primarySearch?.column) {
+        lines.push(`${idx++}) Search, search, default=empty, ${filterCandidates.primarySearch.table}.${filterCandidates.primarySearch.column}, all widgets`);
+    }
+    (filterCandidates?.categoricalColumns || []).slice(0, 4).forEach((col: any) => {
+        if (!col?.table || !col?.column) return;
+        lines.push(`${idx++}) ${col.column}, multi-select, default=all, ${col.table}.${col.column}, all widgets`);
+    });
+    if (lines.length === 0 && tableInsightFilters.length > 0) {
+        tableInsightFilters.slice(0, 4).forEach((f: any) => {
+            const label = f.title || f.column;
+            const type = f.type || "multi-select";
+            lines.push(`${idx++}) ${label}, ${type}, default=all, ${f.table}.${f.column}, all widgets`);
+        });
+    }
+    if (lines.length === 0) {
+        const tables = Object.entries(schemaInfo);
+        let found: { table: string; column: string } | null = null;
+        for (const [table, info] of tables) {
+            const cols = (info as any)?.columns || [];
+            for (const col of cols) {
+                const colName = String(col?.name || "");
+                const colType = String(col?.type || "");
+                if (/date|time|timestamp/i.test(colName) || /date|time|timestamp/i.test(colType)) {
+                    found = { table, column: colName };
+                    break;
+                }
+            }
+            if (found) break;
+        }
+        if (found) {
+            lines.push(`${idx++}) Date Range, date range, default=this_month, ${found.table}.${found.column}, all widgets`);
+        }
+    }
+    if (lines.length === 0) {
+        if (filterSummary) {
+            const dateMatch = filterSummary.match(/Date range filter:\s*([^\n]+)/i);
+            const categoricalMatch = filterSummary.match(/Categorical filters:\s*([^\n]+)/i);
+            if (dateMatch?.[1]) {
+                const dateField = dateMatch[1].split(',')[0]?.trim();
+                if (dateField) {
+                    lines.push(`${idx++}) Date Range, date range, default=this_month, ${dateField}, all widgets`);
+                }
+            }
+            if (categoricalMatch?.[1]) {
+                const fields = categoricalMatch[1]
+                    .split(',')
+                    .map((f) => f.trim())
+                    .filter(Boolean)
+                    .slice(0, 4);
+                fields.forEach((field) => {
+                    lines.push(`${idx++}) ${field.split('.').pop() || field}, multi-select, default=all, ${field}, all widgets`);
+                });
+            }
+        }
+        if (lines.length === 0) {
+            lines.push("1) None");
+        }
+    }
+    return lines.join("\n");
+}
+
+function parsePlannerMeta(text: string) {
+    const cleaned = String(text || "").replace(/\*\*|\*|__|#/g, '');
+    const titleMatch = cleaned.match(/DASHBOARD TITLE\s*:\s*(.+)/i);
+    const purposeMatch = cleaned.match(/PURPOSE\s*:\s*(.+)/i);
+    const filtersSectionMatch = cleaned.match(/FILTERS TO INCLUDE\s*:\s*([\s\S]*?)(?:\nWIDGET\s+1:|$)/i);
+    const filtersText = filtersSectionMatch?.[1]
+        ?.split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => /^\d+\)/.test(line))
+        .join('\n');
+    return {
+        title: titleMatch?.[1]?.trim(),
+        purpose: purposeMatch?.[1]?.trim(),
+        filtersText: filtersText && filtersText.length > 0 ? filtersText : null,
+    };
+}
+
+function parseFiltersOnly(text: string) {
+    const cleaned = String(text || "").replace(/\*\*|\*|__|#/g, '');
+    const filtersSectionMatch = cleaned.match(/FILTERS TO INCLUDE\s*:\s*([\s\S]*?)$/i);
+    const filtersText = filtersSectionMatch?.[1]
+        ?.split('\n')
+        .map((line) => line.trim())
+        .filter(Boolean)
+        .filter((line) => /^\d+\)/.test(line))
+        .join('\n');
+    return filtersText && filtersText.length > 0 ? filtersText : null;
+}
+
+function buildPlanHeader(input: { title: string; purpose: string; filtersText: string; scenarioText?: string }) {
+    const lines: string[] = [];
+    lines.push(`DASHBOARD TITLE: ${input.title || "AI Analytics Dashboard"}`);
+    lines.push(`PURPOSE: ${input.purpose || "Auto-generated dashboard plan."}`);
+    lines.push("");
+    lines.push("FILTERS TO INCLUDE:");
+    lines.push(input.filtersText || "1) None");
+    if (input.scenarioText) {
+        lines.push("");
+        lines.push("SCENARIO COVERAGE:");
+        lines.push(input.scenarioText);
+    }
+    lines.push("");
+    return lines.join("\n");
+}
+
+function replacePlanHeader(planText: string, headerText: string) {
+    const widgetIndex = planText.search(/\nWIDGET\s+1\s*:/i);
+    if (widgetIndex === -1) return `${headerText}${planText}`.trim();
+    const rest = planText.slice(widgetIndex + 1).trimStart();
+    return `${headerText}\n${rest}`.trim();
+}
+
+function resolveFiltersText(metaFiltersText: string | null, fallbackFiltersText: string) {
+    if (!metaFiltersText) return fallbackFiltersText;
+    const normalized = metaFiltersText.replace(/\s+/g, ' ').trim().toLowerCase();
+    if (normalized === "1) none" || normalized === "1) none." || normalized === "none") {
+        return fallbackFiltersText;
+    }
+    return metaFiltersText;
+}
+
+function buildScenarioCoverageText(schemaForPrompt: any, widgets: any[]) {
+    const filterCandidates = schemaForPrompt?.filterCandidates || {};
+    const hasPrimaryDate = Boolean(filterCandidates?.primaryDate?.table && filterCandidates?.primaryDate?.column);
+    const hasSearch = Boolean(filterCandidates?.primarySearch?.table && filterCandidates?.primarySearch?.column);
+    const hasCategorical = Array.isArray(filterCandidates?.categoricalColumns) && filterCandidates.categoricalColumns.length > 0;
+    const hasEntity = Array.isArray(filterCandidates?.entityColumns) && filterCandidates.entityColumns.length > 0;
+    const hasRelationships = Array.isArray(schemaForPrompt?.relationships) && schemaForPrompt.relationships.length > 0;
+    const hasTables = Array.isArray(widgets) && widgets.some((w: any) => w?.type === "table");
+    const hasKpis = Array.isArray(widgets) && widgets.some((w: any) => w?.type === "kpi");
+    const summary = [
+        `1) Date filters: ${hasPrimaryDate ? "yes" : "no"}`,
+        `2) Search: ${hasSearch ? "yes" : "no"}`,
+        `3) Categorical filters: ${hasCategorical ? "yes" : "no"}`,
+        `4) Entity filters: ${hasEntity ? "yes" : "no"}`,
+        `5) Joins/relationships: ${hasRelationships ? "yes" : "no"}`,
+        `6) Table pagination: ${hasTables ? "yes" : "no"}`,
+        `7) KPI coverage: ${hasKpis ? "yes" : "no"}`
+    ];
+    return summary.join("\n");
+}
+
+function buildPlanTextFromWidgets(input: {
+    title: string;
+    purpose: string;
+    filtersText: string;
+    widgets: any[];
+    scenarioText?: string;
+}) {
+    const lines: string[] = [];
+    lines.push(`DASHBOARD TITLE: ${input.title || "AI Analytics Dashboard"}`);
+    lines.push(`PURPOSE: ${input.purpose || "Auto-generated dashboard plan."}`);
+    lines.push("");
+    lines.push("FILTERS TO INCLUDE:");
+    lines.push(input.filtersText || "1) None");
+    if (input.scenarioText) {
+        lines.push("");
+        lines.push("SCENARIO COVERAGE:");
+        lines.push(input.scenarioText);
+    }
+    lines.push("");
+    input.widgets.forEach((w: any, idx: number) => {
+        const widgetTitle = String(w?.title || `Widget ${idx + 1}`).trim();
+        const widgetType = String(w?.type || "chart").trim();
+        const goal = String(w?.goal || "Visualization").trim();
+        const uses = w?.primaryTable ? `${w.primaryTable}.*` : "Not specified.";
+        lines.push(`WIDGET ${idx + 1}: ${widgetType} - ${widgetTitle}`);
+        lines.push(`Shows: ${goal}`);
+        lines.push("Why: Auto-generated by parallel planning.");
+        lines.push(`Uses: ${uses}`);
+        lines.push("Filters applied: See filters above.");
+        lines.push("Notes: Auto-generated.");
+        lines.push("");
+    });
+    return lines.join("\n").trim();
+}
+
+function orderWidgetsByType(widgets: any[], orderedAllowedTypes: string[]) {
+    const typeRank = new Map(orderedAllowedTypes.map((t, i) => [t, i]));
+    return [...widgets].sort((a: any, b: any) => {
+        const aRank = typeRank.has(a?.type) ? (typeRank.get(a.type) as number) : 999;
+        const bRank = typeRank.has(b?.type) ? (typeRank.get(b.type) as number) : 999;
+        if (aRank !== bRank) return aRank - bRank;
+        return String(a?.title || "").localeCompare(String(b?.title || ""));
+    });
+}
+
 function formatTableInsightsForPrompt(tableInsights: Record<string, TableInsight> | null) {
     if (!tableInsights) return "";
     const trimmed = Object.fromEntries(
@@ -509,28 +771,287 @@ function formatTableInsightsForPrompt(tableInsights: Record<string, TableInsight
                     column: f.column,
                     table: f.table,
                     targetTable: f.targetTable
+                })),
+                queryExamples: insight.queryExamples?.slice(0, 3).map((ex) => ({
+                    description: ex.description,
+                    sql: ex.sql,
+                    results: ex.results?.slice(0, 2)
                 }))
             }
         ])
     );
-    return JSON.stringify(trimmed).slice(0, 6000);
+    return JSON.stringify(trimmed).slice(0, 8000);
+}
+
+function tokenizeQuery(query: string) {
+    const stopwords = new Set([
+        "the", "and", "for", "with", "from", "this", "that", "show", "showing", "dashboard", "plan", "report",
+        "metrics", "metric", "chart", "table", "kpi", "summary", "analysis", "overview", "by", "of", "to", "in"
+    ]);
+    return String(query || "")
+        .toLowerCase()
+        .split(/[^a-z0-9_]+/g)
+        .map((t) => t.trim())
+        .filter((t) => t.length >= 3 && !stopwords.has(t));
+}
+
+function scoreTableForAgent(input: {
+    table: string;
+    info: any;
+    queryTokens: string[];
+    type: string;
+    tableCount?: number;
+    primaryDateTable?: string;
+}) {
+    const { table, info, queryTokens, type, tableCount, primaryDateTable } = input;
+    let score = 0;
+    const tableLower = table.toLowerCase();
+    queryTokens.forEach((token) => {
+        if (tableLower.includes(token)) score += 4;
+    });
+    const cols = info?.columns || [];
+    cols.forEach((col: any) => {
+        const colName = String(col?.name || col?.column_name || "").toLowerCase();
+        queryTokens.forEach((token) => {
+            if (colName.includes(token)) score += 2;
+        });
+        if (type !== "table") {
+            if (col?.isNumeric) score += 1.2;
+            if (col?.isTemporal) score += 1.2;
+        }
+    });
+    if (primaryDateTable && primaryDateTable === table) score += 3;
+    if (type === "table") {
+        score += Math.min(cols.length / 5, 4);
+    }
+    if (typeof tableCount === "number") {
+        score += Math.min(Math.log10(tableCount + 1), 3);
+    }
+    return score;
+}
+
+function buildRelevantSchemaForAgent(schemaForPrompt: any, type: string, query: string, maxTables = 6) {
+    const schemaInfo = schemaForPrompt?.schemaInfo || {};
+    const tableCounts = schemaForPrompt?.tableCounts || {};
+    const relationships = Array.isArray(schemaForPrompt?.relationships) ? schemaForPrompt.relationships : [];
+    const primaryDateTable = schemaForPrompt?.filterCandidates?.primaryDate?.table;
+    const queryTokens = tokenizeQuery(query);
+    const tableEntries = Object.entries(schemaInfo);
+    if (tableEntries.length <= maxTables) {
+        return { tables: tableEntries.map(([name]) => name), relationships };
+    }
+
+    const scored = tableEntries.map(([table, info]) => {
+        const count = typeof tableCounts?.[table] === "number" ? Number(tableCounts[table]) : undefined;
+        const score = scoreTableForAgent({ table, info, queryTokens, type, tableCount: count, primaryDateTable });
+        return { table, score };
+    }).sort((a, b) => b.score - a.score);
+
+    let selected = scored.filter((entry) => entry.score > 0).map((entry) => entry.table);
+    if (selected.length === 0) {
+        selected = scored.slice(0, maxTables).map((entry) => entry.table);
+    } else {
+        selected = selected.slice(0, maxTables);
+    }
+
+    const selectedSet = new Set(selected);
+    relationships.forEach((rel: any) => {
+        const from = rel?.from?.table;
+        const to = rel?.to?.table;
+        if (from && to) {
+            if (selectedSet.has(from) && !selectedSet.has(to) && selectedSet.size < maxTables + 2) {
+                selectedSet.add(to);
+            } else if (selectedSet.has(to) && !selectedSet.has(from) && selectedSet.size < maxTables + 2) {
+                selectedSet.add(from);
+            }
+        }
+    });
+
+    return {
+        tables: Array.from(selectedSet),
+        relationships: relationships.filter((rel: any) => selectedSet.has(rel?.from?.table) && selectedSet.has(rel?.to?.table))
+    };
+}
+
+function buildSchemaTextForTables(schemaForPrompt: any, tables: string[]) {
+    return tables.map((table) => {
+        const info = schemaForPrompt?.schemaInfo?.[table];
+        const visible = schemaForPrompt?.visibleColumns?.[table];
+        const cols = (info?.columns || [])
+            .filter((c: any) => {
+                if (!Array.isArray(visible) || visible.length === 0) return true;
+                const name = c?.name || c?.column_name;
+                return visible.includes(name);
+            })
+            .map((c: any) => {
+                const pk = c.isPrimary ? 'PK' : '';
+                const name = c?.name || c?.column_name || '';
+                const type = c?.type || c?.data_type || '';
+                return `${name} (${type}${pk ? ', ' + pk : ''})`;
+            }).join(', ');
+        return `TABLE "${table}" [${cols}]`;
+    }).join('\n');
+}
+
+function buildJoinCandidatesText(relationships: any[]) {
+    if (!relationships || relationships.length === 0) return "None";
+    return relationships.map((rel: any) => {
+        const from = rel?.from?.table && rel?.from?.column ? `${rel.from.table}.${rel.from.column}` : '';
+        const to = rel?.to?.table && rel?.to?.column ? `${rel.to.table}.${rel.to.column}` : '';
+        if (!from || !to) return null;
+        const relType = rel?.type ? ` (${rel.type})` : '';
+        return `${from} -> ${to}${relType}`;
+    }).filter(Boolean).join('\n');
+}
+
+function detectPrimaryIntent(schemaForPrompt: any, query: string) {
+    const tableNames = Object.keys(schemaForPrompt?.schemaInfo || {}).map((t) => t.toLowerCase());
+    const columnNames = Object.values(schemaForPrompt?.schemaInfo || {})
+        .flatMap((info: any) => (info?.columns || []).map((c: any) => String(c?.name || c?.column_name || "").toLowerCase()));
+    const haystack = `${String(query || "").toLowerCase()} ${tableNames.join(" ")} ${columnNames.join(" ")}`;
+    const intents: Array<{ label: string; keywords: string[] }> = [
+        { label: "SaaS", keywords: ["subscription", "mrr", "arr", "plan", "billing", "trial", "seat", "tenant", "workspace", "churn"] },
+        { label: "E-commerce", keywords: ["order", "orders", "cart", "checkout", "product", "sku", "payment", "refund", "shipment", "revenue"] },
+        { label: "Support", keywords: ["ticket", "tickets", "support", "case", "sla", "resolution", "agent", "queue"] },
+        { label: "Marketing", keywords: ["campaign", "utm", "ad", "ads", "click", "impression", "conversion", "lead", "funnel"] },
+    ];
+    const scored = intents.map((intent) => {
+        const score = intent.keywords.reduce((acc, kw) => acc + (haystack.includes(kw) ? 1 : 0), 0);
+        return { ...intent, score };
+    }).sort((a, b) => b.score - a.score);
+    if (scored.length === 0 || scored[0].score === 0) return "General";
+    return scored[0].label;
+}
+
+async function runPlannerDomainAgent(input: {
+    domainLabel: string;
+    query: string;
+    schemaForPrompt: any;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { domainLabel, query, schemaForPrompt, onToken, onDraft, critiqueEnabled } = input;
+    const schemaSummary = buildStrategySchemaSummary(schemaForPrompt);
+    const systemPrompt = `You are the ${domainLabel} Domain Agent.
+
+USER OBJECTIVE: "${query}"
+SCHEMA SUMMARY:
+${schemaSummary}
+
+TASK:
+Provide concise domain-specific guidance (max 5 bullet lines) about:
+- Which KPIs matter most
+- Which dimensions to break down by
+- Any common pitfalls or must-have visuals
+
+Return ONLY bullet lines.`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage("Provide domain guidance only.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+    const formatSpec = `- Bullet line 1
+- Bullet line 2
+- Bullet line 3 (max 5 lines)`;
+    return refinePlannerOutput({
+        agentLabel: `${domainLabel} Domain Agent`,
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+async function runPlannerFinalAgent(input: {
+    query: string;
+    draftPlan: string;
+    allowedTypes: string[];
+    orderedAllowedTypes: string[];
+    requiredWidgetCount: number;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, draftPlan, allowedTypes, orderedAllowedTypes, requiredWidgetCount, onToken, onDraft, critiqueEnabled } = input;
+    const systemPrompt = `You are the Final Plan Agent. You merge all sub-agent outputs into a single best plan.
+
+USER OBJECTIVE: "${query}"
+ALLOWED WIDGET TYPES (STRICT): ${allowedTypes.join(", ")}
+ORDER PREFERENCE: ${orderedAllowedTypes.join(", ")}
+TOTAL WIDGETS REQUIRED: ${requiredWidgetCount}
+
+TASK:
+- Validate and fix the draft plan.
+- Ensure every allowed type appears at least once.
+- If KPI is allowed, ensure exactly 4 KPI cards.
+- If table is allowed, it must be the final widget.
+- Ensure all widgets include Uses, Filters applied, Notes, Confidence, Rationale.
+- Normalize wording and remove duplicates.
+- Keep titles short and business-friendly.
+- Use only tables/columns mentioned in the draft.
+
+Return ONLY the final plan in this exact format:
+
+DASHBOARD TITLE: <title>
+PURPOSE: <purpose>
+
+FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>
+
+SCENARIO COVERAGE:
+1) <coverage line>
+
+WIDGET 1: [Type] - [Title]
+Shows: [Exact metric]
+Why: [Business value]
+Uses: [table.column references, include join paths if needed]
+Filters applied: [List filters and how they modify the query]
+Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
+
+WIDGET 2: ...`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage(draftPlan)
+    ], onToken);
+
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+
+    const formatSpec = `DASHBOARD TITLE: <title>
+PURPOSE: <purpose>
+
+FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>
+
+SCENARIO COVERAGE:
+1) <coverage line>
+
+WIDGET 1: [Type] - [Title]
+Shows: [Exact metric]
+Why: [Business value]
+Uses: [table.column references, include join paths if needed]
+Filters applied: [List filters and how they modify the query]
+Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
+...`;
+    return refinePlannerOutput({
+        agentLabel: "Final Plan Agent",
+        draft,
+        formatSpec,
+        onToken
+    });
 }
 
 function normalizePlannedWidgets(widgets: any[], schemaInfo: Record<string, any>, allowedTypesOverride?: string[]) {
-    const defaultAllowedTypes = [
-        "kpi",
-        "line",
-        "area",
-        "bar",
-        "pie",
-        "donut",
-        "table",
-        "cohort",
-        "funnel",
-        "map",
-        "scatter",
-        "markdown",
-    ];
+    const defaultAllowedTypes = [...PLANNER_WIDGET_TYPE_ORDER];
     const allowedTypes = new Set(allowedTypesOverride && allowedTypesOverride.length > 0
         ? allowedTypesOverride
         : defaultAllowedTypes);
@@ -609,11 +1130,15 @@ function filterSchemaForNonEmptyTables(schema: any) {
     const filteredSampleData = filterMap(schema.sampleData);
     const filteredTableCounts = filterMap(tableCounts);
     const filteredTableInsights = schema.tableInsights ? filterMap(schema.tableInsights) : schema.tableInsights;
+    const filteredVisibleColumns = schema.visibleColumns ? filterMap(schema.visibleColumns) : schema.visibleColumns;
+    const filteredFilterableColumns = schema.filterableColumns ? filterMap(schema.filterableColumns) : schema.filterableColumns;
     const filteredRelationships = Array.isArray(schema.relationships)
         ? schema.relationships.filter((rel: any) => nonEmptyTables.has(rel?.from?.table) && nonEmptyTables.has(rel?.to?.table))
         : [];
 
-    const filterCandidates = detectFilterCandidates(filteredSchemaInfo, filteredSampleData, filteredTableCounts, filteredRelationships);
+    const filterCandidates = filteredFilterableColumns
+        ? buildFilterCandidatesFromColumns(filteredSchemaInfo, filteredFilterableColumns)
+        : detectFilterCandidates(filteredSchemaInfo, filteredSampleData, filteredTableCounts, filteredRelationships);
     const tableNames = Object.keys(filteredSchemaInfo);
     const rawAnalysis = tableNames.length
         ? `Database contains ${tableNames.length} non-empty tables including ${tableNames.slice(0, 5).join(', ')}.`
@@ -625,6 +1150,8 @@ function filterSchemaForNonEmptyTables(schema: any) {
         sampleData: filteredSampleData,
         tableCounts: filteredTableCounts,
         tableInsights: filteredTableInsights,
+        visibleColumns: filteredVisibleColumns,
+        filterableColumns: filteredFilterableColumns,
         relationships: filteredRelationships,
         filterCandidates,
         filterSummary: filterCandidates.summary,
@@ -644,166 +1171,7 @@ export async function runSchemaDiscovery(
     options: SchemaDiscoveryOptions = {},
     allowedTables?: string[]
 ) {
-    console.log("[AGENT] Starting Schema Discovery (Pro Mode)...");
-
-    const envUrl = process.env.POSTGRES_URL || process.env.NEXT_PUBLIC_POSTGRES_URL;
-    const targetUrl = connectionString || envUrl;
-    const isMssql = (() => {
-        const lower = (targetUrl || "").toLowerCase();
-        return lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
-    })();
-    const quoteIdent = (name: string) => {
-        if (isMssql) {
-            return `[${name.replace(/]/g, "]]")}]`;
-        }
-        return `"${name.replace(/"/g, "\"\"")}"`;
-    };
-
-    if (!targetUrl) {
-        const errorMessage = "Schema discovery requires a configured database connection. Set POSTGRES_URL or connect via the Data Sources panel.";
-        console.error("[SCHEMA] " + errorMessage);
-        throw new Error(errorMessage);
-    }
-
-    const connected = await connectToPostgres(targetUrl);
-    if (!connected) {
-        throw new Error("Failed to connect to the database. Please verify your connection details.");
-    }
-
-    const allTablesResult = await dbGateway.listTables(targetUrl);
-
-    // Error Handling for Direct Gateway
-    if (!allTablesResult || (allTablesResult as any).error) {
-        const errorMsg = (allTablesResult as any)?.error || "Failed to retrieve tables from database.";
-        console.error(`[SCHEMA_ERROR] ${errorMsg}`);
-        return {
-            tables: [],
-            schemaInfo: {},
-            sampleData: {},
-            tableCounts: {},
-            relationships: [],
-            rawAnalysis: `Database Connection Error: ${errorMsg}. Please check your connection settings.`
-        };
-    }
-
-    let allTables = Array.isArray(allTablesResult) ? allTablesResult : [];
-    if (Array.isArray(allowedTables) && allowedTables.length > 0) {
-        const allowedLower = new Set(allowedTables.map((t) => t.toLowerCase()));
-        allTables = allTables.filter((t) => t && allowedLower.has(t.toLowerCase()));
-    }
-
-    if (!Array.isArray(allTables) || allTables.length === 0) {
-        console.warn("[SCHEMA_WARNING] No tables found in the database (public schema).");
-        return {
-            tables: [],
-            schemaInfo: {},
-            sampleData: {},
-            tableCounts: {},
-            relationships: [],
-            rawAnalysis: "No tables found in the database. Please verify your connection and ensure tables exist in the 'public' schema."
-        };
-    }
-
-    const schemaInfo: Record<string, any> = {};
-    const sampleData: Record<string, any[]> = {};
-    const tableCounts: Record<string, number> = {};
-    const relationships: any[] = [];
-
-    // Profiling loop
-    for (const tableName of allTables) {
-        console.log(`[SCHEMA] Profiling: ${tableName}`);
-        try {
-            const tableSchema = await dbGateway.getTableSchema(tableName, targetUrl);
-
-            // Enhance schema with data type categorization for AI guidance
-            if (tableSchema && tableSchema.columns) {
-                tableSchema.columns = tableSchema.columns.map((column: any) => ({
-                    ...column,
-                    name: column.column_name || column.name,
-                    type: column.data_type || column.type,
-                    category: categorizeDataType(column.data_type || column.type || ""),
-                    isNumeric: isNumericType(column.data_type || column.type || ""),
-                    isTemporal: isTemporalType(column.data_type || column.type || ""),
-                    isText: isTextType(column.data_type || column.type || "")
-                }));
-            }
-
-            schemaInfo[tableName] = tableSchema;
-
-            const countResult = await dbGateway.runQuery(`SELECT COUNT(*) as count FROM ${quoteIdent(tableName)}`, targetUrl);
-            const rawCount = (Array.isArray(countResult) && countResult.length > 0) ? countResult[0].count : 0;
-            tableCounts[tableName] = rawCount ? Number(rawCount) : 0;
-
-            const preview = await dbGateway.getTablePreview(tableName, targetUrl);
-            sampleData[tableName] = Array.isArray(preview) ? preview : [];
-
-            // Discovered foreign keys for relationship mapping
-            if (tableSchema.foreignKeys && tableSchema.foreignKeys.length > 0) {
-                for (const fk of tableSchema.foreignKeys) {
-                    relationships.push({
-                        from: { table: tableName, column: fk.column_name },
-                        to: { table: fk.foreign_table_name, column: fk.foreign_column_name },
-                        type: "many-to-one"
-                    });
-                }
-            } else {
-                // Heuristic: check if table looks like a junction table (e.g. table_a_table_b)
-                // or contains common FK names if direct FKs aren't metadata-exposed
-                const columns = tableSchema.columns || [];
-                const idColumns = columns.filter((c: any) => c.name.endsWith('_id'));
-                if (idColumns.length >= 2) {
-                    // Potential junction or 1:M relationship that might not have explicit FK constraints in DB
-                    console.log(`[SCHEMA] Potential implicit relationships in ${tableName}: ${idColumns.map((c: any) => c.name).join(', ')}`);
-                }
-            }
-        } catch (err: any) {
-            console.error(`[SCHEMA_PROFILE_ERROR] Failed to profile ${tableName}:`, err);
-            if (err.stack) console.error(err.stack);
-            schemaInfo[tableName] = { columns: [] };
-            sampleData[tableName] = [];
-            tableCounts[tableName] = 0;
-        }
-    }
-
-    // Detect filterable dimensions (dates, categories, entities)
-    const filterCandidates = detectFilterCandidates(schemaInfo, sampleData, tableCounts, relationships);
-
-    const tableInsights = await buildTableInsights(schemaInfo, sampleData, tableCounts, options);
-
-    // Generate natural language analysis using LLM (optional)
-    let rawAnalysis = "";
-    if (options.enableSemanticSearch) {
-        try {
-            rawAnalysis = await generateSchemaAnalysis(
-                allTables,
-                schemaInfo,
-                sampleData,
-                tableCounts,
-                relationships,
-                options.projectContext
-            );
-        } catch (err: any) {
-            console.error("[SCHEMA_LLM_ERROR] Failed to generate semantic analysis:", err.message);
-            rawAnalysis = "Semantic analysis failed. See raw table data below.";
-        }
-    } else {
-        rawAnalysis = options.projectContext
-            ? `Project context: ${options.projectContext}\nSemantic analysis disabled. Schema profiling only.`
-            : "Semantic analysis disabled. Schema profiling only.";
-    }
-
-    return {
-        tables: allTables,
-        schemaInfo,
-        sampleData,
-        tableCounts,
-        relationships,
-        tableInsights,
-        filterCandidates,
-        rawAnalysis,
-        filterSummary: filterCandidates.summary,
-        projectContext: options.projectContext || ""
-    };
+    return runSchemaDiscoveryImpl(connectionString, options, allowedTables);
 }
 
 function detectFilterCandidates(
@@ -815,6 +1183,8 @@ function detectFilterCandidates(
     const dateColumns: { table: string; column: string; type: string }[] = [];
     const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
     const entityColumns: { viaTable: string; from: string; to: string; count?: number }[] = [];
+    const searchColumns: { table: string; column: string; score: number }[] = [];
+    const searchSignals = /(name|title|email|username|user_name|phone|company|customer|client|account|code|number|id)$/i;
 
     for (const [table, info] of Object.entries(schemaInfo)) {
         const columns = (info as any)?.columns || [];
@@ -833,6 +1203,9 @@ function detectFilterCandidates(
                 if (distinct.length > 0 && distinct.length <= 20) {
                     categoricalColumns.push({ table, column: colName, distinct });
                 }
+                const scoreBase = searchSignals.test(String(colName)) ? 4 : 1;
+                const distinctScore = distinct.length > 20 ? 2 : distinct.length > 5 ? 1 : 0;
+                searchColumns.push({ table, column: colName, score: scoreBase + distinctScore });
             }
         });
     }
@@ -849,6 +1222,7 @@ function detectFilterCandidates(
     });
 
     const primaryDate = dateColumns[0];
+    const primarySearch = searchColumns.sort((a, b) => b.score - a.score)[0];
     const summaryLines: string[] = [];
     if (primaryDate) {
         summaryLines.push(`Date range filter: ${primaryDate.table}.${primaryDate.column}`);
@@ -859,11 +1233,16 @@ function detectFilterCandidates(
     if (entityColumns.length > 0) {
         summaryLines.push(`Entity filters: ${entityColumns.slice(0, 5).map(e => e.from).join(', ')}${entityColumns.length > 5 ? ' ...' : ''}`);
     }
+    if (primarySearch?.table && primarySearch?.column) {
+        summaryLines.push(`Search field: ${primarySearch.table}.${primarySearch.column}`);
+    }
 
     return {
         dateColumns,
         categoricalColumns,
         entityColumns,
+        searchColumns,
+        primarySearch,
         primaryDate,
         summary: summaryLines.join('\n') || 'No filterable dimensions detected.'
     };
@@ -937,285 +1316,56 @@ KEEP IT BRIEF.`;
  * Expert database analyst + data analyst + KPI strategist + UI/UX dashboard designer.
  * Returns a comprehensive natural-language dashboard plan.
  */
-export async function runDashboardPlanner(query: string, schema: any) {
-    console.log("[AGENT] Planning Dashboard Architecture (Pro Mode)...");
-
-    const filteredSchema = filterSchemaForNonEmptyTables(schema);
-    const schemaForPrompt = filteredSchema || schema;
-
-    const tables = Object.keys(schemaForPrompt.schemaInfo || {});
-    const disabledTypes = Array.isArray(schemaForPrompt.disabledWidgetTypes) ? schemaForPrompt.disabledWidgetTypes : [];
-    const allowedTypes = [
-        "kpi",
-        "line",
-        "area",
-        "bar",
-        "pie",
-        "donut",
-        "table",
-        "cohort",
-        "funnel",
-        "map",
-        "scatter",
-        "markdown",
-    ].filter((t) => !disabledTypes.includes(t));
-    const widgetTypeOrder = ["kpi", "line", "area", "bar", "pie", "donut", "scatter", "map", "funnel", "cohort", "markdown", "table"];
-    const orderedAllowedTypes = widgetTypeOrder.filter((t) => allowedTypes.includes(t));
-    const requiredWidgetCount = orderedAllowedTypes.length + (allowedTypes.includes("kpi") ? 3 : 0);
+async function runPlannerSubAgent(input: {
+    query: string;
+    schemaForPrompt: any;
+    allowedTypes: string[];
+    orderedAllowedTypes: string[];
+    requiredWidgetCount: number;
+    focusLabel: string;
+    filtersText?: string;
+    strategyNotes?: string;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, schemaForPrompt, allowedTypes, orderedAllowedTypes, requiredWidgetCount, focusLabel, filtersText, strategyNotes, onToken, onDraft, critiqueEnabled } = input;
     const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
     const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
     const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
     const dateContext = buildDateContext(referenceDate);
-    // Simplified schema for LLM optimized reading to prevent hallucinations
-    const simplifiedSchema = Object.entries(schemaForPrompt.schemaInfo || {}).map(([table, info]: [string, any]) => {
-        const cols = info.columns?.map((c: any) => {
-            const pk = c.isPrimary ? 'PK' : '';
-            return `${c.name} (${c.type}${pk ? ', ' + pk : ''})`;
-        }).join(', ');
-        return `TABLE "${table}" [${cols}]`;
-    }).join('\n');
-
-    const relationships = JSON.stringify(schemaForPrompt.relationships || []);
-
-    // Limited sample data for planner
-    const limitedSampleData: Record<string, any[]> = {};
-    Object.entries(schemaForPrompt.sampleData || {}).slice(0, 5).forEach(([table, rows]: [string, any]) => {
-        limitedSampleData[table] = rows.slice(0, 2);
-    });
-    const sampleDataText = JSON.stringify(limitedSampleData);
-
-    const filterSummary = schemaForPrompt.filterSummary || '';
-
-    const systemPrompt = `You are Plan Agent, a Senior Software Architect (15+ years in AI, backend engineering, data analytics, scalable system design).
-
-You receive database schema with sample data and relationships from Schema Discovery Agent.
-
-### INPUT CONTEXT
-USER OBJECTIVE: "${query}"
-${projectContext ? `\nPROJECT CONTEXT:\n${projectContext}\n` : ''}
-
-SCHEMA OVERVIEW:
-${schemaForPrompt.rawAnalysis || 'No previous analysis available.'}
-
-DATABASE STRUCTURE:
-${simplifiedSchema}
-
-RELATIONSHIPS:
-${relationships}
-
-ALLOWED WIDGET TYPES (STRICT):
-${allowedTypes.join(", ")}
-
-DO NOT include any widget types outside this list.
-You MUST include every allowed widget type at least once.
-${allowedTypes.includes("kpi") ? "Include exactly 4 KPI cards if KPI is allowed." : "Do not include KPI cards if KPI is not allowed."}
-${allowedTypes.includes("table") ? "If table is allowed, the final widget must be a table." : "Do not include tables if table is not allowed."}
-Order widgets using this preferred type order (repeat KPI cards first if enabled):
-${orderedAllowedTypes.join(", ")}
-Total widgets must be exactly ${requiredWidgetCount}.
-
-SAMPLE DATA:
-${sampleDataText}
-
-DATE CONTEXT (UTC):
-${dateContext.summary}
-
-FILTERABLE DIMENSIONS:
-${filterSummary || 'No filter candidates detected.'}
-${tableInsightsText ? `\nTABLE INSIGHTS:\n${tableInsightsText}` : ''}
-
-### Your Mission
-Transform database schema and sample data into a complete dashboard widget plan that tells a story.
-
-### Architecture & Design Principles
-1) Data Discovery & Context: Inspect schema, types, constraints, and latest records to validate assumptions.
-2) KPI Identification: Prioritize actionable KPIs that scale with data growth.
-3) Visualization Strategy: Match charts to data characteristics (trend/comparison/proportion/distribution).
-4) Advanced Data Table: Include search, sorting, pagination, and smart filters.
-5) Time-Based Views: Ensure KPIs/charts/tables respond to time filters.
-6) System Efficiency: Keep the plan modular, reusable, and config-driven.
-7) Insights & Reporting: Optimize for decision-making and drill-downs.
-
-### Step 1: Receive and Analyze Input
-Understand:
-- Business type (e-commerce, SaaS, support tickets, etc.)
-- Transaction/event tables (orders, payments, sessions)
-- Reference tables (customers, products, categories)
-- Time columns (created_at, order_date, updated_at)
-- Money columns (amount, price, revenue, cost)
-- Status/category columns (status, type, category, stage)
-
-### Step 2: Identify Core Business Metrics
-If you see orders/sales tables:
-- Total revenue, number of orders, average order value, orders per customer, repeat customer rate
-If you see subscription/SaaS tables:
-- MRR, active subscriptions, churn rate, CLV, new vs returning customers
-If you see support/ticket tables:
-- Total tickets, resolution time, first response time, tickets by status/priority, agent performance
-If you see user/session tables:
-- Active users, session duration, bounce rate, conversion rate, retention
-
-### Step 3: Plan Widget Types (Cover All Enabled Types)
-- Include every allowed widget type at least once.
-- If KPI is allowed, include exactly 4 KPI cards.
-- Keep table as the final widget if table is allowed.
-- Use the preferred type order listed above.
-
-### Step 4: Use Relationships Intelligently
-- Use joins to show customer/product performance when relationships exist
-- Include entity names in detail tables via joins
-- Add Top N charts using related dimensions
-
-### Step 5: Choose Time Ranges Smartly
-- Use sample data to decide daily vs monthly grouping
-- Use last 30/90 days or this year based on data recency
-
-### Step 6: Write Clear Widget Descriptions
-For each widget specify:
-1) Widget number and type
-2) Title
-3) What it shows
-4) Why it matters
-5) Which columns it uses
-6) Special notes (time range, filters, sorting)
-
-### Output Format (Strict)
-Return ONLY a structured list in this exact format:
-
-DASHBOARD TITLE: [Business-appropriate name based on data]
-PURPOSE: [One sentence about what this dashboard helps users understand]
-
-FILTERS TO INCLUDE:
-1) [Filter name, type (date range | multi-select | dropdown | toggle), default, column(s), affected widgets]
-2) ...
-
-WIDGET 1: [Type] - [Title]
-Shows: [Exact metric]
-Why: [Business value]
-Uses: [table.column references]
-Filters applied: [List filters and how they modify the query, e.g., WHERE date between {from}/{to}, c.region IN {regions}]
-Notes: [Any special requirements or comparison logic]
-
-WIDGET 2: [Type] - [Title]
-...
-
-Critical Rules:
-- Always include every allowed widget type at least once
-- Total widgets must be exactly ${requiredWidgetCount}
-- If KPI is allowed, include 4 KPI cards first
-- If line is allowed, include at least 1 trend chart
-- If bar is allowed, include at least 1 breakdown chart
-- If pie or donut is allowed, include at least 1 distribution chart
-- If table is allowed, include 1 detail table at the end
-- Identify filters (date range, categorical, entity) and note which widgets each filter affects
-- Use exact column names from the schema
-- Mention which tables need joins
-- Specify time ranges clearly
-- Keep titles short and business-friendly
-- Do not write SQL
-- Do not output JSON or code
-- Do not repeat these instructions; start directly with the DASHBOARD TITLE line.
-
-Append a short event stream after the plan for UI status (do not change the plan format):
-EVENT_STREAM:
-{"type":"schema_summary","content":"<1-2 sentences summarizing the data domain and key entities>"}
-{"type":"plan_ready","content":"<1 sentence confirming the plan is ready>"}`;
-
-    const response = await invokeModelWithRetry([
-        new SystemMessage(systemPrompt),
-        new HumanMessage("Generate the dashboard plan for the provided schema and query.")
-    ]);
-    const planText = response.content as string;
-
-    const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
-    const widgets = normalizePlannedWidgets(parseNaturalLanguagePlan(planText), schemaForPrompt.schemaInfo || {}, allowedTypes);
-
-    return {
-        title: extractDashboardTitle(planText) || "AI Analytics Dashboard",
-        rawPlan: planText,
-        widgets
-    };
-}
-
-/**
- * STEP 2.5: STREAMING DASHBOARD PLANNER
- * Returns an async generator for streaming the plan text.
- */
-export async function* runDashboardPlannerStream(query: string, schema: any) {
-    console.log("[AGENT] Planning Dashboard Architecture (Streaming Mode)...");
-
-    const truncateText = (value: string, maxChars: number) => {
-        if (!value) return value;
-        if (value.length <= maxChars) return value;
-        return `${value.slice(0, maxChars)}\n...[truncated ${value.length - maxChars} chars]`;
-    };
-
-    const filteredSchema = filterSchemaForNonEmptyTables(schema);
-    const schemaForPrompt = filteredSchema || schema;
-
-    const tables = Object.keys(schemaForPrompt.schemaInfo || {});
-    const disabledTypes = Array.isArray(schemaForPrompt.disabledWidgetTypes) ? schemaForPrompt.disabledWidgetTypes : [];
-    const allowedTypes = [
-        "kpi",
-        "line",
-        "area",
-        "bar",
-        "pie",
-        "donut",
-        "table",
-        "cohort",
-        "funnel",
-        "map",
-        "scatter",
-        "markdown",
-    ].filter((t) => !disabledTypes.includes(t));
-    const widgetTypeOrder = ["kpi", "line", "area", "bar", "pie", "donut", "scatter", "map", "funnel", "cohort", "markdown", "table"];
-    const orderedAllowedTypes = widgetTypeOrder.filter((t) => allowedTypes.includes(t));
-    const requiredWidgetCount = orderedAllowedTypes.length + (allowedTypes.includes("kpi") ? 3 : 0);
-    const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
-    const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
-    // Cap to top 12 tables to keep prompts small for large schemas
-    const simplifiedSchema = Object.entries(schemaForPrompt.schemaInfo || {}).slice(0, 12).map(([table, info]: [string, any]) => {
-        const cols = (info.columns || []).slice(0, 6).map((c: any) => c.name).join(', ');
-        return `${table}: [${cols}]`;
-    }).join('\n');
-
-    const relationships = (schemaForPrompt.relationships || []).map((r: any) => {
-        if (!r?.from?.table || !r?.to?.table) return '';
-        return `${r.from.table}.${r.from.column || ''} -> ${r.to.table}.${r.to.column || ''}`;
-    }).filter(Boolean).join('\n');
-
+    const { tables: relevantTables, relationships: relevantRelationships } = buildRelevantSchemaForAgent(schemaForPrompt, allowedTypes[0] || "chart", query, 6);
+    const simplifiedSchema = buildSchemaTextForTables(schemaForPrompt, relevantTables);
+    const relationships = buildJoinCandidatesText(relevantRelationships);
     const sampleDataText = JSON.stringify(Object.fromEntries(
-        Object.entries(schemaForPrompt.sampleData || {}).slice(0, 2).map(([k, v]: [any, any]) => [k, v.slice(0, 1)])
+        Object.entries(schemaForPrompt.sampleData || {})
+            .filter(([table]) => relevantTables.includes(table))
+            .slice(0, 2)
+            .map(([k, v]: [any, any]) => [k, v.slice(0, 1)])
     ));
+    const filterSummary = schemaForPrompt.filterSummary || '';
+    const trimmedSchema = truncatePlannerText(simplifiedSchema, 2500);
+    const trimmedRelationships = truncatePlannerText(relationships, 1000);
+    const trimmedSampleData = truncatePlannerText(sampleDataText, 800);
+    const trimmedFilterSummary = truncatePlannerText(filterSummary, 1200);
+    const trimmedTableInsights = truncatePlannerText(tableInsightsText || '', 1500);
+    const trimmedProjectContext = truncatePlannerText(projectContext, 1200);
 
-    const rawAnalysis = truncateText(schemaForPrompt.rawAnalysis || 'No previous analysis available.', 2000);
-    const filterSummary = truncateText(schemaForPrompt.filterSummary || 'No filter candidates detected.', 1200);
-    const connectorInstructions = truncateText(schemaForPrompt.connectorInstructions || '', 1200);
-    const trimmedProjectContext = truncateText(projectContext, 1200);
-    const trimmedSchema = truncateText(simplifiedSchema, 3000);
-    const trimmedRelationships = truncateText(relationships, 1200);
-    const trimmedSampleData = truncateText(sampleDataText, 800);
-    const trimmedTableInsights = truncateText(tableInsightsText || '', 2000);
-    const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
-    const dateContext = buildDateContext(referenceDate);
+    const systemPrompt = `You are Plan Agent (${focusLabel}), a Senior Software Architect and KPI Strategist.
 
-    const systemPrompt = `You are Plan Agent, a Senior Software Architect and KPI Strategist for analytics dashboards.
-
-You receive database schema with sample data and relationships from Schema Discovery Agent.
-
-### INPUT CONTEXT
 USER OBJECTIVE: "${query}"
 ${trimmedProjectContext ? `\nPROJECT CONTEXT:\n${trimmedProjectContext}\n` : ''}
-
-SCHEMA OVERVIEW:
-${rawAnalysis}
 
 DATABASE STRUCTURE:
 ${trimmedSchema}
 
-RELATIONSHIPS:
+JOIN CANDIDATES:
 ${trimmedRelationships}
+
+ALLOWED WIDGET TYPES (STRICT):
+${allowedTypes.join(", ")}
+
+${buildPlannerRulesBlock(allowedTypes, orderedAllowedTypes, requiredWidgetCount)}
 
 SAMPLE DATA:
 ${trimmedSampleData}
@@ -1224,118 +1374,615 @@ DATE CONTEXT (UTC):
 ${dateContext.summary}
 
 FILTERABLE DIMENSIONS:
-${filterSummary}
+${trimmedFilterSummary || 'No filter candidates detected.'}
 ${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
-${connectorInstructions ? `\nCONNECTOR INSTRUCTIONS:\n${connectorInstructions}` : ''}
-
-ALLOWED WIDGET TYPES (STRICT):
-${allowedTypes.join(", ")}
-
-DO NOT include any widget types outside this list.
-You MUST include every allowed widget type at least once.
-${allowedTypes.includes("kpi") ? "Include exactly 4 KPI cards if KPI is allowed." : "Do not include KPI cards if KPI is not allowed."}
-${allowedTypes.includes("table") ? "If table is allowed, the final widget must be a table." : "Do not include tables if table is not allowed."}
-Order widgets using this preferred type order (repeat KPI cards first if enabled):
-${orderedAllowedTypes.join(", ")}
-Total widgets must be exactly ${requiredWidgetCount}.
-
-### Your Mission
-Transform database schema and sample data into a complete dashboard widget plan that tells a story.
-
-### Step 1: Receive and Analyze Input
-Understand:
-- Business type (e-commerce, SaaS, support tickets, etc.)
-- Transaction/event tables (orders, payments, sessions)
-- Reference tables (customers, products, categories)
-- Time columns (created_at, order_date, updated_at)
-- Money columns (amount, price, revenue, cost)
-- Status/category columns (status, type, category, stage)
-
-### Step 2: Identify Core Business Metrics
-If you see orders/sales tables:
-- Total revenue, number of orders, average order value, orders per customer, repeat customer rate
-If you see subscription/SaaS tables:
-- MRR, active subscriptions, churn rate, CLV, new vs returning customers
-If you see support/ticket tables:
-- Total tickets, resolution time, first response time, tickets by status/priority, agent performance
-If you see user/session tables:
-- Active users, session duration, bounce rate, conversion rate, retention
-
-### Step 3: Plan Widget Types (Cover All Enabled Types)
-- Include every allowed widget type at least once.
-- If KPI is allowed, include exactly 4 KPI cards.
-- Keep table as the final widget if table is allowed.
-- Use the preferred type order listed above.
-
-### Step 4: Use Relationships Intelligently
-- Use joins to show customer/product performance when relationships exist
-- Include entity names in detail tables via joins
-- Add Top N charts using related dimensions
-
-### Step 5: Choose Time Ranges Smartly
-- Use sample data to decide daily vs monthly grouping
-- Use last 30/90 days or this year based on data recency
-
-### Step 6: Write Clear Widget Descriptions
-For each widget specify:
-1) Widget number and type
-2) Title
-3) What it shows
-4) Why it matters
-5) Which columns it uses
-6) Special notes (time range, filters, sorting)
+${filtersText ? `\nAPPROVED FILTERS (USE WHEN RELEVANT):\n${filtersText}` : ''}
+${strategyNotes ? `\nSTRATEGY NOTES:\n${strategyNotes}` : ''}
 
 ### Output Format (Strict)
-Return ONLY a structured list in this exact format:
-
-DASHBOARD TITLE: [Business-appropriate name based on data]
-PURPOSE: [One sentence about what this dashboard helps users understand]
-
-FILTERS TO INCLUDE:
-1) [Filter name, type (date range | multi-select | dropdown | toggle), default, column(s), affected widgets]
-2) ...
+Return ONLY widget blocks in this exact format (no dashboard title, no filters section):
 
 WIDGET 1: [Type] - [Title]
 Shows: [Exact metric]
 Why: [Business value]
-Uses: [table.column references]
-Filters applied: [List filters and how they modify the query, e.g., WHERE date between {from}/{to}, c.region IN {regions}]
+Uses: [table.column references, include join paths if needed e.g. orders.customer_id -> customers.id]
+Filters applied: [List filters and how they modify the query]
 Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
 
 WIDGET 2: [Type] - [Title]
-...
+...`;
 
-Critical Rules:
-- Always include every allowed widget type at least once
-- Total widgets must be exactly ${requiredWidgetCount}
-- If KPI is allowed, include 4 KPI cards first
-- If line is allowed, include at least 1 trend chart
-- If bar is allowed, include at least 1 breakdown chart
-- If pie or donut is allowed, include at least 1 distribution chart
-- If table is allowed, include 1 detail table at the end
-- Identify filters (date range, categorical, entity) and note which widgets each filter affects
-- Use exact column names from the schema
-- Mention which tables need joins
-- Specify time ranges clearly
-- Keep titles short and business-friendly
-- Do not write SQL
-- Do not output JSON or code
-- Do not repeat these instructions; start directly with the DASHBOARD TITLE line.
-
-Append a short event stream after the plan for UI status (do not change the plan format):
-EVENT_STREAM:
-{"type":"schema_summary","content":"<1-2 sentences summarizing the data domain and key entities>"}
-{"type":"plan_ready","content":"<1 sentence confirming the plan is ready>"}`;
-
-    const stream = await getModel().stream([
+    const response = await streamModelWithRetry([
         new SystemMessage(systemPrompt),
-        new HumanMessage("Generate the complete dashboard plan following the exact format above. Include ALL required sections with multiple widgets in each.")
-    ], { timeout: 900000 }); // 15-minute timeout for the stream itself
+        new HumanMessage("Generate only the widget blocks for the allowed types.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
 
-    for await (const chunk of stream) {
-        if (chunk.content) {
-            yield chunk.content as string;
+    const formatSpec = `WIDGET 1: [Type] - [Title]
+Shows: [Exact metric]
+Why: [Business value]
+Uses: [table.column references, include join paths if needed]
+Filters applied: [List filters and how they modify the query]
+Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
+...`;
+    return refinePlannerOutput({
+        agentLabel: focusLabel,
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+async function runPlannerKpiAgent(input: {
+    query: string;
+    schemaForPrompt: any;
+    requiredWidgetCount: number;
+    focusLabel: string;
+    filtersText?: string;
+    strategyNotes?: string;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, schemaForPrompt, requiredWidgetCount, focusLabel, filtersText, strategyNotes, onToken, onDraft, critiqueEnabled } = input;
+    const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
+    const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
+    const dateContext = buildDateContext(referenceDate);
+    const { tables: relevantTables } = buildRelevantSchemaForAgent(schemaForPrompt, "kpi", query, 6);
+    const simplifiedSchema = buildSchemaTextForTables(schemaForPrompt, relevantTables);
+    const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
+    const trimmedSchema = truncatePlannerText(simplifiedSchema, 2200);
+    const trimmedProjectContext = truncatePlannerText(projectContext, 1200);
+    const trimmedTableInsights = truncatePlannerText(tableInsightsText || '', 1600);
+
+    const systemPrompt = `You are ${focusLabel}, a Senior Analytics Engineer specializing in KPI design.
+
+USER OBJECTIVE: "${query}"
+${trimmedProjectContext ? `\nPROJECT CONTEXT:\n${trimmedProjectContext}\n` : ''}
+
+DATABASE STRUCTURE (RELEVANT TABLES ONLY):
+${trimmedSchema}
+
+DATE CONTEXT (UTC):
+${dateContext.summary}
+
+FILTERABLE DIMENSIONS:
+${filtersText || 'No filter candidates detected.'}
+${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
+${strategyNotes ? `\nSTRATEGY NOTES:\n${strategyNotes}` : ''}
+
+KPI RULES (STRICT):
+- Generate exactly ${requiredWidgetCount} KPI widgets.
+- KPIs must be high-signal and tied to primary fact tables.
+- Prefer additive metrics (count, sum, avg) over niche ratios unless query demands it.
+- Always include a time-aware KPI if a date column exists (e.g., this month, last 30 days).
+- Use human-readable titles (no raw IDs).
+- Include explicit table.column references in Uses.
+
+Output ONLY widget blocks in this exact format:
+WIDGET 1: KPI - [Title]
+Shows: [Exact metric]
+Why: [Business value]
+Uses: [table.column references, include join paths if needed]
+Filters applied: [List filters and how they modify the query]
+Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
+
+WIDGET 2: ...`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage("Generate KPI widgets only.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+    const formatSpec = `WIDGET 1: KPI - [Title]
+Shows: [Exact metric]
+Why: [Business value]
+Uses: [table.column references, include join paths if needed]
+Filters applied: [List filters and how they modify the query]
+Notes: [Any special requirements or comparison logic]
+Confidence: [0-1]
+Rationale: [Short reasoning]
+...`;
+    return refinePlannerOutput({
+        agentLabel: focusLabel,
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+async function runPlannerMetaAgent(input: {
+    query: string;
+    schemaForPrompt: any;
+    allowedTypes: string[];
+    orderedAllowedTypes: string[];
+    requiredWidgetCount: number;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, schemaForPrompt, allowedTypes, orderedAllowedTypes, requiredWidgetCount, onToken, onDraft, critiqueEnabled } = input;
+    const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
+    const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
+    const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
+    const dateContext = buildDateContext(referenceDate);
+    const simplifiedSchema = Object.entries(schemaForPrompt.schemaInfo || {}).map(([table, info]: [string, any]) => {
+        const cols = info.columns?.map((c: any) => c.name).join(', ');
+        return `${table}: [${cols}]`;
+    }).join('\n');
+    const relationships = (schemaForPrompt.relationships || []).map((r: any) => {
+        if (!r?.from?.table || !r?.to?.table) return '';
+        return `${r.from.table}.${r.from.column || ''} -> ${r.to.table}.${r.to.column || ''}`;
+    }).filter(Boolean).join('\n');
+    const sampleDataText = JSON.stringify(Object.fromEntries(
+        Object.entries(schemaForPrompt.sampleData || {}).slice(0, 2).map(([k, v]: [any, any]) => [k, v.slice(0, 1)])
+    ));
+    const filterSummary = schemaForPrompt.filterSummary || '';
+    const trimmedSchema = truncatePlannerText(simplifiedSchema, 2000);
+    const trimmedRelationships = truncatePlannerText(relationships, 800);
+    const trimmedSampleData = truncatePlannerText(sampleDataText, 600);
+    const trimmedFilterSummary = truncatePlannerText(filterSummary, 1200);
+    const trimmedTableInsights = truncatePlannerText(tableInsightsText || '', 1200);
+    const trimmedProjectContext = truncatePlannerText(projectContext, 1000);
+
+    const systemPrompt = `You are the Planner Meta Agent. Your job is to produce a concise dashboard title, purpose, and filters.
+
+USER OBJECTIVE: "${query}"
+${trimmedProjectContext ? `\nPROJECT CONTEXT:\n${trimmedProjectContext}\n` : ''}
+
+DATABASE STRUCTURE:
+${trimmedSchema}
+
+RELATIONSHIPS:
+${trimmedRelationships}
+
+ALLOWED WIDGET TYPES (STRICT):
+${allowedTypes.join(", ")}
+
+${buildPlannerRulesBlock(allowedTypes, orderedAllowedTypes, requiredWidgetCount)}
+
+SAMPLE DATA:
+${trimmedSampleData}
+
+DATE CONTEXT (UTC):
+${dateContext.summary}
+
+FILTERABLE DIMENSIONS:
+${trimmedFilterSummary || 'No filter candidates detected.'}
+${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
+
+Return ONLY this format:
+DASHBOARD TITLE: <title>
+PURPOSE: <purpose>
+
+FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage("Generate the dashboard title, purpose, and filters in the exact format.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+    const formatSpec = `DASHBOARD TITLE: <title>
+PURPOSE: <purpose>
+
+FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>`;
+    return refinePlannerOutput({
+        agentLabel: "Meta Agent",
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+async function runPlannerFilterAgent(input: {
+    query: string;
+    schemaForPrompt: any;
+    allowedTypes: string[];
+    orderedAllowedTypes: string[];
+    requiredWidgetCount: number;
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, schemaForPrompt, allowedTypes, orderedAllowedTypes, requiredWidgetCount, onToken, onDraft, critiqueEnabled } = input;
+    const projectContext = schemaForPrompt.projectContext || schemaForPrompt.projectAbout || "";
+    const referenceDate = findLatestDate(schemaForPrompt.sampleData || {});
+    const dateContext = buildDateContext(referenceDate);
+    const simplifiedSchema = Object.entries(schemaForPrompt.schemaInfo || {}).map(([table, info]: [string, any]) => {
+        const cols = info.columns?.map((c: any) => `${c.name} (${c.type})`).join(', ');
+        return `${table}: [${cols}]`;
+    }).join('\n');
+    const relationships = (schemaForPrompt.relationships || []).map((r: any) => {
+        if (!r?.from?.table || !r?.to?.table) return '';
+        return `${r.from.table}.${r.from.column || ''} -> ${r.to.table}.${r.to.column || ''}`;
+    }).filter(Boolean).join('\n');
+    const sampleDataText = JSON.stringify(Object.fromEntries(
+        Object.entries(schemaForPrompt.sampleData || {}).slice(0, 2).map(([k, v]: [any, any]) => [k, v.slice(0, 1)])
+    ));
+    const filterSummary = schemaForPrompt.filterSummary || '';
+    const tableInsightsText = formatTableInsightsForPrompt(schemaForPrompt.tableInsights || null);
+    const trimmedSchema = truncatePlannerText(simplifiedSchema, 2500);
+    const trimmedRelationships = truncatePlannerText(relationships, 1000);
+    const trimmedSampleData = truncatePlannerText(sampleDataText, 800);
+    const trimmedFilterSummary = truncatePlannerText(filterSummary, 1200);
+    const trimmedTableInsights = truncatePlannerText(tableInsightsText || '', 2000);
+    const trimmedProjectContext = truncatePlannerText(projectContext, 1200);
+
+    const systemPrompt = `You are the Filter Planner Agent. Your job is to propose dashboard filters.
+
+USER OBJECTIVE: "${query}"
+${trimmedProjectContext ? `\nPROJECT CONTEXT:\n${trimmedProjectContext}\n` : ''}
+
+DATABASE STRUCTURE:
+${trimmedSchema}
+
+RELATIONSHIPS:
+${trimmedRelationships}
+
+ALLOWED WIDGET TYPES (STRICT):
+${allowedTypes.join(", ")}
+
+${buildPlannerRulesBlock(allowedTypes, orderedAllowedTypes, requiredWidgetCount)}
+
+SAMPLE DATA:
+${trimmedSampleData}
+
+DATE CONTEXT (UTC):
+${dateContext.summary}
+
+FILTERABLE DIMENSIONS:
+${trimmedFilterSummary || 'No filter candidates detected.'}
+${trimmedTableInsights ? `\nTABLE INSIGHTS:\n${trimmedTableInsights}` : ''}
+
+Return ONLY this section in exact format:
+FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage("Generate filters in the exact format.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+    const formatSpec = `FILTERS TO INCLUDE:
+1) <filter name, type, default, column(s), affected widgets>`;
+    return refinePlannerOutput({
+        agentLabel: "Filter Agent",
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+type PlannerAgentEvent = { type: "start" | "done"; agent: string };
+type PlannerAgentToken = { agent: string; token: string };
+type PlannerAgentDraft = { agent: string; content: string };
+type PlannerMetaEvent = { type: "planner_intents"; intents: string[] };
+
+function shouldRunStrategyAgent(schemaForPrompt: any, query: string) {
+    const tableCount = Object.keys(schemaForPrompt?.schemaInfo || {}).length;
+    const relationshipCount = Array.isArray(schemaForPrompt?.relationships) ? schemaForPrompt.relationships.length : 0;
+    const shortQuery = String(query || "").trim().length < 20;
+    return tableCount > 6 || relationshipCount > 3 || shortQuery;
+}
+
+function buildStrategySchemaSummary(schemaForPrompt: any) {
+    const tables = Object.keys(schemaForPrompt?.schemaInfo || {});
+    const relationships = Array.isArray(schemaForPrompt?.relationships) ? schemaForPrompt.relationships : [];
+    const dateColumns = schemaForPrompt?.filterCandidates?.dateColumns || [];
+    return [
+        `Tables: ${tables.length > 0 ? tables.slice(0, 8).join(", ") : "none"}`,
+        `Relationships: ${relationships.length}`,
+        `Date columns: ${dateColumns.length}`
+    ].join("\n");
+}
+
+async function runPlannerStrategyAgent(input: {
+    query: string;
+    schemaForPrompt: any;
+    allowedTypes: string[];
+    onToken?: (token: string) => void;
+    onDraft?: (draft: string) => void;
+    critiqueEnabled?: boolean;
+}) {
+    const { query, schemaForPrompt, allowedTypes, onToken, onDraft, critiqueEnabled } = input;
+    const schemaSummary = buildStrategySchemaSummary(schemaForPrompt);
+    const systemPrompt = `You are the Strategy Agent for dashboard planning.
+
+USER OBJECTIVE: "${query}"
+ALLOWED WIDGET TYPES: ${allowedTypes.join(", ")}
+
+SCHEMA SUMMARY:
+${schemaSummary}
+
+TASK:
+Provide concise guidance (max 6 bullet lines) about:
+- Best story arc for this dashboard
+- Key business metrics to prioritize
+- Any caution about sparse tables or missing dates
+- Suggested grouping grain (daily/weekly/monthly)
+
+Return ONLY the bullet lines.`;
+
+    const response = await streamModelWithRetry([
+        new SystemMessage(systemPrompt),
+        new HumanMessage("Provide strategy notes only.")
+    ], onToken);
+    const draft = (response.content as string) || "";
+    onDraft?.(draft);
+    if (!critiqueEnabled) return draft;
+    const formatSpec = `- Bullet line 1
+- Bullet line 2
+- Bullet line 3 (max 6 lines)`;
+    return refinePlannerOutput({
+        agentLabel: "Strategy Agent",
+        draft,
+        formatSpec,
+        onToken
+    });
+}
+
+async function generateDashboardPlan(
+    query: string,
+    schema: any,
+    includeAgentEvent = false,
+    onAgentEvent?: (event: PlannerAgentEvent) => void,
+    onAgentToken?: (event: PlannerAgentToken) => void,
+    onAgentDraft?: (event: PlannerAgentDraft) => void,
+    onPlannerMeta?: (event: PlannerMetaEvent) => void
+) {
+    const filteredSchema = filterSchemaForNonEmptyTables(schema);
+    const schemaForPrompt = filteredSchema || schema;
+    const { allowedTypes, orderedAllowedTypes, requiredWidgetCount } = getAllowedWidgetTypes(schemaForPrompt);
+    const emitToken = (agent: string) => (token: string) => onAgentToken?.({ agent, token });
+    const critiqueEnabled = true;
+
+    onAgentEvent?.({ type: "start", agent: "Meta Agent" });
+    const metaText = await runPlannerMetaAgent({
+        query,
+        schemaForPrompt,
+        allowedTypes,
+        orderedAllowedTypes,
+        requiredWidgetCount,
+        onToken: emitToken("Meta Agent"),
+        onDraft: (content) => onAgentDraft?.({ agent: "Meta Agent", content }),
+        critiqueEnabled
+    }).catch(() => "").finally(() => onAgentEvent?.({ type: "done", agent: "Meta Agent" }));
+
+    onAgentEvent?.({ type: "start", agent: "Filter Agent" });
+    const filterText = await runPlannerFilterAgent({
+        query,
+        schemaForPrompt,
+        allowedTypes,
+        orderedAllowedTypes,
+        requiredWidgetCount,
+        onToken: emitToken("Filter Agent"),
+        onDraft: (content) => onAgentDraft?.({ agent: "Filter Agent", content }),
+        critiqueEnabled
+    }).catch(() => "").finally(() => onAgentEvent?.({ type: "done", agent: "Filter Agent" }));
+
+    let strategyText = "";
+    if (shouldRunStrategyAgent(schemaForPrompt, query)) {
+        onAgentEvent?.({ type: "start", agent: "Strategy Agent" });
+        strategyText = await runPlannerStrategyAgent({
+            query,
+            schemaForPrompt,
+            allowedTypes,
+            onToken: emitToken("Strategy Agent"),
+            onDraft: (content) => onAgentDraft?.({ agent: "Strategy Agent", content }),
+            critiqueEnabled
+        }).catch(() => "").finally(() => onAgentEvent?.({ type: "done", agent: "Strategy Agent" }));
+    }
+    const domainLabel = detectPrimaryIntent(schemaForPrompt, query);
+    onPlannerMeta?.({ type: "planner_intents", intents: [domainLabel] });
+    const domainAgentName = `${domainLabel} Domain Agent`;
+    onAgentEvent?.({ type: "start", agent: domainAgentName });
+    const domainText = await runPlannerDomainAgent({
+        domainLabel,
+        query,
+        schemaForPrompt,
+        onToken: emitToken(domainAgentName),
+        onDraft: (content) => onAgentDraft?.({ agent: domainAgentName, content }),
+        critiqueEnabled
+    }).catch(() => "").finally(() => onAgentEvent?.({ type: "done", agent: domainAgentName }));
+    const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
+    const meta = parsePlannerMeta(metaText);
+    const filtersFromAgent = parseFiltersOnly(filterText);
+    const strategyNotes = [strategyText, domainText].filter(Boolean).join("\n");
+    const resolvedFiltersText = resolveFiltersText(filtersFromAgent, buildPlannerFiltersText(schemaForPrompt));
+
+    const perTypeTasks: Array<() => Promise<string>> = [];
+    const agentLabels: string[] = ["Meta Agent", "Filter Agent"];
+    if (strategyText) agentLabels.push("Strategy Agent");
+    agentLabels.push(domainAgentName);
+    const typesForAgents = orderedAllowedTypes.length > 0 ? orderedAllowedTypes : allowedTypes;
+
+    typesForAgents.forEach((type) => {
+        const label = `${type.toUpperCase()} Content Agent`;
+        agentLabels.push(label);
+        onAgentEvent?.({ type: "start", agent: label });
+        const requiredCount = type === "kpi" ? 4 : 1;
+        perTypeTasks.push(() => {
+            const runner = type === "kpi"
+                ? runPlannerKpiAgent({
+                    query,
+                    schemaForPrompt,
+                    requiredWidgetCount: requiredCount,
+                    focusLabel: label,
+                    filtersText: resolvedFiltersText,
+                    strategyNotes,
+                    onToken: emitToken(label),
+                    onDraft: (content) => onAgentDraft?.({ agent: label, content }),
+                    critiqueEnabled
+                })
+                : runPlannerSubAgent({
+                    query,
+                    schemaForPrompt,
+                    allowedTypes: [type],
+                    orderedAllowedTypes: [type],
+                    requiredWidgetCount: requiredCount,
+                    focusLabel: label,
+                    filtersText: resolvedFiltersText,
+                    strategyNotes,
+                    onToken: emitToken(label),
+                    onDraft: (content) => onAgentDraft?.({ agent: label, content }),
+                    critiqueEnabled
+                });
+            return runner.finally(() => onAgentEvent?.({ type: "done", agent: label }));
+        });
+    });
+
+    const runWithConcurrency = async <T,>(tasks: Array<() => Promise<T>>, limit: number) => {
+        const results: T[] = [];
+        let index = 0;
+        const workers = new Array(Math.min(limit, tasks.length)).fill(0).map(async () => {
+            while (index < tasks.length) {
+                const current = index++;
+                results[current] = await tasks[current]();
+            }
+        });
+        await Promise.all(workers);
+        return results;
+    };
+
+    const concurrencyEnv = Number(process.env.PLANNER_AGENT_CONCURRENCY || process.env.NEXT_PUBLIC_PLANNER_AGENT_CONCURRENCY || 3);
+    const concurrency = Number.isFinite(concurrencyEnv) && concurrencyEnv > 0 ? Math.max(1, Math.floor(concurrencyEnv)) : 3;
+    const groupResults = await runWithConcurrency(perTypeTasks, concurrency);
+    const parsedGroups = groupResults.map((text) => parseNaturalLanguagePlan(text));
+    const combined = parsedGroups.flat();
+    const ordered = orderWidgetsByType(combined, orderedAllowedTypes);
+    const widgets = normalizePlannedWidgets(ordered, schemaForPrompt.schemaInfo || {}, allowedTypes);
+
+    const titleBase = String(query || "").split(/[.!?]/)[0]?.trim();
+    const fallbackTitle = titleBase && titleBase.length <= 60 ? `${titleBase} Dashboard` : "AI Analytics Dashboard";
+    const title = meta.title || fallbackTitle;
+    const purpose = meta.purpose || (query ? `Dashboard plan for: ${query}` : "Auto-generated dashboard plan.");
+    const scenarioText = buildScenarioCoverageText(schemaForPrompt, widgets);
+    let rawPlan = buildPlanTextFromWidgets({
+        title,
+        purpose,
+        filtersText: resolvedFiltersText,
+        widgets,
+        scenarioText
+    });
+    agentLabels.push("Final Plan Agent");
+    onAgentEvent?.({ type: "start", agent: "Final Plan Agent" });
+    const finalPlanText = await runPlannerFinalAgent({
+        query,
+        draftPlan: rawPlan,
+        allowedTypes,
+        orderedAllowedTypes,
+        requiredWidgetCount,
+        onToken: (token) => onAgentToken?.({ agent: "Final Plan Agent", token }),
+        onDraft: (content) => onAgentDraft?.({ agent: "Final Plan Agent", content }),
+        critiqueEnabled
+    })
+        .catch(() => rawPlan)
+        .finally(() => onAgentEvent?.({ type: "done", agent: "Final Plan Agent" }));
+
+    const finalWidgets = normalizePlannedWidgets(parseNaturalLanguagePlan(finalPlanText), schemaForPrompt.schemaInfo || {}, allowedTypes);
+    const finalTitle = extractDashboardTitle(finalPlanText) || title;
+    let finalRawPlan = finalPlanText || rawPlan;
+
+    if (includeAgentEvent) {
+        const agentNames = agentLabels.length > 0 ? agentLabels.join(", ") : "Parallel agents";
+        finalRawPlan = `${finalRawPlan}\n\nEVENT_STREAM:\n{"type":"planner_agents","content":"${agentNames}"}`;
+    }
+
+    return { title: finalTitle, rawPlan: finalRawPlan, widgets: finalWidgets };
+}
+
+export async function runDashboardPlanner(query: string, schema: any) {
+    console.log("[AGENT] Planning Dashboard Architecture (Pro Mode)...");
+
+    return generateDashboardPlan(query, schema, true);
+}
+
+/**
+ * STEP 2.5: STREAMING DASHBOARD PLANNER
+ * Returns an async generator for streaming the plan text.
+ */
+export async function* runDashboardPlannerStream(query: string, schema: any) {
+    console.log("[AGENT] Planning Dashboard Architecture (Streaming Mode)...");
+    type PlannerStreamItem = { kind: "chunk"; chunk: string } | { kind: "event"; event: any };
+    const queue: PlannerStreamItem[] = [];
+    let resolver: ((value: PlannerStreamItem) => void) | null = null;
+    let done = false;
+
+    const push = (value: PlannerStreamItem) => {
+        if (resolver) {
+            const r = resolver;
+            resolver = null;
+            r(value);
+            return;
         }
+        queue.push(value);
+    };
+
+    const next = () => new Promise<PlannerStreamItem>((resolve) => {
+        if (queue.length > 0) {
+            resolve(queue.shift() as PlannerStreamItem);
+            return;
+        }
+        resolver = resolve;
+    });
+
+    const emitAgentEvent = (event: PlannerAgentEvent) => {
+        push({
+            kind: "event", event: {
+                type: "planner_agent_status",
+                agent: event.agent,
+                status: event.type
+            }
+        });
+    };
+    const emitAgentToken = (event: PlannerAgentToken) => {
+        if (!event?.token) return;
+        push({ kind: "event", event: { type: "planner_agent_token", agent: event.agent, token: event.token } });
+    };
+    const emitAgentDraft = (event: PlannerAgentDraft) => {
+        push({ kind: "event", event: { type: "planner_agent_draft", agent: event.agent, content: event.content } });
+    };
+    const emitPlannerMeta = (event: PlannerMetaEvent) => {
+        push({ kind: "event", event });
+    };
+
+    const planPromise = generateDashboardPlan(query, schema, false, emitAgentEvent, emitAgentToken, emitAgentDraft, emitPlannerMeta)
+        .then((plan) => {
+            done = true;
+            return plan;
+        })
+        .catch((err) => {
+            done = true;
+            throw err;
+        });
+
+    while (!done || queue.length > 0) {
+        const eventChunk = await next();
+        if (eventChunk) {
+            yield eventChunk;
+        }
+    }
+
+    const plan = await planPromise;
+    const chunks = String(plan.rawPlan || '').match(/[\s\S]{1,1200}/g) || [];
+    for (const chunk of chunks) {
+        yield { kind: "chunk", chunk };
     }
 }
 
@@ -1366,34 +2013,118 @@ export async function finalizePlan(planText: string) {
  * Expert PostgreSQL database developer and query optimizer.
  * Generates optimized, safe, and high-performance SQL for every widget.
  */
-function normalizeSqlForValidation(sql: string) {
-    let text = String(sql || "");
-    if (!text) return "";
-    text = text.replace(/^\uFEFF/, "");
-    text = text.replace(/```/g, "");
-    text = text.replace(/^\s*sql\s*:/i, "");
-    text = text.trimStart();
-    while (text.startsWith("--") || text.startsWith("#") || text.startsWith("/*")) {
-        if (text.startsWith("--") || text.startsWith("#")) {
-            text = text.replace(/^(--|#)[^\n]*\n?/, "").trimStart();
-            continue;
-        }
-        if (text.startsWith("/*")) {
-            text = text.replace(/^\/\*[\s\S]*?\*\//, "").trimStart();
-            continue;
-        }
-        break;
-    }
-    return text.trim();
+function parseWidgetDetailsFromPlan(rawPlan: string) {
+    if (!rawPlan) return [];
+    const cleaned = rawPlan.replace(/\*\*|\*|__|#/g, '');
+    const matches = Array.from(cleaned.matchAll(/(?:^|\n)\s*WIDGET\s*\d+[^]*?(?=(?:\n\s*WIDGET\s*\d+)|$)/gi));
+    return matches.map((match) => {
+        const block = match[0];
+        const usesMatch = block.match(/Uses:\s*([^\n]+)/i);
+        const filtersMatch = block.match(/Filters applied:\s*([^\n]+)/i);
+        const notesMatch = block.match(/Notes:\s*([^\n]+)/i);
+        return {
+            uses: usesMatch?.[1]?.trim() || "",
+            filters: filtersMatch?.[1]?.trim() || "",
+            notes: notesMatch?.[1]?.trim() || ""
+        };
+    });
 }
 
-function validateSqlAgainstInstructions(sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) {
-    const trimmed = normalizeSqlForValidation(sql);
-    if (!trimmed.toLowerCase().startsWith("select")) {
-        return { ok: false, error: "Validation failed: SQL must start with SELECT." };
+function parseScenarioCoverageFromPlan(rawPlan: string) {
+    if (!rawPlan) return "";
+    const cleaned = rawPlan.replace(/\*\*|\*|__|#/g, '');
+    const match = cleaned.match(/SCENARIO COVERAGE:\s*([\s\S]*?)(?:\nWIDGET\s+\d+:|$)/i);
+    return match?.[1]?.trim() || "";
+}
+
+function buildAliasMap(sql: string) {
+    const map = new Map<string, string>();
+    const regex = /\b(from|join)\s+["`\[]?([a-zA-Z0-9_.]+)["`\]]?(?:\s+as)?\s+([a-zA-Z0-9_]+)?/gi;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(sql)) !== null) {
+        const rawTable = match[2];
+        const table = rawTable?.split('.').pop() || rawTable;
+        const alias = match[3] || table;
+        if (table) {
+            map.set(table, table);
+            if (alias) map.set(alias, table);
+        }
     }
-    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter"];
-    if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
+    return map;
+}
+
+function extractJoinPairs(sql: string, aliasMap: Map<string, string>) {
+    const pairs: Array<{ leftTable: string; leftColumn: string; rightTable: string; rightColumn: string }> = [];
+    const regex = /\bon\s+["`\[]?([a-zA-Z0-9_]+)["`\]]?\.(["`\[]?[a-zA-Z0-9_]+["`\]]?)\s*=\s*["`\[]?([a-zA-Z0-9_]+)["`\]]?\.(["`\[]?[a-zA-Z0-9_]+["`\]]?)/gi;
+    let match: RegExpExecArray | null;
+    while ((match = regex.exec(sql)) !== null) {
+        const leftAlias = match[1];
+        const leftColumn = match[2].replace(/["`\[\]]/g, '');
+        const rightAlias = match[3];
+        const rightColumn = match[4].replace(/["`\[\]]/g, '');
+        const leftTable = aliasMap.get(leftAlias) || leftAlias;
+        const rightTable = aliasMap.get(rightAlias) || rightAlias;
+        if (leftTable && rightTable && leftColumn && rightColumn) {
+            pairs.push({ leftTable, leftColumn, rightTable, rightColumn });
+        }
+    }
+    return pairs;
+}
+
+function buildRelationshipSet(schema: any) {
+    const rels = Array.isArray(schema?.relationships) ? schema.relationships : [];
+    const set = new Set<string>();
+    rels.forEach((rel: any) => {
+        if (rel?.from?.table && rel?.from?.column && rel?.to?.table && rel?.to?.column) {
+            const forward = `${rel.from.table}.${rel.from.column}->${rel.to.table}.${rel.to.column}`;
+            const reverse = `${rel.to.table}.${rel.to.column}->${rel.from.table}.${rel.from.column}`;
+            set.add(forward);
+            set.add(reverse);
+        }
+    });
+    return set;
+}
+
+function columnIsPrimary(schema: any, table: string, column: string) {
+    const info = schema?.schemaInfo?.[table] || schema?.schemaInfo?.[table?.toLowerCase?.()] || schema?.schemaInfo?.[table?.toUpperCase?.()];
+    const cols = info?.columns || [];
+    const match = cols.find((c: any) => (c?.name || c?.column_name) === column);
+    return match?.isPrimary === true;
+}
+
+function validateJoinsAgainstSchema(sql: string, schemaForPrompt?: any) {
+    if (!schemaForPrompt?.relationships || schemaForPrompt.relationships.length === 0) return { ok: true };
+    const aliasMap = buildAliasMap(sql);
+    const pairs = extractJoinPairs(sql, aliasMap);
+    if (pairs.length === 0) return { ok: true };
+    const relSet = buildRelationshipSet(schemaForPrompt);
+    for (const pair of pairs) {
+        const key = `${pair.leftTable}.${pair.leftColumn}->${pair.rightTable}.${pair.rightColumn}`;
+        if (!relSet.has(key)) {
+            return { ok: false, error: `Validation failed: join ${key} is not defined in schema relationships.` };
+        }
+        const leftIsPk = columnIsPrimary(schemaForPrompt, pair.leftTable, pair.leftColumn);
+        const rightIsPk = columnIsPrimary(schemaForPrompt, pair.rightTable, pair.rightColumn);
+        if (leftIsPk === false && rightIsPk === false) {
+            return { ok: false, error: `Validation failed: join ${key} may cause fan-out (no primary key).` };
+        }
+    }
+    return { ok: true };
+}
+
+function validateSqlAgainstInstructions(sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string, schemaForPrompt?: any) {
+    const trimmed = normalizeSqlForValidation(sql);
+    const startsWithAllowed = /^(select|with|show|explain)\b/i.test(trimmed);
+    if (!startsWithAllowed) {
+        return { ok: false, error: "Validation failed: SQL must start with SELECT, WITH, SHOW, or EXPLAIN." };
+    }
+    const semicolonIndex = trimmed.indexOf(";");
+    if (semicolonIndex >= 0 && trimmed.slice(semicolonIndex).trim() !== ";") {
+        return { ok: false, error: "Validation failed: multiple SQL statements are not allowed." };
+    }
+    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter", "create", "grant", "revoke"];
+    const sanitized = stripSqlLiteralsAndComments(trimmed).toLowerCase();
+    if (blocked.some((kw) => new RegExp(`\\b${kw}\\b`, "i").test(sanitized))) {
         return { ok: false, error: "Validation failed: unsafe SQL detected." };
     }
     const lower = String(connectionString || "").toLowerCase();
@@ -1453,6 +2184,8 @@ function validateSqlAgainstInstructions(sql: string, connectionString?: string, 
             return { ok: false, error: `Validation failed: SQL must include "${required}".` };
         }
     }
+    const joinValidation = validateJoinsAgainstSchema(trimmed, schemaForPrompt);
+    if (!joinValidation.ok) return joinValidation;
     return { ok: true };
 }
 
@@ -1483,7 +2216,7 @@ export async function runQueryGenerator(
             let attempt = 0;
             let currentSql = sql;
             while (attempt < 2) {
-                const validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+                const validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType, schemaForPrompt);
                 if (validation.ok) break;
                 attempt += 1;
                 try {
@@ -1507,9 +2240,33 @@ export async function runQueryGenerator(
                     break;
                 }
             }
-            const finalCheck = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+            const finalCheck = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType, schemaForPrompt);
             if (!finalCheck.ok) {
-                output[id] = `SELECT 'SQL violates connector rules' as status, '${(finalCheck.error || '').replace(/'/g, "''")}' as message`;
+                try {
+                    const widget = (effectiveWidgets || []).find((w: any) => w.id === id);
+                    const repair = await repairFailedQuery({
+                        widgetId: id,
+                        widgetTitle: widget?.title || id,
+                        widgetType: widget?.type || "unknown",
+                        widgetGoal: widget?.goal,
+                        originalSql: currentSql,
+                        errorMessage: finalCheck.error || "Connector instruction violation",
+                        schema: schemaForPrompt,
+                        errorLog,
+                        connectionString
+                    });
+                    if (repair?.sql) {
+                        const recheck = validateSqlAgainstInstructions(repair.sql, connectionString, connectorInstructions, connectorType, schemaForPrompt);
+                        if (recheck.ok) {
+                            output[id] = repair.sql;
+                            return;
+                        }
+                    }
+                } catch {
+                    // fallthrough to fallback SQL
+                }
+                const fallbackForWidget = buildFallbackSql(plan, schemaForPrompt, isMssql)?.sqlMap?.[id];
+                output[id] = fallbackForWidget || currentSql;
             } else {
                 output[id] = currentSql;
             }
@@ -1624,6 +2381,25 @@ export async function runQueryGenerator(
                 return null;
         }
     };
+    const paginationControlKeys = new Set([
+        "page",
+        "size",
+        "pagesize",
+        "page_size",
+        "offset",
+        "rowsonpage",
+        "storepage",
+        "storesize"
+    ]);
+    const isPaginationControlKey = (dimension: string) => {
+        const key = String(dimension || "").trim();
+        if (!key) return false;
+        if (key.startsWith("__page:") || key.startsWith("__pageSize:") || key.startsWith("__offset:")) return true;
+        const lower = key.toLowerCase();
+        if (paginationControlKeys.has(lower)) return true;
+        const lastSegment = lower.split(":").pop() || lower;
+        return paginationControlKeys.has(lastSegment);
+    };
     const buildFilterSqlHints = (resolved: Record<string, any>) => {
         const hints: string[] = [];
         Object.entries(resolved || {}).forEach(([dimension, info]) => {
@@ -1631,6 +2407,10 @@ export async function runQueryGenerator(
             const value = info && typeof info === "object" && "value" in info ? info.value : info;
             const safeDimension = maybeCastTextColumn(dimension);
             const dimensionName = String(dimension || "");
+            const hasKey = `__has.${dimensionName}`;
+            if (dimensionName.startsWith("__") || isPaginationControlKey(dimensionName)) {
+                return;
+            }
             const isVerboseColumn = /(settings|config|json|metadata|payload|properties|options)/i.test(dimensionName);
             const rawValueText = Array.isArray(value) ? value.join(",") : String(value ?? "");
             const isVerboseValue = rawValueText.length > 120;
@@ -1639,45 +2419,59 @@ export async function runQueryGenerator(
             }
 
             if (type === "date-range") {
-                const range = info?.range;
-                const from = range?.from;
-                const to = range?.to;
-                if (from && to) {
-                    hints.push(`${safeDimension} BETWEEN '${escapeSqlLiteral(from)}' AND '${escapeSqlLiteral(to)}'`);
-                } else if (from) {
-                    hints.push(`${safeDimension} >= '${escapeSqlLiteral(from)}'`);
-                } else if (to) {
-                    hints.push(`${safeDimension} <= '${escapeSqlLiteral(to)}'`);
-                }
+                const fromKey = `${dimensionName}.from`;
+                const toKey = `${dimensionName}.to`;
+                hints.push(`({{__has.${fromKey}}} = 0 OR ${safeDimension} >= {{${fromKey}}})`);
+                hints.push(`({{__has.${toKey}}} = 0 OR ${safeDimension} <= {{${toKey}}})`);
                 return;
             }
 
             if (Array.isArray(value)) {
-                if (value.length === 0) return;
-                const capped = value.slice(0, 12);
-                const literals = capped
-                    .map(formatLiteral)
-                    .filter((v) => v !== null)
-                    .join(", ");
-                if (literals) {
-                    hints.push(`${safeDimension} IN (${literals})`);
-                }
+                hints.push(`({{${hasKey}}} = 0 OR ${safeDimension} IN ({{${dimensionName}}}))`);
                 return;
             }
-
-            const literal = formatLiteral(value);
-            if (!literal) return;
             if (type === "search") {
-                if (isMssql) {
-                    hints.push(`${safeDimension} LIKE '%' + ${literal} + '%'`);
-                } else {
-                    hints.push(`${safeDimension} ILIKE '%' || ${literal} || '%'`);
-                }
+                // Search is handled in the SQL prompt to avoid hard-coding a single column
+                return;
             } else {
-                hints.push(`${safeDimension} = ${literal}`);
+                hints.push(`({{${hasKey}}} = 0 OR ${safeDimension} = {{${dimensionName}}})`);
             }
         });
         return hints;
+    };
+
+    const pickTableSortColumn = (widget: any) => {
+        const table = widget?.primaryTable
+            || (schemaForPrompt?.filterCandidates?.primaryDate?.table)
+            || Object.keys(schemaForPrompt?.schemaInfo || {})[0];
+        if (!table) return null;
+        const tableInfo = schemaForPrompt?.schemaInfo?.[table];
+        const cols = tableInfo?.columns || [];
+        const primaryDate = schemaForPrompt?.filterCandidates?.primaryDate;
+        if (primaryDate?.table === table && primaryDate?.column) {
+            return `${table}.${primaryDate.column}`;
+        }
+        const pk = cols.find((c: any) => c?.isPrimary)?.name || cols.find((c: any) => (c?.name || '').toLowerCase() === 'id')?.name;
+        if (pk) return `${table}.${pk}`;
+        const temporal = cols.find((c: any) => c?.isTemporal)?.name;
+        if (temporal) return `${table}.${temporal}`;
+        return null;
+    };
+
+    const pickTableTieBreakerColumn = (widget: any, primarySortColumn?: string | null) => {
+        const table = widget?.primaryTable
+            || (schemaForPrompt?.filterCandidates?.primaryDate?.table)
+            || Object.keys(schemaForPrompt?.schemaInfo || {})[0];
+        if (!table) return null;
+        const tableInfo = schemaForPrompt?.schemaInfo?.[table];
+        const cols = tableInfo?.columns || [];
+        const pk = cols.find((c: any) => c?.isPrimary)?.name || cols.find((c: any) => (c?.name || '').toLowerCase() === 'id')?.name;
+        const candidate = pk ? `${table}.${pk}` : null;
+        if (!candidate) return null;
+        if (primarySortColumn && String(primarySortColumn).toLowerCase() === String(candidate).toLowerCase()) {
+            return null;
+        }
+        return candidate;
     };
 
     const normalizeSqlForWidget = (sql: string, widget: any) => {
@@ -1691,36 +2485,56 @@ export async function runQueryGenerator(
         const isTable = widget?.type === "table";
         if (!isTable) return cleaned;
 
-        const limitCap = 1000;
+        const sizeToken = widget?.id ? `{{size:${widget.id}}}` : "{{size}}";
+        const offsetToken = widget?.id ? `{{offset:${widget.id}}}` : "{{offset}}";
+        const sortColumn = pickTableSortColumn(widget);
+        const tieBreakerColumn = pickTableTieBreakerColumn(widget, sortColumn);
+        const resolveColumnRef = (candidate: string | null) => {
+            if (!candidate) return null;
+            const col = candidate.split(".").pop() || candidate;
+            const colEscaped = col.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            const aliasMatch = cleaned.match(new RegExp(`\\b([a-zA-Z_][\\w]*)\\.${colEscaped}\\b`, "i"));
+            if (aliasMatch?.[0]) return aliasMatch[0];
+            const fullEscaped = candidate.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+            if (new RegExp(`\\b${fullEscaped}\\b`, "i").test(cleaned)) return candidate;
+            if (new RegExp(`\\b${colEscaped}\\b`, "i").test(cleaned)) return col;
+            return null;
+        };
+        const resolvedSortColumn = resolveColumnRef(sortColumn);
+        const resolvedTieBreakerColumn = resolveColumnRef(tieBreakerColumn);
+        const hasOrderBy = /\border\s+by\b/i.test(cleaned);
+        const orderClause = !hasOrderBy && resolvedSortColumn ? ` ORDER BY ${resolvedSortColumn} DESC` : "";
+        const escapeRegex = (value: string) => value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+        const hasStableSort = Boolean(
+            hasOrderBy &&
+            resolvedSortColumn &&
+            new RegExp(`\\b${escapeRegex(resolvedSortColumn)}\\b`, "i").test(cleaned)
+        );
+        const stableOrderSuffix = hasOrderBy && resolvedSortColumn && !hasStableSort ? `, ${resolvedSortColumn} DESC` : "";
+        const hasTieBreakerInOrder = Boolean(
+            hasOrderBy &&
+            resolvedTieBreakerColumn &&
+            new RegExp(`\\b${escapeRegex(resolvedTieBreakerColumn)}\\b`, "i").test(cleaned)
+        );
+        const tieBreakerSuffix = hasOrderBy && resolvedTieBreakerColumn && !hasTieBreakerInOrder
+            ? `, ${resolvedTieBreakerColumn} DESC`
+            : "";
+        const tieBreakerForNewOrder = !hasOrderBy && resolvedTieBreakerColumn ? `, ${resolvedTieBreakerColumn} DESC` : "";
+
         if (isMssql) {
-            const topMatch = cleaned.match(/\bTOP\s+(\d+)\b/i);
-            if (topMatch) {
-                const current = Number(topMatch[1]);
-                if (current > limitCap) {
-                    cleaned = cleaned.replace(/\bTOP\s+\d+\b/i, `TOP ${limitCap}`);
-                }
-                return cleaned;
-            }
-            if (/^\s*SELECT\s+/i.test(cleaned)) {
-                cleaned = cleaned.replace(/^\s*SELECT\s+(DISTINCT\s+)?/i, (_m, distinct) => {
-                    const prefix = distinct ? `SELECT ${distinct}` : "SELECT ";
-                    return `${prefix}TOP ${limitCap} `;
-                });
-            }
-            return cleaned;
+            cleaned = cleaned.replace(/\bTOP\s+\d+\b/i, "").trim();
+            cleaned = cleaned.replace(/\bLIMIT\s+[^\s;]+(\s+OFFSET\s+[^\s;]+)?\b/i, "").trim();
+            cleaned = cleaned.replace(/\bOFFSET\s+[^\s;]+\s+ROWS\s+FETCH\s+NEXT\s+[^\s;]+\s+ROWS\s+ONLY\b/i, "").trim();
+            const orderBy = hasOrderBy || resolvedSortColumn ? "" : " ORDER BY (SELECT NULL)";
+            const trimmed = cleaned.replace(/;+\s*$/, "");
+            return `${trimmed}${stableOrderSuffix}${tieBreakerSuffix}${orderClause}${tieBreakerForNewOrder}${orderBy} OFFSET ${offsetToken} ROWS FETCH NEXT ${sizeToken} ROWS ONLY;`;
         }
 
-        const limitMatch = cleaned.match(/\bLIMIT\s+(\d+)\b/i);
-        if (limitMatch) {
-            const current = Number(limitMatch[1]);
-            if (current > limitCap) {
-                cleaned = cleaned.replace(/\bLIMIT\s+\d+\b/i, `LIMIT ${limitCap}`);
-            }
-            return cleaned;
-        }
+        cleaned = cleaned.replace(/\bLIMIT\s+[^\s;]+(\s+OFFSET\s+[^\s;]+)?\b/i, "").trim();
+        cleaned = cleaned.replace(/\bOFFSET\s+[^\s;]+\b/i, "").trim();
 
         const trimmed = cleaned.replace(/;+\s*$/, "");
-        cleaned = `${trimmed}\nLIMIT ${limitCap};`;
+        cleaned = `${trimmed}${stableOrderSuffix}${tieBreakerSuffix}${orderClause}${tieBreakerForNewOrder}\nLIMIT ${sizeToken} OFFSET ${offsetToken};`;
         return cleaned;
     };
 
@@ -1737,6 +2551,8 @@ export async function runQueryGenerator(
         const { parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
         effectiveWidgets = parseNaturalLanguagePlan(rawPlan);
     }
+    const widgetDetails = parseWidgetDetailsFromPlan(rawPlan);
+    const scenarioCoverage = parseScenarioCoverageFromPlan(rawPlan);
 
     const tables = Object.keys(schemaForPrompt.schemaInfo || {});
 
@@ -1761,8 +2577,13 @@ export async function runQueryGenerator(
         const title = w?.title ? String(w.title).slice(0, 80) : '';
         const metric = w?.metric ? String(w.metric).slice(0, 40) : '';
         const dim = w?.dim ? String(w.dim).slice(0, 40) : '';
-        return `${idx + 1}) ${w.id} | ${w.type} | ${title} | metric=${metric} | dim=${dim}`;
+        const details = widgetDetails[idx] || {};
+        const uses = details.uses ? ` | uses=${details.uses}` : '';
+        const filters = details.filters ? ` | filters=${details.filters}` : '';
+        const notes = details.notes ? ` | notes=${details.notes}` : '';
+        return `${idx + 1}) ${w.id} | ${w.type} | ${title} | metric=${metric} | dim=${dim}${uses}${filters}${notes}`;
     });
+
     const widgets = truncate(widgetSummaryLines.join('\n'), 4000);
     const relationships = truncate((schemaForPrompt.relationships || [])
         .slice(0, 3)
@@ -1793,20 +2614,65 @@ export async function runQueryGenerator(
     const dateContext = buildDateContext(referenceDate);
     const sqlHints = buildSqlPromptHints(schemaForPrompt);
 
+    // Generate dynamic SQL patterns for each widget
+    const widgetPatternMap = new Map<string, string>();
+    (effectiveWidgets || []).forEach((w: any) => {
+        const bestPatterns = sqlHints.findBestPatterns(w.goal || w.title || '', w.table || '');
+        if (bestPatterns.length > 0) {
+            const guidance = sqlHints.generateDynamicGuidance(w, bestPatterns, isMssql);
+            widgetPatternMap.set(w.id, guidance);
+        }
+    });
+
+    // Build widget-specific dynamic guidance section
+    const dynamicGuidanceSections: string[] = [];
+    widgetPatternMap.forEach((guidance, widgetId) => {
+        dynamicGuidanceSections.push(`\n--- WIDGET ${widgetId} DYNAMIC PATTERNS ---\n${guidance}\n`);
+    });
+    const dynamicGuidanceText = dynamicGuidanceSections.join('\n');
+
     const baseDate = parseDate(referenceDate || undefined) || new Date();
-    const planFilters = applyFilters && Array.isArray(plan?.filters) && plan.filters.length > 0
+    const hasActiveRuntimeFilters = Object.entries(filters || {}).some(([dimension, value]) => {
+        if (isPaginationControlKey(dimension)) return false;
+        if (Array.isArray(value)) return value.length > 0;
+        if (value && typeof value === "object") {
+            if ("from" in value || "to" in value) {
+                return Boolean((value as any).from || (value as any).to || (value as any).preset);
+            }
+            if ("value" in value) {
+                const inner = (value as any).value;
+                if (Array.isArray(inner)) return inner.length > 0;
+                return inner !== undefined && inner !== null && String(inner).trim() !== "";
+            }
+        }
+        return value !== undefined && value !== null && String(value).trim() !== "";
+    });
+    const hasPlanDefaultFilters = Array.isArray(plan?.filters) && plan.filters.some((f: any) => {
+        const value = f?.value;
+        if (Array.isArray(value)) return value.length > 0;
+        if (value && typeof value === "object") {
+            if ("from" in value || "to" in value) {
+                return Boolean(value.from || value.to || value.preset);
+            }
+        }
+        return value !== undefined && value !== null && String(value).trim() !== "";
+    });
+    const shouldApplyFilters = Boolean(applyFilters || hasActiveRuntimeFilters || hasPlanDefaultFilters);
+    const planFilters = shouldApplyFilters && Array.isArray(plan?.filters) && plan.filters.length > 0
         ? plan.filters
         : [];
-    const resolvedFilters = applyFilters
+    const resolvedFilters: Record<string, any> = shouldApplyFilters
         ? (planFilters.length > 0
             ? planFilters.reduce((acc: Record<string, any>, f: any) => {
                 const dimension = f?.dimension;
                 if (!dimension) return acc;
+                if (isPaginationControlKey(dimension)) return acc;
                 const rawValue = Object.prototype.hasOwnProperty.call(filters, dimension)
                     ? filters[dimension]
                     : f?.value;
 
-                if (f?.type === "date-range") {
+                const type = String(f?.type || "").toLowerCase();
+                if (type === "date-range" || type === "date_range") {
                     const preset = typeof rawValue === "string" ? rawValue : rawValue?.preset;
                     const customFrom = rawValue?.from;
                     const customTo = rawValue?.to;
@@ -1822,17 +2688,83 @@ export async function runQueryGenerator(
                     return acc;
                 }
 
+                if (type.includes("multi")) {
+                    const value = Array.isArray(rawValue) ? rawValue : (rawValue !== undefined ? [rawValue] : []);
+                    acc[dimension] = { type: "multi-select", value };
+                    return acc;
+                }
+                if (type.includes("entity")) {
+                    const value = Array.isArray(rawValue) ? rawValue[0] : rawValue;
+                    acc[dimension] = { type: "entity", value };
+                    return acc;
+                }
+
                 acc[dimension] = { type: f?.type || "select", value: rawValue };
                 return acc;
             }, {})
             : (filters || {}))
         : {};
 
+    const searchEntry = Object.entries(resolvedFilters).find(([, info]) => info?.type === "search");
+    const searchParamKey = searchEntry ? String(searchEntry[0]) : "__search";
+    let searchValue = searchEntry ? String((searchEntry[1] as any)?.value ?? "").trim() : "";
+    if (!searchValue) {
+        searchValue = String(filters?.__search ?? "").trim();
+    }
+    const requestedSearchColumn = String(filters?.__searchColumn ?? "").trim().toLowerCase();
+    const allSearchCandidates = Array.isArray(schemaForPrompt?.filterCandidates?.searchColumns)
+        ? schemaForPrompt.filterCandidates.searchColumns
+        : [];
+    const searchCandidates = requestedSearchColumn
+        ? allSearchCandidates.filter((candidate: any) => {
+            const table = String(candidate?.table || "").trim().toLowerCase();
+            const column = String(candidate?.column || "").trim().toLowerCase();
+            if (!column) return false;
+            const qualified = `${table}.${column}`;
+            return (
+                column === requestedSearchColumn
+                || qualified === requestedSearchColumn
+                || qualified.endsWith(`.${requestedSearchColumn}`)
+            );
+        })
+        : allSearchCandidates;
+    const effectiveSearchCandidates = searchCandidates.length > 0 ? searchCandidates : allSearchCandidates;
+    const searchCandidateText = effectiveSearchCandidates
+        .slice(0, 8)
+        .map((c: any) => `${c.table}.${c.column}`)
+        .join(", ") || "None";
+
+    // Enforce primary date filter column when a date-range filter is present
+    const primaryDate = schemaForPrompt?.filterCandidates?.primaryDate;
+    if (primaryDate?.table && primaryDate?.column) {
+        const primaryDimension = `${primaryDate.table}.${primaryDate.column}`;
+        const dateEntries = Object.entries(resolvedFilters).filter(([, info]) => info?.type === "date-range");
+        if (dateEntries.length > 0) {
+            const [firstKey, firstVal] = dateEntries[0];
+            if (firstKey !== primaryDimension) {
+                resolvedFilters[primaryDimension] = firstVal;
+                delete resolvedFilters[firstKey];
+            }
+        }
+    }
+
     const activeFilters = truncate(JSON.stringify(resolvedFilters), 800);
     const filterSqlHintList = buildFilterSqlHints(resolvedFilters);
+    if (effectiveSearchCandidates.length > 0) {
+        const searchCols = effectiveSearchCandidates
+            .map((c: any) => `${c.table}.${c.column}`)
+            .slice(0, 5)
+            .map((col: string) => maybeCastTextColumn(col));
+        const orClause = isMssql
+            ? searchCols.map((col: string) => `${col} LIKE '%' + {{${searchParamKey}}} + '%'`).join(" OR ")
+            : searchCols.map((col: string) => `${col} ILIKE '%' || {{${searchParamKey}}} || '%'`).join(" OR ");
+        if (orClause) {
+            filterSqlHintList.push(`({{__has.${searchParamKey}}} = 0 OR (${orClause}))`);
+        }
+    }
     const filterSqlHints = filterSqlHintList.join("\n") || "NONE";
     const applyFiltersToQueries = (queries: Record<string, string>) => {
-        if (!applyFilters || filterSqlHintList.length === 0) return queries;
+        if (!shouldApplyFilters || filterSqlHintList.length === 0) return queries;
         return Object.fromEntries(
             Object.entries(queries).map(([id, sql]) => {
                 const baseSql = ensureWhereBase(sql);
@@ -1843,6 +2775,40 @@ export async function runQueryGenerator(
 
     const systemPrompt = isMssql ? `You are SQL Agent, a Senior SQL Server (MSSQL) Engineer and query optimizer.
 Connector instructions are mandatory and override any conflicting guidance.
+
+### DATABASE CONNECTION INFO
+Type: Microsoft SQL Server (MSSQL)
+${connectorInstructionsTrimmed ? `Special Instructions: ${connectorInstructionsTrimmed}` : ''}
+
+### HELPER FUNCTION REFERENCE
+**Date Functions:**
+- Get today's date: CAST(GETDATE() AS DATE) or CONVERT(DATE, GETDATE())
+- Get current timestamp: GETDATE()
+- Add days: DATEADD(day, N, date_col)
+- Subtract days: DATEADD(day, -N, date_col)
+- Date difference in days: DATEDIFF(day, start_date, end_date)
+- Truncate to month: DATEADD(month, DATEDIFF(month, 0, date_col), 0)
+- Truncate to year: DATEADD(year, DATEDIFF(year, 0, date_col), 0)
+- Format date: CONVERT(VARCHAR, date_col, 120) -- yields YYYY-MM-DD HH:MM:SS
+
+**String Functions:**
+- Case-insensitive LIKE: col LIKE '%term%'
+- Concatenate: col1 + ' ' + col2
+- Uppercase: UPPER(col)
+- Lowercase: LOWER(col)
+- Trim: LTRIM(RTRIM(col))
+- Substring: SUBSTRING(col, start, length)
+
+**Aggregation Helpers:**
+- Safe division: numerator / NULLIF(denominator, 0)
+- Handle NULL: ISNULL(col, default_value) or COALESCE(col, default_value)
+- Conditional count: COUNT(CASE WHEN condition THEN 1 END)
+- Running total: SUM(col) OVER (ORDER BY date_col)
+- Row number: ROW_NUMBER() OVER (ORDER BY col)
+
+**Pagination:**
+- TOP N: SELECT TOP N * FROM table
+- OFFSET/FETCH: OFFSET N ROWS FETCH NEXT M ROWS ONLY
 
 ### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
 1. **NO LIMIT** - Use TOP or OFFSET/FETCH.
@@ -1885,11 +2851,35 @@ ${widgets}
 - If a date-range filter includes "range.from"/"range.to", use those values directly (do not recalculate).
 - REQUIRED WHERE CONDITIONS (apply ALL when present; AND together):
 ${filterSqlHints}
+- Runtime values must use placeholders, not hardcoded literals.
+- Preferred predicate guard pattern: ({{__has.<param_key>}} = 0 OR column = {{<param_key>}}).
+
+### DYNAMIC QUERY PATTERNS (Widget-Specific Templates)
+${dynamicGuidanceText || 'No specific patterns matched. Use general SQL best practices.'}
+
+### API-STYLE CONTRACT (BACKEND-LIKE BEHAVIOR)
+- Treat table/detail widgets like API list endpoints.
+- Validate and clamp pagination inputs in SQL logic: page >= 0, page_size between 1 and 100, defaults page=0 and page_size=25 when missing.
+- Only use filter and sort fields that exist in schema or widget config; ignore unsupported fields.
+- Search value must be length 2-100; if outside bounds, ignore search filter.
+- Prefer parameterized optional predicates (e.g., @p_q IS NULL OR [name] LIKE '%' + @p_q + '%').
+- For paginated detail outputs, include COUNT(*) OVER() AS total_count for consistent pagination metadata.
+- Always apply deterministic ORDER BY before OFFSET/FETCH (fallback to created/date/id column from schema when needed).
+- Use dynamic template placeholders instead of hardcoded literals for runtime values: {{status}}, {{created_from}}, {{created_to}}, {{__search}}, {{size}}, {{offset}}.
+
+### SEARCH FILTER (GLOBAL)
+- Search value: "${searchValue || ""}"
+- Apply search to the most relevant text column for each widget (prefer widget primary table).
+- Candidate columns (from schema): ${searchCandidateText}
+- If search value is empty, do not apply search.
 
 ### RECENT SQL ERRORS (FIX THESE PATTERNS)
 ${recentErrors || "[]"}
 - Avoid repeating these failures. Validate table/column names and data types against schema.
 - Explicitly double-check every error message and adjust queries to prevent the same failure.
+
+### SCENARIO COVERAGE (FROM PLAN)
+${scenarioCoverage || "Not provided"}
 
 ### Your Mission
 Generate **one optimized, production-grade SQL query for each widget** in the dashboard plan.
@@ -1948,6 +2938,45 @@ Example:
 ]`
         : `You are SQL Agent, a Senior PostgreSQL Engineer and query optimizer.
 
+### DATABASE CONNECTION INFO
+Type: PostgreSQL
+${connectorInstructionsTrimmed ? `Special Instructions: ${connectorInstructionsTrimmed}` : ''}
+
+### HELPER FUNCTION REFERENCE
+**Date Functions:**
+- Get today's date: CURRENT_DATE
+- Get current timestamp: NOW() or CURRENT_TIMESTAMP
+- Add days: date_col + INTERVAL 'N days'
+- Subtract days: date_col - INTERVAL 'N days'
+- Date difference in days: (end_date::date - start_date::date)
+- Truncate to day: DATE_TRUNC('day', date_col)
+- Truncate to month: DATE_TRUNC('month', date_col)
+- Truncate to year: DATE_TRUNC('year', date_col)
+- Extract day/month/year: EXTRACT(DAY FROM date_col), EXTRACT(MONTH FROM date_col), EXTRACT(YEAR FROM date_col)
+- Format date: TO_CHAR(date_col, 'YYYY-MM-DD')
+
+**String Functions:**
+- Case-insensitive LIKE: col ILIKE '%term%'
+- Concatenate: col1 || ' ' || col2 or CONCAT(col1, ' ', col2)
+- Uppercase: UPPER(col)
+- Lowercase: LOWER(col)
+- Trim: TRIM(col)
+- Substring: SUBSTRING(col FROM start FOR length)
+- Replace: REPLACE(col, 'old', 'new')
+
+**Aggregation Helpers:**
+- Safe division: numerator / NULLIF(denominator, 0)
+- Handle NULL: COALESCE(col, default_value)
+- Conditional count: COUNT(*) FILTER (WHERE condition)
+- Conditional sum: SUM(CASE WHEN condition THEN col ELSE 0 END)
+- Running total: SUM(col) OVER (ORDER BY date_col)
+- Row number: ROW_NUMBER() OVER (ORDER BY col)
+- Rank: RANK() OVER (ORDER BY col)
+
+**Pagination:**
+- LIMIT: LIMIT N
+- OFFSET: OFFSET N LIMIT M
+
 ### CRITICAL: POSTGRESQL SYNTAX RULES (MANDATORY)
 1. **NO DATEDIFF()** - This function DOES NOT EXIST in PostgreSQL.
    - USE: \`date1 - date2\` for the difference in days.
@@ -1959,6 +2988,10 @@ Example:
 7. **Handle NULLs** - Use \`COALESCE(SUM(col), 0)\` for metrics to avoid returning null to the UI.
 8. **Explicit Aggregations** - Every column in SELECT must either be in GROUP BY or be an aggregate function.
 9. **Division by Zero** - Protect divisions: \`numerator / NULLIF(denominator, 0)\`.
+10. **COALESCE TYPE SAFETY** - PostgreSQL will error if you \`COALESCE(interval, 0)\`.
+    - If calculating days difference using \`(A - B)\` where A or B are TIMESTAMPS, it returns an \`interval\`.
+    - You MUST cast to date FIRST (\`A::date - B::date\`) to get an integer, OR cast the interval to an integer: \`EXTRACT(DAY FROM (A - B))::integer\`.
+    - Always ensure your \`COALESCE\` arguments are the same type.
 
 ### DATABASE SCHEMA (STRICT TRUTH)
 ${simplifiedSchema}
@@ -1990,6 +3023,21 @@ ${widgets}
 - If a date-range filter includes "range.from"/"range.to", use those values directly (do not recalculate).
 - REQUIRED WHERE CONDITIONS (apply ALL when present; AND together):
 ${filterSqlHints}
+- Runtime values must use placeholders, not hardcoded literals.
+- Preferred predicate guard pattern: ({{__has.<param_key>}} = 0 OR column = {{<param_key>}}).
+
+### DYNAMIC QUERY PATTERNS (Widget-Specific Templates)
+${dynamicGuidanceText || 'No specific patterns matched. Use general SQL best practices.'}
+
+### API-STYLE CONTRACT (BACKEND-LIKE BEHAVIOR)
+- Treat table/detail widgets like API list endpoints.
+- Validate and clamp pagination inputs in SQL logic: page >= 0, page_size between 1 and 100, defaults page=0 and page_size=25 when missing.
+- Only use filter and sort fields that exist in schema or widget config; ignore unsupported fields.
+- Search value must be length 2-100; if outside bounds, ignore search filter.
+- Prefer parameterized optional predicates (e.g., $1::text IS NULL OR "name" ILIKE '%' || $1 || '%').
+- For paginated detail outputs, include COUNT(*) OVER() AS total_count for consistent pagination metadata.
+- Always apply deterministic ORDER BY before LIMIT/OFFSET (fallback to created/date/id column from schema when needed).
+- Use dynamic template placeholders instead of hardcoded literals for runtime values: {{status}}, {{created_from}}, {{created_to}}, {{__search}}, {{size}}, {{offset}}.
 
 ### RECENT SQL ERRORS (FIX THESE PATTERNS)
 ${recentErrors || "[]"}
@@ -2066,118 +3114,128 @@ Example:
   { "id": "w2", "sql": "SELECT * FROM table LIMIT 10" }
 ]`;
 
-    const maxPromptChars = 18000;
+    const isSqlPlaceholder = (sql?: string) => {
+        const text = String(sql || "").toLowerCase();
+        return (
+            text.includes("sql generation missing")
+            || text.includes("check plan/schema")
+            || text.includes("sql violates connector rules")
+            || text.includes("demo placeholder")
+        );
+    };
     const fillMissingQueries = (queries: Record<string, string>) => {
-        const missing = (effectiveWidgets || []).filter((w: any) => !queries[w.id]);
+        const missing = (effectiveWidgets || []).filter((w: any) => !queries[w.id] || isSqlPlaceholder(queries[w.id]));
         if (missing.length === 0) return queries;
-        const fallbackSql = buildFallbackSql(plan, schemaForPrompt);
+        const fallbackSql = buildFallbackSql(plan, schemaForPrompt, isMssql);
         missing.forEach((w: any) => {
             if (fallbackSql?.sqlMap?.[w.id]) {
                 queries[w.id] = fallbackSql.sqlMap[w.id];
-            } else {
-                queries[w.id] = `SELECT 'SQL generation missing for ${w.id}' AS status`;
             }
         });
         return queries;
     };
-    if (systemPrompt.length > maxPromptChars) {
-        const dbLabel = isMssql ? "SQL Server (MSSQL)" : "PostgreSQL";
-        const compactPrompt = [
-            `You are SQL Agent. Generate ${dbLabel} SQL for each widget.`,
-            "Rules: use only schema columns, obey filters, avoid recent errors, return JSON array.",
-            clampSection("SCHEMA:", simplifiedSchema, 1200),
-            clampSection("RELATIONSHIPS:", relationships || "[]", 400),
-            clampSection("FILTERS:", activeFilters || "{}", 600),
-            clampSection("REQUIRED_WHERE:", filterSqlHints || "NONE", 600),
-            connectorInstructionsTrimmed ? clampSection("CONNECTOR_INSTRUCTIONS:", connectorInstructionsTrimmed, 600) : "",
-            clampSection("WIDGETS:", widgets || "[]", 1200),
-            clampSection("ERRORS:", recentErrors || "[]", 800),
-        ].join("\n\n");
-        console.log(`[DEBUG] Prompt trimmed from ${systemPrompt.length} to ${compactPrompt.length} chars.`);
-        const response = await invokeModelWithRetry([
-            new SystemMessage(compactPrompt),
-            new HumanMessage("Generate the SQL queries in strict JSON format.")
-        ]);
-        let content = response.content as string;
-        content = normalizeSqlJsonContent(content);
-        let parsedSQL: any[] = [];
-        try {
-            parsedSQL = JSON.parse(content);
-        } catch (e) {
-            console.error("Failed to parse SQL JSON", content);
-        }
-        const queries: Record<string, string> = {};
-        if (Array.isArray(parsedSQL) && parsedSQL.length > 0) {
-            parsedSQL.forEach((item: any) => {
-                if (item.id && item.sql) {
-                    queries[item.id] = item.sql;
-                }
-            });
-            const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
-            return await enforceQueries(prepared);
-        }
-        const fallback = parseSQLOutput(content, effectiveWidgets);
-        if (fallback && Object.keys(fallback).length > 0) {
-            const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(fallback)));
-            return await enforceQueries(prepared);
-        }
-        return {};
-    }
 
-    console.log("[DEBUG] Sending Prompt to LLM...");
+    const concurrencyEnv = Number(process.env.PLANNER_AGENT_CONCURRENCY || process.env.NEXT_PUBLIC_PLANNER_AGENT_CONCURRENCY || 3);
+    const concurrency = Number.isFinite(concurrencyEnv) && concurrencyEnv > 0 ? Math.max(1, Math.floor(concurrencyEnv)) : 3;
 
-    let content = "";
-    try {
-        const response = await invokeModelWithRetry([
-            new SystemMessage(systemPrompt),
-            new HumanMessage("Generate the SQL queries in strict JSON format.")
-        ]);
-        content = response.content as string;
-    } catch (err: any) {
-        console.error("[SQL_GENERATOR] LLM failed, using fallback SQL:", err?.message || err);
-        const fallbackSql = buildFallbackSql(plan, schemaForPrompt);
-        if (fallbackSql) {
-            return applyFiltersToQueries(polishQueries(fallbackSql.sqlMap));
-        }
-        return {};
-    }
+    // Parallel SQL Generation Logic
+    const widgetsToProcess = (effectiveWidgets || []).slice(0, 10);
+    const projectContext = schemaForPrompt?.projectContext || schemaForPrompt?.context || "";
 
-    // parsing cleanup
-    content = normalizeSqlJsonContent(content);
-    let parsedSQL: any[] = [];
-    try {
-        parsedSQL = JSON.parse(content);
-    } catch (e) {
-        console.error("Failed to parse SQL JSON", content);
-    }
-
-    const queries: Record<string, string> = {};
-    if (Array.isArray(parsedSQL) && parsedSQL.length > 0) {
-        parsedSQL.forEach((item: any) => {
-            if (item.id && item.sql) {
-                queries[item.id] = item.sql;
+    // Helper for parallel execution with limit
+    const runInParallel = async (tasks: Array<() => Promise<any>>, limit: number) => {
+        const results: any[] = [];
+        let index = 0;
+        const workers = new Array(Math.min(limit, tasks.length)).fill(0).map(async () => {
+            while (index < tasks.length) {
+                const i = index++;
+                results[i] = await tasks[i]();
             }
         });
-        const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
-        return await enforceQueries(prepared);
-    }
+        await Promise.all(workers);
+        return results;
+    };
 
-    // Fallback to old parser just in case
-    const fallback = parseSQLOutput(content, effectiveWidgets);
-    if (fallback && Object.keys(fallback).length > 0) {
-        const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(fallback)));
-        return await enforceQueries(prepared);
-    }
+    console.log(`[SQL_GENERATOR] Generating SQL for ${widgetsToProcess.length} widgets with concurrency ${concurrency}...`);
 
-    // Absolute fallback: generate stub queries so UI remains functional
-    effectiveWidgets.forEach((w: any) => {
-        queries[w.id] = `SELECT 'SQL generation missing for ${w.id}' AS status`;
+    const sqlTasks = widgetsToProcess.map((widget: any) => async () => {
+        try {
+            const role = isMssql ? AGENT_ROLES.SQL_SERVER_ENGINEER : AGENT_ROLES.SQL_ENGINEER;
+            const rules = isMssql ? SQL_GENERATION_RULES.MSSQL : SQL_GENERATION_RULES.POSTGRES;
+
+            // Build focused schema context for this specific widget
+            const { tables: relevantTables, relationships: relevantRelationships } = buildRelevantSchemaForAgent(
+                schemaForPrompt,
+                widget.type || "chart",
+                `${widget.title} ${widget.goal}`,
+                10
+            );
+
+            const focusedSchemaText = buildSchemaTextForTables(schemaForPrompt, relevantTables);
+            const widgetJson = JSON.stringify(widget, null, 2);
+
+            const expertPrompt = `Role: ${role}
+Connector instructions are mandatory and override any conflicting guidance.
+
+### CRITICAL RULES:
+${rules.map((r, i) => `${i + 1}. ${r}`).join('\n')}
+
+### FOCUSED DATABASE SCHEMA (STRICT TRUTH)
+${focusedSchemaText}
+
+### RELATIONSHIPS (STRICT JOIN LOGIC)
+${JSON.stringify(relevantRelationships)}
+
+### TIME CONTEXT
+${timeContext}
+
+### DATE CONTEXT (UTC)
+${dateContext.summary}
+
+### PROJECT BRIEF & TARGET WIDGET
+Project: ${projectContext}
+Target Widget: ${widgetJson}
+
+### ACTIVE FILTERS (MUST APPLY IN WHERE)
+- JSON: ${activeFilters || "{}"}
+- REQUIRED WHERE CONDITIONS:
+${filterSqlHints}
+
+### SEARCH CONTEXT
+- Search Column Candidates: ${searchCandidateText}
+- Global Search Value: "${searchValue}"
+
+YOUR TASK:
+Generate exactly ONE optimized ${isMssql ? 'MSSQL' : 'PostgreSQL'} query for WIDGET ID: "${widget.id}".
+Return ONLY the SQL. No JSON wrapping, no markdown, no conversational filler.`;
+
+            const response = await invokeModelWithRetry([
+                new SystemMessage(expertPrompt),
+                new HumanMessage(`Generate the SQL for ${widget.id}.`)
+            ]);
+
+            let sql = String(response.content || "").trim();
+            // Clean up if the model ignored instructions and wrapped in markdown
+            sql = sql.replace(/```sql/gi, '').replace(/```/g, '').trim();
+
+            return { id: widget.id, sql };
+        } catch (err: any) {
+            console.error(`[SQL_GENERATOR] Failed for widget ${widget.id}:`, err.message);
+            // Fallback for this single widget
+            const fallback = buildFallbackSql(plan, schemaForPrompt, isMssql)?.sqlMap?.[widget.id] || "SELECT 1 /* fallback */";
+            return { id: widget.id, sql: fallback };
+        }
     });
-    const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(queries)));
+
+    const results = await runInParallel(sqlTasks, concurrency);
+    const sqlMap: Record<string, string> = {};
+    results.forEach(r => {
+        if (r?.id && r?.sql) sqlMap[r.id] = r.sql;
+    });
+
+    // Post-processing and enforcement
+    const prepared = applyFiltersToQueries(polishQueries(fillMissingQueries(sqlMap)));
     return await enforceQueries(prepared);
-
-
-
 }
 
 function normalizeSqlJsonContent(content: string): string {
@@ -2279,6 +3337,160 @@ function buildDateContext(referenceDate?: string | null) {
     };
 }
 
+// Dynamic Query Pattern Matcher - Matches widget requirements to best query template
+function findBestQueryPatterns(
+    widgetGoal: string,
+    widgetTable: string,
+    queryExamples: any[],
+    schemaInfo: any
+): any[] {
+    if (!queryExamples || queryExamples.length === 0) return [];
+
+    const goalLower = widgetGoal.toLowerCase();
+    const patterns: Array<{ example: any; score: number; reasons: string[] }> = [];
+
+    queryExamples.forEach((ex: any) => {
+        let score = 0;
+        const reasons: string[] = [];
+        const descLower = ex.description?.toLowerCase() || '';
+        const sqlLower = ex.sql?.toLowerCase() || '';
+
+        // Table match (highest priority)
+        if (ex.table?.toLowerCase() === widgetTable?.toLowerCase()) {
+            score += 50;
+            reasons.push('Same table');
+        }
+
+        // Pattern matching based on widget goal keywords
+        if (/date|time|range|period|between/i.test(goalLower)) {
+            if (descLower.includes('date') || sqlLower.includes('date')) {
+                score += 30;
+                reasons.push('Date filtering pattern');
+            }
+        }
+
+        if (/search|find|filter|where|like/i.test(goalLower)) {
+            if (descLower.includes('search') || descLower.includes('filter') ||
+                sqlLower.includes('like') || sqlLower.includes('where')) {
+                score += 30;
+                reasons.push('Search/filter pattern');
+            }
+        }
+
+        if (/count|sum|avg|total|aggregate|group/i.test(goalLower)) {
+            if (sqlLower.includes('count') || sqlLower.includes('sum') ||
+                sqlLower.includes('group by')) {
+                score += 30;
+                reasons.push('Aggregation pattern');
+            }
+        }
+
+        if (/join|relate|connect|link/i.test(goalLower)) {
+            if (descLower.includes('join') || sqlLower.includes('join')) {
+                score += 40;
+                reasons.push('JOIN pattern');
+            }
+        }
+
+        if (/enum|category|type|status/i.test(goalLower)) {
+            if (descLower.includes('enum') || descLower.includes('value')) {
+                score += 25;
+                reasons.push('Enum/categorical pattern');
+            }
+        }
+
+        // Bonus for successful execution
+        if (ex.results && ex.results.length > 0) {
+            score += 10;
+            reasons.push('Verified working');
+        }
+
+        // Bonus for fast execution
+        if (ex.executionTime && ex.executionTime < 100) {
+            score += 5;
+            reasons.push('Fast query');
+        }
+
+        if (score > 0) {
+            patterns.push({ example: ex, score, reasons });
+        }
+    });
+
+    // Sort by score and return top 3
+    return patterns
+        .sort((a, b) => b.score - a.score)
+        .slice(0, 3)
+        .map(p => ({
+            ...p.example,
+            matchScore: p.score,
+            matchReasons: p.reasons
+        }));
+}
+
+// Generate dynamic SQL guidance based on widget requirements and query patterns
+function generateDynamicSqlGuidance(
+    widget: any,
+    bestPatterns: any[],
+    schemaInfo: any,
+    isMssql: boolean
+): string {
+    if (bestPatterns.length === 0) return '';
+
+    const guidance: string[] = ['### DYNAMIC QUERY PATTERNS (Use as Templates)'];
+
+    bestPatterns.forEach((pattern, idx) => {
+        guidance.push(`\n**Pattern ${idx + 1}** (Match Score: ${pattern.matchScore})`);
+        guidance.push(`Reasons: ${pattern.matchReasons?.join(', ')}`);
+        guidance.push(`Purpose: ${pattern.description}`);
+        guidance.push(`SQL Template:`);
+        guidance.push('```sql');
+        guidance.push(pattern.sql);
+        guidance.push('```');
+
+        if (pattern.results && pattern.results.length > 0) {
+            guidance.push(`Sample Results: ${JSON.stringify(pattern.results[0])}`);
+        }
+
+        // Add specific guidance on how to adapt this pattern
+        guidance.push('**How to adapt:**');
+
+        // Extract columns from the example SQL
+        const tableMatch = pattern.sql.match(/FROM\s+["\[]?(\w+)["\]]?/i);
+        const exampleTable = tableMatch ? tableMatch[1] : pattern.table;
+        const targetTable = widget.table || exampleTable;
+
+        if (exampleTable !== targetTable) {
+            guidance.push(`- Replace table "${exampleTable}" with "${targetTable}"`);
+        }
+
+        if (pattern.sql.toLowerCase().includes('where')) {
+            guidance.push('- Keep the WHERE clause structure but adapt conditions to your widget filters');
+        }
+
+        if (pattern.sql.toLowerCase().includes('join')) {
+            guidance.push('- Maintain JOIN pattern for related data access');
+        }
+
+        if (pattern.sql.toLowerCase().includes('group by')) {
+            guidance.push('- Use similar aggregation pattern with appropriate GROUP BY columns');
+        }
+    });
+
+    // Add SQL syntax hints based on patterns
+    if (bestPatterns.some(p => p.sql?.toLowerCase().includes('date'))) {
+        guidance.push('\n### DATE FILTERING GUIDANCE');
+        if (isMssql) {
+            guidance.push('- Use: DATEADD(day, -30, GETDATE()) for "last 30 days"');
+            guidance.push('- Use: DATEADD(month, DATEDIFF(month, 0, date_col), 0) for month truncation');
+        } else {
+            guidance.push('- Use: CURRENT_DATE - INTERVAL \'30 days\' for "last 30 days"');
+            guidance.push('- Use: DATE_TRUNC(\'month\', date_col) for month truncation');
+        }
+    }
+
+    return guidance.join('\n');
+}
+
 function buildSqlPromptHints(schemaForPrompt: any) {
     const dateColumns: string[] = [];
     const numericColumns: string[] = [];
@@ -2336,12 +3548,99 @@ function buildSqlPromptHints(schemaForPrompt: any) {
         : null;
     const tableRows = Object.entries(tableCounts).slice(0, 12).map(([table, count]) => `${table}: ${count}`);
 
+    // Build detailed filter examples from tableInsights
+    const filterExamples: any[] = [];
+    Object.entries(tableInsights).forEach(([table, insight]: [string, any]) => {
+        const filters = insight?.filters || [];
+        filters.forEach((filter: any) => {
+            if (filter?.column && filter?.examples) {
+                filterExamples.push({
+                    filter: `${table}.${filter.column}`,
+                    type: filter.type,
+                    sampleValues: filter.examples.sampleValues || filter.sampleValues,
+                    distinctValues: filter.examples.distinctValues,
+                    totalDistinctCount: filter.examples.totalDistinctCount,
+                    sampleQueries: filter.examples.sampleQueries?.slice(0, 2), // Limit to 2 queries
+                    queryToGetValues: filter.examples.queryToGetValues
+                });
+            }
+        });
+    });
+
+    // Build relationship samples from related tables
+    const relationshipSamples: Record<string, any> = {};
+    const sampleData = schemaForPrompt?.sampleData || {};
+    const relationships = schemaForPrompt?.schemaRelationships || schemaForPrompt?.relationships || [];
+
+    relationships.forEach((rel: any) => {
+        const targetTable = rel?.toTable || rel?.to?.table;
+        if (targetTable && sampleData[targetTable] && !relationshipSamples[targetTable]) {
+            relationshipSamples[targetTable] = {
+                sampleRows: sampleData[targetTable].slice(0, 3),
+                relatedVia: {
+                    fromTable: rel?.fromTable || rel?.from?.table,
+                    fromColumn: rel?.via || rel?.from?.column,
+                    toTable: targetTable,
+                    toColumn: rel?.targetColumn || rel?.to?.column
+                }
+            };
+        }
+    });
+
+    // Build query examples with actual results
+    const queryExamplesWithResults: any[] = [];
+    Object.entries(tableInsights).forEach(([table, insight]: [string, any]) => {
+        const examples = insight?.queryExamples || [];
+        examples.forEach((ex: any) => {
+            if (ex?.results && ex.results.length > 0) {
+                queryExamplesWithResults.push({
+                    table,
+                    description: ex.description,
+                    sql: ex.sql,
+                    results: ex.results.slice(0, 3), // Limit to 3 rows
+                    executionTime: ex.executionTime
+                });
+            }
+        });
+    });
+
     const summaryLines = [
         `PRIMARY_DATE: ${primaryDate || "none"}`,
         `DATE_COLUMNS: ${unique(dateColumns).slice(0, 10).join(", ") || "none"}`,
         `NUMERIC_COLUMNS: ${unique(numericColumns).slice(0, 10).join(", ") || "none"}`,
         `CATEGORICAL_COLUMNS: ${unique(categoricalColumns).slice(0, 10).join(", ") || "none"}`,
-        `TABLE_ROWS: ${tableRows.join(", ") || "unknown"}`
+        `TABLE_ROWS: ${tableRows.join(", ") || "unknown"}`,
+        ``,
+        `FILTER_EXAMPLES (use these to understand data patterns):`,
+        ...filterExamples.slice(0, 8).map((f: any) => {
+            const lines = [`  - ${f.filter} (${f.type}):`];
+            if (f.sampleValues?.length) {
+                lines.push(`    Sample values: ${JSON.stringify(f.sampleValues.slice(0, 5))}`);
+            }
+            if (f.distinctValues?.length) {
+                lines.push(`    Distinct values (${f.totalDistinctCount || f.distinctValues.length} total): ${JSON.stringify(f.distinctValues.slice(0, 5))}`);
+            }
+            if (f.queryToGetValues) {
+                lines.push(`    Query to explore: ${f.queryToGetValues}`);
+            }
+            return lines.join("\n");
+        }),
+        ``,
+        `RELATED_TABLE_SAMPLES (for JOIN understanding):`,
+        ...Object.entries(relationshipSamples).slice(0, 6).map(([table, data]: [string, any]) => {
+            const lines = [`  - ${table}:`];
+            lines.push(`    Join via: ${data.relatedVia.fromTable}.${data.relatedVia.fromColumn} = ${data.relatedVia.toTable}.${data.relatedVia.toColumn}`);
+            lines.push(`    Sample data: ${JSON.stringify(data.sampleRows)}`);
+            return lines.join("\n");
+        }),
+        ``,
+        `EXECUTED_QUERY_EXAMPLES (verified working SQL with real results):`,
+        ...queryExamplesWithResults.slice(0, 10).map((ex: any) => {
+            const lines = [`  - ${ex.table}: ${ex.description} (${ex.executionTime}ms)`];
+            lines.push(`    SQL: ${ex.sql.replace(/\n/g, ' ')}`);
+            lines.push(`    Results: ${JSON.stringify(ex.results)}`);
+            return lines.join("\n");
+        })
     ];
 
     return {
@@ -2349,7 +3648,15 @@ function buildSqlPromptHints(schemaForPrompt: any) {
         dateColumns: unique(dateColumns),
         numericColumns: unique(numericColumns),
         categoricalColumns: unique(categoricalColumns),
-        summary: summaryLines.join("\n")
+        filterExamples: filterExamples.slice(0, 10),
+        relationshipSamples,
+        queryExamples: queryExamplesWithResults.slice(0, 10),
+        summary: summaryLines.join("\n"),
+        // Add helper functions for dynamic pattern matching
+        findBestPatterns: (widgetGoal: string, widgetTable: string) =>
+            findBestQueryPatterns(widgetGoal, widgetTable, queryExamplesWithResults, schemaInfo),
+        generateDynamicGuidance: (widget: any, bestPatterns: any[], isMssql: boolean) =>
+            generateDynamicSqlGuidance(widget, bestPatterns, schemaInfo, isMssql)
     };
 }
 
@@ -2386,6 +3693,11 @@ function parseSQLOutput(output: string, widgets: any[]): Record<string, string> 
                 .replace(/```/g, '')
                 .replace(/\*\*/g, '')
                 .trim();
+
+            // STRIP JSON artifacts (leaked closing braces/brackets/quotes from fallback parsing)
+            // This happens when the LLM returns JSON but we fall back to text parsing
+            sql = sql.replace(/^["']|["']$/g, ''); // Strip outer quotes
+            sql = sql.replace(/[}\],]+$/, '').trim(); // Strip trailing JSON artifacts
 
             if (sql.endsWith(';')) sql = sql.slice(0, -1);
 
@@ -2424,6 +3736,11 @@ function parseSQLOutput(output: string, widgets: any[]): Record<string, string> 
                     .replace(/```/g, '')
                     .replace(/\*\*/g, '')
                     .trim();
+
+                // Consistency fix for trailing artifacts
+                sql = sql.replace(/^["']|["']$/g, '');
+                sql = sql.replace(/[}\],]+$/, '').trim();
+
                 if (sql.endsWith(';')) sql = sql.slice(0, -1);
                 queries[w.id] = sql;
             }
@@ -2453,11 +3770,10 @@ function parseSQLOutput(output: string, widgets: any[]): Record<string, string> 
         }
     }
 
-    // Final Validation & Error Fallback
+    // Final validation: keep only parsable SQL and let caller backfill missing widgets.
     widgets.forEach(w => {
         if (!queries[w.id]) {
-            console.warn(`[SQL_PARSER] Missing query for ${w.id}. Providing default error SELECT.`);
-            queries[w.id] = `SELECT 'SQL generation missing for ${w.id}' as status, 'Check plan/schema' as message`;
+            console.warn(`[SQL_PARSER] Missing query for ${w.id}.`);
         }
     });
 
@@ -2468,480 +3784,6 @@ function parseSQLOutput(output: string, widgets: any[]): Record<string, string> 
  * STEP 4: QUERY EXECUTOR
  * Executes generated SQL in parallel with performance tracking.
  */
-const extractInstructionBans = (instructions: string) => {
-    const bans = new Set<string>();
-    if (!instructions) return bans;
-    const lines = instructions.split(/\r?\n/);
-    const patterns = [
-        /(?:do not use|don't use|avoid|never use|no)\s+([a-z0-9_().\[\]]+)/i
-    ];
-    lines.forEach((line) => {
-        patterns.forEach((pattern) => {
-            const match = line.match(pattern);
-            if (match?.[1]) {
-                bans.add(match[1].toLowerCase());
-            }
-        });
-    });
-    return bans;
-};
-
-const detectIsMssql = (connectionString?: string, connectorType?: string) => {
-    const lower = String(connectionString || "").toLowerCase();
-    if (lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=")) {
-        return true;
-    }
-    const typeLower = String(connectorType || "").toLowerCase();
-    return typeLower.includes("mssql") || typeLower.includes("sql server");
-};
-
-const validateSqlWithInstructions = (sql: string, connectionString?: string, connectorInstructions?: string, connectorType?: string) => {
-    const trimmed = normalizeSqlForValidation(sql);
-    if (!trimmed.toLowerCase().startsWith("select")) {
-        return { ok: false, error: "Validation failed: SQL must start with SELECT." };
-    }
-    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter"];
-    if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
-        return { ok: false, error: "Validation failed: unsafe SQL detected." };
-    }
-    const isMssql = detectIsMssql(connectionString, connectorType);
-    if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
-        return { ok: false, error: "Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH." };
-    }
-    if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
-        return { ok: false, error: "Validation failed: PostgreSQL does not support TOP. Use LIMIT." };
-    }
-    const bans = extractInstructionBans(connectorInstructions || "");
-    for (const banned of bans) {
-        const pattern = new RegExp(`\\b${banned.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
-        if (pattern.test(trimmed)) {
-            return { ok: false, error: `Validation failed: SQL violates connector instruction (avoid \"${banned}\").` };
-        }
-    }
-    return { ok: true };
-};
-
-export async function runQueryExecutor(
-    queries: Record<string, string>,
-    connectionString?: string,
-    options?: { connectorInstructions?: string; connectorType?: string }
-) {
-    console.log("[AGENT] Executing optimized query set...");
-    const results: Record<string, any> = {};
-
-    const tasks = Object.entries(queries).map(async ([id, sql]) => {
-        const start = Date.now();
-        try {
-            console.log(`[EXEC] Running Widget ${id}...`);
-            const validation = validateSqlWithInstructions(sql, connectionString, options?.connectorInstructions, options?.connectorType);
-            if (!validation.ok) {
-                const duration = Date.now() - start;
-                results[id] = {
-                    error: validation.error,
-                    status: "error",
-                    sql,
-                    executionTime: `${duration}ms`
-                };
-                return;
-            }
-            const data = await dbGateway.runQuery(sql, connectionString);
-            const duration = Date.now() - start;
-
-            if (data && (data as any).error) {
-                const errValue = (data as any).error;
-                const errMessage = typeof errValue === 'string' ? errValue : JSON.stringify(errValue);
-                results[id] = {
-                    error: errMessage,
-                    status: "error",
-                    sql: sql,
-                    executionTime: `${duration}ms`
-                };
-            } else {
-                results[id] = {
-                    data: Array.isArray(data) ? data : [],
-                    status: "success",
-                    executionTime: `${duration}ms`
-                };
-            }
-        } catch (err: any) {
-            const errMessage = typeof err?.message === 'string' ? err.message : JSON.stringify(err);
-            results[id] = {
-                error: errMessage,
-                status: "error",
-                sql: sql
-            };
-        }
-    });
-
-    await Promise.all(tasks);
-
-    // Status Reporting
-    const logSummary = Object.entries(results).map(([id, res]) =>
-        `WIDGET ${id}: ${res.status === 'success' ? '✓ Success' : '✗ Failed'} (${res.executionTime || '0ms'})`
-    ).join('\n');
-    console.log("EXECUTION RESULTS:\n" + logSummary);
-
-    return results;
-}
-
-/**
- * SQL REPAIR AGENT
- * Intelligently fixes failed SQL queries using LLM analysis.
- * Takes the error, schema, original query, and widget context to generate a corrected query.
- */
-export async function repairFailedQuery(context: {
-    widgetId: string;
-    widgetTitle: string;
-    widgetType: string;
-    widgetGoal?: string;
-    originalSql: string;
-    errorMessage: string;
-    schema: any;
-    errorLog?: Array<{ id: string; title?: string; sql?: string; error: string; timestamp?: string }>;
-    connectionString?: string;
-}): Promise<{ sql: string; explanation: string }> {
-    console.log(`[SQL_REPAIR] Attempting to fix query for widget: ${context.widgetTitle}`);
-
-    // Format schema for LLM
-    const schemaInfo = context.schema?.schemaInfo || {};
-    const simplifiedSchema = Object.entries(schemaInfo).map(([table, info]: [string, any]) => {
-        const cols = info.columns?.map((c: any) => `${c.name || c.column_name} (${c.type || c.data_type})`).join(', ');
-        return `TABLE "${table}" HAS COLUMNS: [${cols}]`;
-    }).join('\n');
-
-    const recentErrors = JSON.stringify((context.errorLog || []).slice(0, 15));
-    const truncate = (text: string, max = 3000) => text.length > max ? `${text.slice(0, max)}...` : text;
-    const compactErrors = truncate(recentErrors || "[]", 600);
-    const compactSql = truncate(context.originalSql || "", 1500);
-    const compactError = truncate(context.errorMessage || "", 800);
-
-    const extractTablesFromSql = (sql: string) => {
-        const tables = new Set<string>();
-        const regex = /\b(from|join)\s+["`[]?([A-Za-z0-9_.]+)["`\]]?/gi;
-        let match: RegExpExecArray | null;
-        while ((match = regex.exec(sql)) !== null) {
-            const name = match[2]?.split('.').pop();
-            if (name) tables.add(name);
-        }
-        return Array.from(tables);
-    };
-
-    const buildCompactSchema = () => {
-        const tableNames = extractTablesFromSql(context.originalSql || "");
-        const fallbackTables = Object.keys(schemaInfo || {}).slice(0, 2);
-        const selected = tableNames.length > 0 ? tableNames : fallbackTables;
-        return selected.map((table) => {
-            const info = schemaInfo[table] || schemaInfo[table.toLowerCase()] || schemaInfo[table.toUpperCase()];
-            const cols = info?.columns?.slice(0, 4).map((c: any) => `${c.name || c.column_name} (${c.type || c.data_type})`).join(', ');
-            return `TABLE "${table}" HAS COLUMNS: [${cols || 'unknown'}]`;
-        }).join('\n');
-    };
-
-    const compactSchema = truncate(buildCompactSchema(), 1200);
-
-    const connectorType = String(context.schema?.connectorType || context.schema?.connector?.type || "").toLowerCase();
-    const isMssql = (() => {
-        const lower = (context.connectionString || "").toLowerCase();
-        if (lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=")) {
-            return true;
-        }
-        return connectorType.includes("mssql") || connectorType.includes("sql server");
-    })();
-    const connectorInstructions = String(context.schema?.connectorInstructions || "").trim();
-
-    const systemPrompt = isMssql
-        ? `You are **SQL Repair Agent**, a Senior SQL Server (MSSQL) debugger.
-Connector instructions are mandatory and override any conflicting guidance.
-
-### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
-1. **NO LIMIT** - Use \`TOP\` or \`OFFSET ... FETCH\`.
-2. **DATE FUNCTIONS** - Use \`GETDATE()\`, \`DATEADD\`, \`DATEDIFF\`.
-3. **DATE TRUNCATION** - Use \`DATEADD(day, DATEDIFF(day, 0, col), 0)\` for day, \`DATEADD(month, DATEDIFF(month, 0, col), 0)\` for month.
-4. **TEXT TYPE** - If comparing text/ntext, CAST to NVARCHAR(MAX) before equality.
-5. **IDENTIFIERS** - Use brackets \`[Table]\` and \`[Column]\` when needed.
-
-${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ''}
-
-### FAILED QUERY CONTEXT
-- **Widget Goal:** ${context.widgetGoal || 'Display relevant data'}
- - **Original SQL:** \`${compactSql}\`
- - **Error Message:** \`${compactError}\`
- - **Recent SQL Errors (Avoid repeats):** ${compactErrors}
-
-### DATABASE SCHEMA
-${compactSchema}
-
-### YOUR MISSION
-1. Analyze the error and generate a FIXED SQL Server query.
-2. Use ONLY columns that exist in the schema.
-3. Fix any syntax errors and handle type mismatches.
-4. Do NOT repeat any patterns from recent SQL errors.
-5. **Never** claim the error is "misleading" or "already valid" — you must change the SQL to address the error.
-6. If the error mentions LIMIT, DATE_TRUNC, CURRENT_DATE, or GROUP BY aliasing, you MUST replace with SQL Server equivalents.
-
-### OUTPUT FORMAT (MANDATORY)
-Return ONLY a valid JSON object. No conversation.
-{
-  "sql": "SELECT ... fixed query ...",
-  "explanation": "Brief fix summary"
-}`
-        : `You are **SQL Repair Agent**, a Senior PostgreSQL debugger.
-Connector instructions are mandatory and override any conflicting guidance.
-
-### CRITICAL: POSTGRESQL SYNTAX RULES (MANDATORY)
-1. **NO DATEDIFF()** - This function DOES NOT EXIST in PostgreSQL.
-   - USE: \`(end_date - start_date)\` for days difference.
-   - Example: \`(CURRENT_DATE - first_used_at)\`
-2. **NO window functions inside aggregates** - You cannot do \`SUM(count(*) OVER (...))\`.
-3. **DATE_TRUNC** - Always cast to timestamp: \`DATE_TRUNC('day', col::timestamp)\`.
-
-${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ''}
-
-### FAILED QUERY CONTEXT
-- **Widget Goal:** ${context.widgetGoal || 'Display relevant data'}
- - **Original SQL:** \`${compactSql}\`
- - **Error Message:** \`${compactError}\`
- - **Recent SQL Errors (Avoid repeats):** ${compactErrors}
-
-### DATABASE SCHEMA
-${compactSchema}
-
-### YOUR MISSION
-1. Analyze the error and generate a FIXED PostgreSQL query.
-2. Use ONLY columns that exist in the schema.
-3. Fix any syntax errors and handle type mismatches.
-4. Do NOT repeat any patterns from recent SQL errors.
-5. **Never** claim the error is "misleading" or "already valid" — you must change the SQL to address the error.
-
-### OUTPUT FORMAT (MANDATORY)
-Return ONLY a valid JSON object. No conversation.
-{
-  "sql": "SELECT ... fixed query ...",
-  "explanation": "Brief fix summary"
-}`;
-
-    const maxPromptChars = 9000;
-    try {
-        if (systemPrompt.length > maxPromptChars) {
-            const compactPrompt = [
-                "You are SQL Repair Agent. Fix the SQL based on schema + error.",
-                `Original SQL: ${compactSql}`,
-                `Error: ${compactError}`,
-                `Schema: ${compactSchema}`,
-                `Recent errors: ${compactErrors}`,
-                "Return JSON: {\"sql\":\"...\",\"explanation\":\"...\"}"
-            ].join("\n");
-            const response = await invokeModelWithRetry([
-                new SystemMessage(compactPrompt),
-                new HumanMessage("Fix the failed SQL query in strict JSON.")
-            ]);
-            const content = response.content as string;
-            const parsed = extractJSON(content);
-            if (parsed && parsed.sql) {
-                return {
-                    sql: parsed.sql,
-                    explanation: parsed.explanation || "Repaired query"
-                };
-            }
-            throw new Error("Repair response missing SQL.");
-        }
-        const response = await invokeModelWithRetry([
-            new SystemMessage(systemPrompt),
-            new HumanMessage("Fix the failed SQL query based on the error and schema provided.")
-        ]);
-
-        const content = response.content as string;
-        console.log("[SQL_REPAIR] LLM Response:", content.substring(0, 200));
-
-        // Extract JSON from response
-        const parsed = extractJSON(content);
-
-        if (parsed && parsed.sql) {
-            console.log(`[SQL_REPAIR] Successfully generated fix: ${parsed.explanation}`);
-            return {
-                sql: parsed.sql,
-                explanation: parsed.explanation || "Query repaired by AI"
-            };
-        }
-
-        // Fallback: try to extract SQL directly if JSON parsing fails or doesn't have sql field
-        // Look for SQL in markdown blocks first, then general SELECT patterns
-        const markdownSqlMatch = content.match(/```(?:sql)?\s*([\s\S]+?)```/i);
-        if (markdownSqlMatch) {
-            let sql = markdownSqlMatch[1].trim();
-            if (sql.toLowerCase().includes("select")) {
-                return {
-                    sql: sql,
-                    explanation: "Query extracted from markdown block"
-                };
-            }
-        }
-
-        const directSqlMatch = content.match(/(?:SELECT|WITH)[\s\S]+?(?:;|$)/i);
-        if (directSqlMatch) {
-            return {
-                sql: directSqlMatch[0].trim(),
-                explanation: "Query extracted via text matching"
-            };
-        }
-
-        throw new Error("Could not extract repaired SQL from LLM response");
-    } catch (err: any) {
-        console.error("[SQL_REPAIR] Failed to repair query:", err.message);
-        throw new Error(`SQL repair failed: ${err.message}`);
-    }
-}
-
-/**
- * STEP 5: FINAL ASSEMBLY
- * Orchestrates the final dashboard with Smart Layout positioning.
- */
-export async function assembleFinalDashboard(plan: any, queries: any[], results: any[], insights: string[] = [], filterCandidates?: any) {
-    console.log("[AGENT] Assembling Final Dashboard with Smart Layout...");
-
-    // Row 1 (y=0): KPIs (3 cols each, height 2)
-    // Row 2 (y=2): Main trend chart (12 cols, height 4)
-    // Row 3 (y=6): Comparison charts (6 cols each, height 4)
-    // Row 4 (y=10): Detail table (12 cols, height 6)
-
-    let kpiCount = 0;
-    let chartCount = 0;
-
-    const widgetsWithResults = plan.widgets.map((w: any) => {
-        // Prefer a direct match on widget ID; fall back to explicit queryId, then to query->widget mapping, then title match
-        const q = queries.find((query: any) =>
-            query.id === w.id ||
-            query.id === w.queryId ||
-            query.widgetIds?.includes?.(w.id) ||
-            (w.title && query.title && query.title.toLowerCase() === w.title.toLowerCase())
-        );
-        const res = results.find((r: any) =>
-            r.id === w.id ||
-            r.id === w.queryId ||
-            (q ? r.id === q.id : false) ||
-            (w.title && r.title && r.title.toLowerCase() === w.title.toLowerCase())
-        );
-
-        let pos = { x: 0, y: 0, w: 6, h: 4 };
-
-        if (w.type === 'kpi') {
-            pos = { x: (kpiCount % 4) * 3, y: 0, w: 3, h: 2 };
-            kpiCount++;
-        } else if (w.type === 'line' && (w.layoutHint === 'row2-full' || chartCount === 0)) {
-            pos = { x: 0, y: 2, w: 12, h: 4 };
-            chartCount++;
-        } else if (w.type === 'table') {
-            pos = { x: 0, y: 10, w: 12, h: 6 };
-        } else if (['bar', 'donut', 'pie', 'line'].includes(w.type)) {
-            pos = { x: (chartCount % 2) * 6, y: 6, w: 6, h: 4 };
-            chartCount++;
-        }
-
-        return {
-            ...w, // Preserve all original config (encoding, kpiConfig, etc.)
-            id: w.id,
-            title: w.title,
-            type: w.type,
-            goal: w.goal,
-            data: res?.data || [],
-            sql: q?.sql,
-            position: pos,
-            __resultStatus: res?.status,
-            __hasData: Array.isArray(res?.data) ? res.data.length > 0 : false
-        };
-    });
-
-    const filtered = widgetsWithResults
-        .filter((w: any) => w.__resultStatus !== "error")
-        .filter((w: any) => w.__hasData || w.type === "markdown")
-        .map((w: any) => {
-            const { __resultStatus, __hasData, ...rest } = w;
-            return rest;
-        });
-
-    kpiCount = 0;
-    chartCount = 0;
-    const widgets = filtered.map((w: any) => {
-        let pos = { x: 0, y: 0, w: 6, h: 4 };
-        if (w.type === 'kpi') {
-            pos = { x: (kpiCount % 4) * 3, y: 0, w: 3, h: 2 };
-            kpiCount++;
-        } else if (w.type === 'line' && (w.layoutHint === 'row2-full' || chartCount === 0)) {
-            pos = { x: 0, y: 2, w: 12, h: 4 };
-            chartCount++;
-        } else if (w.type === 'table') {
-            pos = { x: 0, y: 10, w: 12, h: 6 };
-        } else if (['bar', 'donut', 'pie', 'line'].includes(w.type)) {
-            pos = { x: (chartCount % 2) * 6, y: 6, w: 6, h: 4 };
-            chartCount++;
-        }
-        return { ...w, position: pos };
-    });
-
-    return {
-        id: `dash_${Date.now()}`,
-        name: plan.title || "AI Insights Dashboard",
-        widgets,
-        layout: widgets.map((w: any) => ({ i: w.id, ...w.position })),
-        insights,
-        filters: plan.filters || buildFiltersFromCandidates(filterCandidates),
-        updatedAt: new Date().toISOString()
-    };
-}
-
-function buildFiltersFromCandidates(filterCandidates: any): any[] {
-    if (!filterCandidates) return [];
-    const filters: any[] = [];
-
-    const primaryDate = filterCandidates.primaryDate;
-    if (primaryDate) {
-        filters.push({
-            id: `${primaryDate.table}.${primaryDate.column}`,
-            dimension: `${primaryDate.table}.${primaryDate.column}`,
-            label: `${primaryDate.table}.${primaryDate.column}`,
-            type: "date-range",
-            value: "this_month",
-            options: [
-                { label: "Today", value: "today" },
-                { label: "This Week", value: "this_week" },
-                { label: "This Month", value: "this_month" },
-                { label: "This Year", value: "this_year" },
-                { label: "Custom", value: "custom" }
-            ]
-        });
-    }
-
-    (filterCandidates.categoricalColumns || []).slice(0, 4).forEach((col: any) => {
-        filters.push({
-            id: `${col.table}.${col.column}`,
-            dimension: `${col.table}.${col.column}`,
-            label: `${col.table}.${col.column}`,
-            type: col.distinct && col.distinct.length > 5 ? "select" : "multi-select",
-            value: col.distinct ? col.distinct.slice(0, 5) : [],
-            options: (col.distinct || []).map((v: any) => ({ label: String(v), value: v }))
-        });
-    });
-
-    return filters;
-}
-
-/**
- * STEP 4.5: NARRATIVE GENERATOR
- * Analyzes result summary to provide executive insights.
- */
-export async function runNarrativeGenerator(resultsList: any[]) {
-    console.log("[AGENT] Analyzing data trends...");
-    const prompt = `Role: Senior Strategic Executive Analyst.
-    RESULTS: ${JSON.stringify(resultsList.map(r => ({ title: r.title, sample: r.data?.slice(0, 3) })))}
-    
-    TASK: Provide 3-4 professional, one-sentence bulleted insights based on this data.
-    Return JSON: { "insights": ["..."] }`;
-
-    const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
-    const data = extractJSON(response.content as string);
-    return data?.insights || ["Data retrieval successful. Full analysis ready."];
-}
-
 // --- LEGACY AGENTS (Maintained for backward compatibility during migration) ---
 
 /**
@@ -2951,8 +3793,22 @@ export async function intentAgent(state: typeof AgentState.State) {
     const lastMessage = state.messages[state.messages.length - 1];
     const query = typeof lastMessage.content === 'string' ? lastMessage.content : "Overview of data";
     const focusTable = state.context?.focusTable;
+    
+    // Get today's date
+    const today = new Date();
+    const todayStr = today.toISOString().split('T')[0];
+    const todayFormatted = today.toLocaleDateString('en-US', { 
+        weekday: 'long', 
+        year: 'numeric', 
+        month: 'long', 
+        day: 'numeric' 
+    });
 
     const prompt = `You are an Intent Parsing Agent (Senior Analyst). Extract user goals into JSON.
+    
+    TODAY'S DATE: ${todayFormatted} (${todayStr})
+    Use this when interpreting date-related queries like "today", "this week", "last month", etc.
+    
     FIELDS: intent (short string), entities (tables involved), metrics (requested values), dimensions (grouping), filters (where clause ideas).
     ${focusTable ? `CONTEXT: The user is currently inspecting the '${focusTable}' table. Prioritize this entity.` : ''}
     QUERY: "${query}"`;
@@ -2980,233 +3836,7 @@ export async function intentAgent(state: typeof AgentState.State) {
  * Objective: Database intelligence & profiling
  */
 export async function schemaAgent(state: typeof AgentState.State) {
-    const manualSchema = state.context?.manualSchema;
-    const schemaSnapshot = state.context?.schemaSnapshot;
-    const schemaOptions: SchemaDiscoveryOptions = state.context?.schemaOptions || {};
-    const connectionString = state.context?.connectionString || state.context?.dbUrl || state.context?.postgresUrl || null;
-
-    const effectiveOptions: SchemaDiscoveryOptions = {
-        ...schemaOptions,
-        enableTableKpis: schemaOptions.enableTableKpis ?? true,
-        enableTableMatrix: schemaOptions.enableTableMatrix ?? true,
-        enableTableFilters: schemaOptions.enableTableFilters ?? true
-    };
-
-    if (schemaSnapshot) {
-        console.log("[SCHEMA] Using schema snapshot from context.");
-        const schemaInfo = schemaSnapshot.schemaInfo || schemaSnapshot.schema || {};
-        const sampleData = schemaSnapshot.sampleData || {};
-        const snapshotInsights = schemaSnapshot.tableInsights || schemaSnapshot.dataProfile || null;
-        const rawRelationships = schemaSnapshot.relationships || schemaSnapshot.schemaRelationships || [];
-        const normalizedRelationships = Array.isArray(rawRelationships)
-            ? rawRelationships.map((rel: any) => {
-                if (rel?.from?.table && rel?.to?.table) {
-                    return {
-                        fromTable: rel.from.table,
-                        toTable: rel.to.table,
-                        via: rel.from.column,
-                        type: rel.type || "many-to-one",
-                        targetColumn: rel.to.column
-                    };
-                }
-                return rel;
-            })
-            : [];
-
-        const tableInsights = snapshotInsights || await buildTableInsights(schemaInfo, sampleData, null, effectiveOptions);
-
-        return {
-            schemaInfo,
-            sampleData,
-            schemaRelationships: normalizedRelationships,
-            dataProfile: tableInsights,
-            status: "Using schema snapshot from context.",
-            messages: [new AIMessage(`[SCHEMA] Grounded in schema snapshot with ${Object.keys(schemaInfo).length} tables.`)]
-        };
-    }
-
-    if (manualSchema) {
-        console.log("[SCHEMA] Using manually selected schema.");
-        const normalizedSchema: Record<string, any> = {};
-        const sampleData: Record<string, any[]> = {};
-        const relationships: any[] = [];
-
-        Object.entries(manualSchema as Record<string, any>).forEach(([tableName, info]) => {
-            if (!info) return;
-
-            const rawColumns =
-                Array.isArray(info.columns)
-                    ? info.columns
-                    : Array.isArray(info.columns?.columns)
-                        ? info.columns.columns
-                        : Array.isArray(info.schema?.columns)
-                            ? info.schema.columns
-                            : [];
-
-            const normalizedColumns = rawColumns.map((col: any) => ({
-                ...col,
-                name: col.name || col.column_name,
-                type: col.type || col.data_type,
-            }));
-
-            const foreignKeys =
-                Array.isArray(info.foreignKeys)
-                    ? info.foreignKeys
-                    : Array.isArray(info.columns?.foreignKeys)
-                        ? info.columns.foreignKeys
-                        : [];
-
-            normalizedSchema[tableName] = {
-                columns: normalizedColumns,
-                primaryKeys: info.primaryKeys || info.columns?.primaryKeys || [],
-                foreignKeys: foreignKeys,
-            };
-
-            if (Array.isArray(info.sampleRows)) {
-                sampleData[tableName] = info.sampleRows;
-            } else if (Array.isArray(info.sampleData)) {
-                sampleData[tableName] = info.sampleData;
-            } else {
-                sampleData[tableName] = [];
-            }
-
-            if (foreignKeys.length > 0) {
-                foreignKeys.forEach((fk: any) => {
-                    if (!fk?.foreign_table_name || !fk?.foreign_column_name) return;
-                    relationships.push({
-                        fromTable: tableName,
-                        toTable: fk.foreign_table_name,
-                        via: fk.column_name,
-                        type: "1-to-many",
-                        targetColumn: fk.foreign_column_name,
-                    });
-                });
-            }
-        });
-
-        const tableInsights = await buildTableInsights(normalizedSchema, sampleData, null, effectiveOptions);
-
-        return {
-            schemaInfo: normalizedSchema,
-            sampleData,
-            schemaRelationships: relationships,
-            dataProfile: tableInsights,
-            status: "Using manual grounding.",
-            messages: [new AIMessage(`[SCHEMA] Grounded in manually selected tables: ${Object.keys(normalizedSchema).join(', ')}`)]
-        };
-    }
-
-    try {
-        const focusTable = state.context?.focusTable;
-        let allTablesResult = await dbGateway.listTables(connectionString || undefined);
-        let allTables: string[] = Array.isArray(allTablesResult) ? allTablesResult : [];
-
-        // If focusing, we prioritize the focus table but still list neighbors
-        // The crawling logic below will pick up related tables.
-        if (focusTable && allTables.includes(focusTable)) {
-            allTables = [focusTable];
-            console.log(`[SCHEMA] Targeted profiling of table: ${focusTable} and its relations...`);
-        } else {
-            console.log(`[SCHEMA] Exhaustive profiling of ${allTables.length} tables...`);
-        }
-
-        const schemaInfo: Record<string, any> = {};
-        const sampleData: Record<string, any[]> = {};
-        const relationships: any[] = [];
-        const processedTables = new Set<string>();
-
-        // Helper to profile a single table
-        const profileTable = async (tableName: string) => {
-            if (processedTables.has(tableName)) return;
-            processedTables.add(tableName); // Mark immediately
-
-            try {
-                // Parallelize schema and sample data fetch
-                const [tableSchema, samples] = await Promise.all([
-                    dbGateway.getTableSchema(tableName, connectionString || undefined),
-                    dbGateway.getTablePreview(tableName, connectionString || undefined)
-                ]);
-
-                schemaInfo[tableName] = tableSchema;
-                sampleData[tableName] = Array.isArray(samples) ? samples : [];
-
-                if (tableSchema.foreignKeys) {
-                    for (const fk of tableSchema.foreignKeys) {
-                        relationships.push({
-                            fromTable: tableName,
-                            toTable: fk.foreign_table_name,
-                            via: fk.column_name,
-                            type: "1-to-many",
-                            targetColumn: fk.foreign_column_name
-                        });
-                    }
-                }
-            } catch (e) {
-                console.warn(`[SCHEMA] Failed to profile ${tableName}:`, e);
-            }
-        };
-
-        // BATCH PROCESSING: Process tables in chunks to avoid connection timeouts but maintain speed
-        const BATCH_SIZE = 5;
-
-        // 1. Profile initial list
-        for (let i = 0; i < allTables.length; i += BATCH_SIZE) {
-            const chunk = allTables.slice(i, i + BATCH_SIZE);
-            await Promise.all(chunk.map(t => profileTable(t)));
-        }
-
-        // 2. Discover and profile missing related tables (One level deep only for performance)
-        const relatedTables = new Set<string>();
-        Object.values(schemaInfo).forEach((schema: any) => {
-            schema.foreignKeys?.forEach((fk: any) => {
-                if (!processedTables.has(fk.foreign_table_name)) {
-                    relatedTables.add(fk.foreign_table_name);
-                }
-            });
-        });
-
-        if (relatedTables.size > 0) {
-            console.log(`[SCHEMA] Profiling ${relatedTables.size} related tables...`);
-            const relatedArray = Array.from(relatedTables);
-            for (let i = 0; i < relatedArray.length; i += BATCH_SIZE) {
-                const chunk = relatedArray.slice(i, i + BATCH_SIZE);
-                await Promise.all(chunk.map(t => profileTable(t)));
-            }
-        }
-
-        // Second pass: Identify many-to-many / junction tables
-        for (const tableName of Array.from(processedTables)) {
-            const schema = schemaInfo[tableName];
-            if (schema.foreignKeys && schema.foreignKeys.length >= 2) {
-                // Potential junction table
-                const isJunction = schema.columns.length <= (schema.foreignKeys.length + 2); // heuristic: mostly FKs
-                if (isJunction) {
-                    console.log(`[SCHEMA] Identified junction table: ${tableName}`);
-                    const table1 = schema.foreignKeys[0].foreign_table_name;
-                    const table2 = schema.foreignKeys[1].foreign_table_name;
-                    relationships.push({
-                        fromTable: table1,
-                        toTable: table2,
-                        via: tableName,
-                        type: "many-to-many"
-                    });
-                }
-            }
-        }
-
-        const tableInsights = await buildTableInsights(schemaInfo, sampleData, null, schemaOptions);
-
-        return {
-            schemaInfo,
-            sampleData,
-            schemaRelationships: relationships,
-            dataProfile: tableInsights,
-            status: `Canonical database intelligence gathered. Profiled ${processedTables.size} tables and identified ${relationships.length} relationships.`,
-            messages: [new AIMessage(`[SCHEMA] Deep profiled ${processedTables.size} entities with full schema and 5-record snapshots. identified junction tables and M:M relations.`)]
-        };
-    } catch (error: any) {
-        return { errors: [`Exhaustive schema grounding failed: ${error.message}`] };
-    }
+    return schemaAgentImpl(state);
 }
 
 /**
@@ -3236,136 +3866,7 @@ export async function queryEnhancerAgent(state: typeof AgentState.State) {
  * Objective: Decides what widgets to create
  */
 export async function dashboardPlannerAgent(state: typeof AgentState.State) {
-    const intent = state.intent;
-    const focusTable = state.context?.focusTable;
-    const tableInsightsText = formatTableInsightsForPrompt(state.dataProfile || null);
-    const projectContext = state.context?.projectContext || state.context?.projectAbout || "";
-    const disabledTypes = Array.isArray(state.context?.disabledWidgetTypes) ? state.context?.disabledWidgetTypes : [];
-    const allowedTypes = [
-        "kpi",
-        "line",
-        "area",
-        "bar",
-        "pie",
-        "donut",
-        "table",
-        "cohort",
-        "funnel",
-        "map",
-        "scatter",
-        "markdown",
-    ].filter((t) => !disabledTypes.includes(t));
-    const prompt = `Role: Senior Software Architect (15+ years in AI, backend engineering, data analytics, scalable system design).
-    TASK: Design a dynamic, efficient, analytics-driven dashboard directly from the schema.
-    
-    INTENT: "${intent.intent}"
-    ${projectContext ? `PROJECT_CONTEXT: ${projectContext}` : ''}
-    SCHEMA: ${JSON.stringify(state.schemaInfo)}
-    RELATIONS: ${JSON.stringify(state.schemaRelationships || [])}
-    SAMPLES_CONEXT: ${JSON.stringify(state.sampleData || {})}
-    ${tableInsightsText ? `TABLE_INSIGHTS: ${tableInsightsText}` : ''}
-    ${focusTable ? `PRIMARY_ENTITY: Targeting table '${focusTable}'.` : ''}
-
-    ALLOWED WIDGET TYPES (STRICT):
-    ${allowedTypes.join(", ")}
-
-    DO NOT include any widget types outside this list.
-
-    ARCHITECTURE & DESIGN PRINCIPLES:
-    1) Data Discovery & Context: Inspect schema, types, constraints, and latest records to validate assumptions.
-    2) KPI Identification: Prioritize actionable KPIs that scale with data growth.
-    3) Visualization Strategy: Match charts to data characteristics (trend/comparison/proportion/distribution).
-    4) Advanced Data Table: Include search, sorting, pagination, and smart filters.
-    5) Time-Based Views: Ensure KPIs/charts/tables respond to time filters.
-    6) System Efficiency: Keep the plan modular, reusable, and config-driven.
-    7) Insights & Reporting: Optimize for decision-making and drill-downs.
-
-    STRICT ARCHITECTURAL DIRECTIVES:
-    1. ZERO DATA LEAKAGE: DO NOT include actual data values, records, or samples in the output. ONLY define the schema and structural intent.
-    2. STRUCTURAL PRECISION: For each widget, identify the EXACT metrics and dimensions from the SCHEMA to be used.
-    3. HIERARCHICAL LAYOUT: Suggest 3-4 North Star KPIs followed by specialized visual segments.
-    4. TECHNICAL SPECIFICATION: Use 'goal' to describe the analytical value and 'title' for the professional display name.
-    
-    Return JSON: 
-    {
-      "title": "EXECUTIVE_DATA_INSIGHT: [DOMAIN]",
-      "actionable_plan": "A precise technical summary of the data strategy and JOIN logic...",
-      "widgets": [
-        { 
-          "id": "w1", 
-          "type": "kpi", 
-          "title": "[ENTITY]_TOTAL_VOLUME", 
-          "goal": "Primary throughput monitor",
-          "metric": "column_name",
-          "dim": null
-        },
-        { 
-          "id": "w2", 
-          "type": "line", 
-          "title": "TEMPORAL_GROWTH_TREND", 
-          "goal": "Performance velocity check",
-          "metric": "value_col",
-          "dim": "date_col"
-        }
-      ]
-    }`;
-
-    const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
-    let plan = extractJSON(response.content as string) || { title: "AI Dashboard", widgets: [] };
-
-    const filterWidgetsByType = (value: any) => {
-        if (!value || !Array.isArray(value.widgets) || allowedTypes.length === 0) return value;
-        const allowedSet = new Set(allowedTypes);
-        return {
-            ...value,
-            widgets: value.widgets.filter((w: any) => allowedSet.has(w?.type)),
-        };
-    };
-    const buildWidgetOverviewText = (widgets: any[]) => {
-        const lines: string[] = ["Widgets Overview"];
-        widgets.forEach((w) => {
-            const title = String(w?.title || w?.name || "Widget").trim();
-            const type = String(w?.type || "chart").trim();
-            const goal = String(w?.goal || "").trim();
-            lines.push(`${title} (${type})`);
-            if (goal) lines.push(goal);
-        });
-        return lines.join("\n");
-    };
-
-    // Demo-ready fallback: ensure we always have widgets to drive SQL/visualization
-    if (!plan.widgets || plan.widgets.length < 4) {
-        const fallbackPlan = buildFallbackPlanFromSchema(state.schemaInfo);
-        if (fallbackPlan) {
-            plan = fallbackPlan;
-        } else {
-            // As a last resort, synthesize a demo plan so the UI always renders
-            plan = buildDemoPlan(intent?.intent || "Demo Analytics Overview") as any;
-        }
-    }
-
-    plan = filterWidgetsByType(plan);
-    if (disabledTypes.length > 0) {
-        plan = {
-            ...plan,
-            actionable_plan: buildWidgetOverviewText(plan.widgets || []),
-        };
-    }
-
-    if (allowedTypes.length === 0) {
-        return {
-            queryPlan: { ...plan, widgets: [] },
-            errors: ["All widget types are disabled in settings."],
-            status: "No widget types enabled. Update Widget Visibility settings and retry.",
-            messages: [new AIMessage("[PLANNER] All widget types are disabled; cannot generate a plan.")],
-        };
-    }
-
-    return {
-        queryPlan: plan,
-        status: `Professional blueprint generated with ${plan.widgets?.length || 0} high-impact components.`,
-        messages: [new AIMessage(`[PLANNER] ${plan.actionable_plan || 'Architected executive analytics blueprint.'}`)]
-    };
+    return dashboardPlannerAgentImpl(state);
 }
 
 /**
@@ -3383,13 +3884,13 @@ export async function multiQueryOrchestratorAgent(state: typeof AgentState.State
     })();
     const projectContext = state.context?.projectContext || "";
 
-    if (!plan) {
-        const fallbackPlan = buildFallbackPlanFromSchema(state.schemaInfo);
-        if (fallbackPlan) {
-            plan = fallbackPlan;
-        } else {
-            plan = buildDemoPlan(state.intent?.intent || "Demo Analytics Overview") as any;
-        }
+    if (!plan || !plan.widgets || plan.widgets.length === 0) {
+        return {
+            status: "Error: No valid dashboard plan available. Cannot generate SQL.",
+            errors: ["Dashboard plan is missing or empty."],
+            messages: [new AIMessage("[ORCHESTRATOR] Planning failed – no widgets were architected.")],
+            results: []
+        };
     }
 
     // If this is a retry and we have repaired SQL, use it instead of generating new
@@ -3403,239 +3904,145 @@ export async function multiQueryOrchestratorAgent(state: typeof AgentState.State
         };
     }
 
-    // Generate fresh SQL queries
-    const prompt = isMssql ? `Role: Senior SQL Server Engineer & Data Analyst.
-    PROJECT CONTEXT: ${projectContext || "None provided."}
-    SCHEMA: ${JSON.stringify(state.schemaInfo)}
-    RELATIONSHIPS: ${JSON.stringify(state.schemaRelationships || [])}
-    SAMPLES: ${JSON.stringify(state.sampleData)}
-    DASHBOARD_PLAN: ${JSON.stringify(plan)}
-    STRICT SQL SERVER RULES:
-    1. NO LIMIT. Use TOP or OFFSET/FETCH.
-    2. DATE MATH: GETDATE(), DATEADD, DATEDIFF.
-    3. DATE TRUNC: DATEADD(month, DATEDIFF(month, 0, col), 0).
-    4. TEXT/NTEXT: CAST to NVARCHAR(MAX) before comparisons.
-    5. IDENTIFIERS: Use [Table] and [Column] when needed.
-    6. NO ILIKE. Use LIKE with proper collation if needed.
-    7. GROUP BY: Every non-aggregated column must be in GROUP BY.
-    8. Division by zero: use NULLIF(denominator, 0).
-    9. JOINS: Prefer LEFT JOIN when the primary entity might miss matches.
+    const schemaForPrompt = {
+        schemaInfo: state.schemaInfo,
+        relationships: state.schemaRelationships,
+        sampleData: state.sampleData,
+        connectorInstructions: state.context?.connectorInstructions,
+        connectorType: state.context?.connectorType,
+        connectionString,
+        projectContext
+    };
 
-    Return JSON Map: { "widgetId": "SQL" }`
-        : `Role: Senior SQL Engineer & Data Analyst. 
-    PROJECT CONTEXT: ${projectContext || "None provided."}
-    SCHEMA: ${JSON.stringify(state.schemaInfo)}
-    RELATIONSHIPS: ${JSON.stringify(state.schemaRelationships || [])}
-    SAMPLES: ${JSON.stringify(state.sampleData)}
-    DASHBOARD_PLAN: ${JSON.stringify(plan)}
-    STRICT DATA ARCHITECTURE RULES:
-    1. PLAN ADHERENCE: Use the 'metric' and 'dim' defined for each widget in the DASHBOARD_PLAN.
-    2. ZERO HALLUCINATION: Only use tables/columns listed in SCHEMA.
-    3. CASE SENSITIVITY: Use DOUBLE QUOTES for ALL identifiers (e.g. "TableName"."ColumnName").
-    4. TYPE-AWARE AGGREGATES: For 'kpi' widgets, use COALESCE(..., 0).
-    5. RELATIONSHIP NAVIGATOR: Use RELATIONSHIPS for JOINs. Use LEFT JOIN.
-    6. RICH DESCRIPTORS: For tables, select meaningful columns (Name, Status, Date).
-    7. POSTGRESQL RULES: No DATEDIFF(), prefer DATE_TRUNC for month/week grouping, use ILIKE for case-insensitive search, protect division with NULLIF.
+    const filters = (state.context?.runtimeParams as Record<string, any>) || {};
+    const errorLog = (state.errors || []).map(err => ({ id: 'prev_error', error: err }));
 
-    Return JSON Map: { "widgetId": "SQL" }`;
-
-    const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
-    let sqlMap = extractJSON(response.content as string) || {};
-
-    // If the model returned nothing, synthesize safe defaults to keep the demo flowing
-    if (!sqlMap || Object.keys(sqlMap).length === 0) {
-        if ((plan as any).demo) {
-            sqlMap = buildDemoSql(plan);
-        } else {
-            const fallbackSql = buildFallbackSql(plan, state.schemaInfo);
-            if (fallbackSql) {
-                sqlMap = fallbackSql.sqlMap;
-                plan = fallbackSql.plan || plan;
-            } else {
-                // Force demo mode if nothing usable
-                plan = buildDemoPlan(state.intent?.intent || "Demo Analytics Overview") as any;
-                sqlMap = buildDemoSql(plan);
-            }
-        }
-    }
+    // Use our high-performance parallel generator
+    const sqlMap = await runQueryGenerator(plan, schemaForPrompt, filters, errorLog, true);
 
     return {
         queryPlan: plan,
         queryValidation: sqlMap,
         sqlQueries: Object.values(sqlMap),
-        status: "Synthesized multi-query set with rich column selection.",
-        messages: [new AIMessage(`[ORCHESTRATOR] Generated ${Object.keys(sqlMap).length} targeted SQL statements with deep column resolution.`)]
+        status: "Synthesized multi-query set with parallel expert agents.",
+        messages: [new AIMessage(`[ORCHESTRATOR] Generated ${Object.keys(sqlMap).length} targeted SQL statements with Expert-per-Widget orchestration.`)]
     };
-}
-
-/**
- * Build a resilient fallback plan when the LLM returns an empty plan.
- */
-function buildFallbackPlanFromSchema(schemaInfo: Record<string, any> | undefined) {
-    const entry = Object.entries(schemaInfo || {}).find(([, info]) => (info as any)?.columns?.length);
-    if (!entry) return null;
-
-    const [tableName, info] = entry as [string, any];
-    const columns = info?.columns || [];
-    const getName = (col: any) => col?.name || col?.column_name;
-    const numericCol = columns.find((c: any) => categorizeDataType(c.data_type || c.type || "") === "numeric");
-    const temporalCol = columns.find((c: any) => isTemporalType(c.data_type || c.type || ""));
-    const textCol = columns.find((c: any) => isTextType(c.data_type || c.type || ""));
-    const idCol = columns.find((c: any) => c.isPrimary || getName(c) === "id") || columns[0];
-
-    const widgets = [
-        {
-            id: "w_kpi_total",
-            type: "kpi",
-            title: "Total Records",
-            goal: `Row count for ${tableName}`,
-            metric: "count_star",
-            dim: null,
-            table: tableName,
-        },
-        {
-            id: "w_kpi_sum",
-            type: "kpi",
-            title: numericCol ? `Total ${getName(numericCol)}` : "Total Entities",
-            goal: "Aggregate numeric health",
-            metric: getName(numericCol) || getName(idCol),
-            dim: null,
-            table: tableName,
-        },
-        {
-            id: "w_trend",
-            type: "line",
-            title: "Activity Trend",
-            goal: "Recent velocity over time",
-            metric: getName(numericCol) || getName(idCol),
-            dim: getName(temporalCol) || getName(idCol),
-            table: tableName,
-        },
-        {
-            id: "w_top_category",
-            type: "bar",
-            title: textCol ? `Top ${getName(textCol)}` : "Top Entities",
-            goal: "Breakdown by category",
-            metric: getName(numericCol) || getName(idCol),
-            dim: getName(textCol) || getName(idCol),
-            table: tableName,
-        },
-        {
-            id: "w_distribution",
-            type: "pie",
-            title: "Composition",
-            goal: "Share by category",
-            metric: getName(numericCol) || getName(idCol),
-            dim: getName(textCol) || getName(idCol),
-            table: tableName,
-        },
-        {
-            id: "w_table",
-            type: "table",
-            title: "Recent Records",
-            goal: "Drill-down table",
-            metric: "*",
-            dim: null,
-            table: tableName,
-        },
-    ];
-
-    return {
-        title: `${tableName} Overview`,
-        actionable_plan: `Auto-generated fallback plan to guarantee demo output using ${tableName}.`,
-        widgets,
-    } as any;
 }
 
 /**
  * Build safe fallback SQL when the LLM returns nothing.
  */
-function buildFallbackSql(plan: any, schemaInfo: Record<string, any> | undefined) {
+function buildFallbackSql(plan: any, schemaInfo: Record<string, any> | undefined, isMssql = false) {
     const entry = Object.entries(schemaInfo || {}).find(([, info]) => (info as any)?.columns?.length);
     if (!entry) return null;
     const [tableName, info] = entry as [string, any];
     const columns = info?.columns || [];
     const getName = (col: any) => col?.name || col?.column_name;
+    const quoteIdent = (name: string) => {
+        const raw = String(name || "").trim();
+        if (isMssql) return `[${raw.replace(/]/g, "]]")}]`;
+        return `"${raw.replace(/"/g, '""')}"`;
+    };
+    const quoteCol = (col: any) => quoteIdent(getName(col) || String(col || ""));
+    const tableRef = quoteIdent(tableName);
     const numericCol = columns.find((c: any) => categorizeDataType(c.data_type || c.type || "") === "numeric");
     const temporalCol = columns.find((c: any) => isTemporalType(c.data_type || c.type || ""));
     const textCol = columns.find((c: any) => isTextType(c.data_type || c.type || ""));
     const idCol = columns.find((c: any) => c.isPrimary || getName(c) === "id") || columns[0];
-    const columnNames = columns.slice(0, 8).map((c: any) => `"${getName(c)}"`).join(", ");
+    const columnNames = columns.map((c: any) => quoteCol(c)).join(", ") || "*";
 
     const map: Record<string, string> = {};
-    const widgets = plan?.widgets || [];
+    const widgets = Array.isArray(plan?.widgets) && plan.widgets.length > 0
+        ? plan.widgets
+        : [
+            { id: "w_kpi_total", type: "kpi" },
+            { id: "w_kpi_sum", type: "kpi" },
+            { id: "w_trend", type: "line" },
+            { id: "w_top_category", type: "bar" },
+            { id: "w_distribution", type: "pie" },
+            { id: "w_table", type: "table" }
+        ];
 
-    const findId = (fallbackId: string, predicate: (w: any) => boolean) => {
-        const found = widgets.find(predicate);
-        return found?.id || fallbackId;
-    };
+    const numericValueExpr = numericCol ? `COALESCE(SUM(${quoteCol(numericCol)}), 0)` : "COUNT(*)";
+    const categoryCol = textCol || idCol;
+    const categoryRef = quoteCol(categoryCol);
+    const orderColRef = temporalCol ? quoteCol(temporalCol) : quoteCol(idCol);
+    let kpiIndex = 0;
 
-    const totalId = findId("w_kpi_total", (w) => w.type === "kpi");
-    map[totalId] = `SELECT COUNT(*) AS total_records FROM "${tableName}";`;
+    widgets.forEach((widget: any) => {
+        const widgetId = String(widget?.id || "").trim();
+        if (!widgetId) return;
+        const widgetType = String(widget?.type || "").toLowerCase();
 
-    const sumId = findId("w_kpi_sum", (w) => w.type === "kpi" && w.id !== totalId);
-    map[sumId] = numericCol
-        ? `SELECT COALESCE(SUM("${getName(numericCol)}"), 0) AS total_value FROM "${tableName}";`
-        : `SELECT COUNT(DISTINCT "${getName(idCol)}") AS total_entities FROM "${tableName}";`;
+        if (widgetType === "kpi") {
+            kpiIndex += 1;
+            if (kpiIndex === 1) {
+                map[widgetId] = `SELECT COUNT(*) AS total_records FROM ${tableRef};`;
+            } else if (numericCol) {
+                map[widgetId] = `SELECT COALESCE(SUM(${quoteCol(numericCol)}), 0) AS total_value FROM ${tableRef};`;
+            } else {
+                map[widgetId] = `SELECT COUNT(DISTINCT ${quoteCol(idCol)}) AS total_entities FROM ${tableRef};`;
+            }
+            return;
+        }
 
-    const trendId = findId("w_trend", (w) => w.type === "line");
-    if (temporalCol) {
-        const valueExpr = numericCol ? `COALESCE(SUM("${getName(numericCol)}"), 0)` : "COUNT(*)";
-        map[trendId] = `
-SELECT DATE_TRUNC('day', "${getName(temporalCol)}") AS day, ${valueExpr} AS value
-FROM "${tableName}"
+        if (widgetType === "line" || widgetType === "area") {
+            if (temporalCol) {
+                if (isMssql) {
+                    map[widgetId] = `SELECT TOP 90 CAST(${quoteCol(temporalCol)} AS date) AS day, ${numericValueExpr} AS value
+FROM ${tableRef}
+GROUP BY CAST(${quoteCol(temporalCol)} AS date)
+ORDER BY day DESC;`;
+                } else {
+                    map[widgetId] = `SELECT DATE_TRUNC('day', ${quoteCol(temporalCol)}) AS day, ${numericValueExpr} AS value
+FROM ${tableRef}
 GROUP BY 1
 ORDER BY 1 DESC
 LIMIT 90;`;
-    } else {
-        map[trendId] = `
-SELECT "${getName(idCol)}" AS seq, ${numericCol ? `"${getName(numericCol)}"` : "1"} AS value
-FROM "${tableName}"
-ORDER BY "${getName(idCol)}" DESC
+                }
+            } else if (isMssql) {
+                map[widgetId] = `SELECT TOP 50 ${quoteCol(idCol)} AS seq, ${numericCol ? quoteCol(numericCol) : "1"} AS value
+FROM ${tableRef}
+ORDER BY ${quoteCol(idCol)} DESC;`;
+            } else {
+                map[widgetId] = `SELECT ${quoteCol(idCol)} AS seq, ${numericCol ? quoteCol(numericCol) : "1"} AS value
+FROM ${tableRef}
+ORDER BY ${quoteCol(idCol)} DESC
 LIMIT 50;`;
-    }
+            }
+            return;
+        }
 
-    const catId = findId("w_top_category", (w) => w.type === "bar");
-    const catCol = textCol || idCol;
-    const catValue = numericCol ? `COALESCE(SUM("${getName(numericCol)}"), 0)` : "COUNT(*)";
-    map[catId] = `
-SELECT "${getName(catCol)}" AS category, ${catValue} AS value
-FROM "${tableName}"
+        if (widgetType === "table") {
+            if (isMssql) {
+                map[widgetId] = `SELECT TOP 50 ${columnNames}
+FROM ${tableRef}
+ORDER BY ${orderColRef} DESC;`;
+            } else {
+                map[widgetId] = `SELECT ${columnNames}
+FROM ${tableRef}
+ORDER BY ${orderColRef} DESC
+LIMIT 50;`;
+            }
+            return;
+        }
+
+        // Fallback for bar/pie/donut/scatter/funnel/other chart types
+        if (isMssql) {
+            map[widgetId] = `SELECT TOP 10 ${categoryRef} AS category, ${numericValueExpr} AS value
+FROM ${tableRef}
+GROUP BY ${categoryRef}
+ORDER BY value DESC;`;
+        } else {
+            map[widgetId] = `SELECT ${categoryRef} AS category, ${numericValueExpr} AS value
+FROM ${tableRef}
 GROUP BY 1
 ORDER BY value DESC
 LIMIT 10;`;
-
-    const distId = findId("w_distribution", (w) => w.type === "pie");
-    map[distId] = map[catId];
-
-    const tableId = findId("w_table", (w) => w.type === "table");
-    const orderCol = temporalCol ? `"${getName(temporalCol)}"` : `"${getName(idCol)}"`;
-    map[tableId] = `
-SELECT ${columnNames || "*"}
-FROM "${tableName}"
-ORDER BY ${orderCol} DESC
-LIMIT 50;`;
+        }
+    });
 
     return { sqlMap: map, plan };
-}
-
-/**
- * Build a demo plan that does not require a live database (for offline/demo use).
- */
-function buildDemoPlan(intent: string) {
-    return {
-        demo: true,
-        title: "Demo Commerce Performance",
-        actionable_plan: `Auto-generated demo plan for "${intent}" so the UI always renders.`,
-        widgets: [
-            { id: "w_kpi_revenue", type: "kpi", title: "Total Revenue", goal: "Overall revenue", metric: "revenue" },
-            { id: "w_kpi_orders", type: "kpi", title: "Total Orders", goal: "Order volume", metric: "orders" },
-            { id: "w_kpi_aov", type: "kpi", title: "Avg Order Value", goal: "Efficiency", metric: "aov" },
-            { id: "w_trend", type: "line", title: "Daily Revenue", goal: "Trend over time", metric: "revenue", dim: "date" },
-            { id: "w_bar", type: "bar", title: "Top Categories", goal: "Category performance", metric: "revenue", dim: "category" },
-            { id: "w_table", type: "table", title: "Recent Orders", goal: "Detail drilldown", metric: "*", dim: null },
-        ],
-    };
 }
 
 /**
@@ -3649,69 +4056,6 @@ function buildDemoSql(plan: any) {
     return sqlMap;
 }
 
-/**
- * Build demo results so downstream agents can render without DB access.
- */
-function buildDemoResults(plan: any) {
-    const today = new Date();
-    const days = Array.from({ length: 14 }).map((_, idx) => {
-        const d = new Date(today);
-        d.setDate(d.getDate() - (13 - idx));
-        return { date: d.toISOString().slice(0, 10), revenue: 5000 + idx * 320, orders: 80 + idx * 4 };
-    });
-
-    return (plan.widgets || []).map((w: any) => {
-        if (w.type === "kpi") {
-            const value = w.id === "w_kpi_revenue" ? 742000 : w.id === "w_kpi_orders" ? 14820 : 50.1;
-            return {
-                widgetId: w.id,
-                widgetTitle: w.title,
-                type: "kpi",
-                data: [{ value }],
-                columns: ["value"],
-                goal: w.goal,
-            };
-        }
-        if (w.type === "line") {
-            return {
-                widgetId: w.id,
-                widgetTitle: w.title,
-                type: "line",
-                data: days.map(d => ({ date: d.date, value: d.revenue })),
-                columns: ["date", "value"],
-                goal: w.goal,
-            };
-        }
-        if (w.type === "bar" || w.type === "pie") {
-            const categories = [
-                { category: "Electronics", value: 220000 },
-                { category: "Apparel", value: 185000 },
-                { category: "Home", value: 142000 },
-                { category: "Sports", value: 88000 },
-            ];
-            return {
-                widgetId: w.id,
-                widgetTitle: w.title,
-                type: w.type,
-                data: categories,
-                columns: ["category", "value"],
-                goal: w.goal,
-            };
-        }
-        return {
-            widgetId: w.id,
-            widgetTitle: w.title,
-            type: "table",
-            data: [
-                { order_id: 10422, customer: "Acme Corp", date: today.toISOString().slice(0, 10), revenue: 1299.99 },
-                { order_id: 10421, customer: "Northwind", date: today.toISOString().slice(0, 10), revenue: 899.5 },
-                { order_id: 10420, customer: "Globex", date: today.toISOString().slice(0, 10), revenue: 450.0 },
-            ],
-            columns: ["order_id", "customer", "date", "revenue"],
-            goal: w.goal,
-        };
-    });
-}
 /**
  * 5. SECURITY VALIDATOR
  */
@@ -3759,43 +4103,17 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
 
     yield { type: "progress", stage: "starting", message: `Preparing to execute ${totalQueries} queries...` };
 
-    // Demo mode: short-circuit with synthetic data so the UI renders even without a DB
-    if ((state.queryPlan as any)?.demo) {
-        yield { type: "progress", stage: "demo", message: "Using demo data mode..." };
-        const demoResults = buildDemoResults(state.queryPlan as any);
-        
-        // Simulate progress for demo mode
-        for (let i = 0; i < totalQueries; i++) {
-            yield { 
-                type: "query_progress", 
-                widgetId: Object.keys(sqlMap)[i],
-                stage: "executing",
-                message: `Executing demo query ${i + 1}/${totalQueries}...`
-            };
-            await new Promise(resolve => setTimeout(resolve, 200));
-            
-            yield { 
-                type: "query_complete", 
-                widgetId: Object.keys(sqlMap)[i],
-                result: demoResults[i],
-                message: `Demo query ${i + 1}/${totalQueries} completed`
-            };
-        }
-        
-        yield { type: "complete", results: demoResults, message: "All demo queries completed successfully" };
-        return;
-    }
 
     const results: any[] = [];
 
     // Execute queries sequentially with progress updates to enable proper streaming
     for (const [id, sql] of Object.entries(sqlMap)) {
         const wInfo = state.queryPlan?.widgets?.find((w: any) => w.id === id);
-        
+
         try {
             // Yield query start
-            yield { 
-                type: "query_progress", 
+            yield {
+                type: "query_progress",
                 widgetId: id,
                 widgetTitle: wInfo?.title || "Metric",
                 stage: "executing",
@@ -3804,7 +4122,7 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
             };
 
             let currentSql = sql as string;
-            let validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+            let validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType, state.schema);
             let attempts = 0;
             while (!validation.ok && attempts < 2) {
                 attempts += 1;
@@ -3826,7 +4144,7 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
                 } catch {
                     break;
                 }
-                validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType);
+                validation = validateSqlAgainstInstructions(currentSql, connectionString, connectorInstructions, connectorType, state.schema);
             }
             if (!validation.ok) {
                 yield {
@@ -3842,7 +4160,35 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
             }
 
             console.log(`[EXECUTOR] Running widget ${id}...`);
-            const data = await dbGateway.runQuery(currentSql, connectionString);
+            const isMssqlExec = detectIsMssql(connectionString, connectorType);
+            const templatedSql = renderDynamicSqlTemplate(currentSql, (state.context as any)?.runtimeParams || {}, isMssqlExec);
+            const contextTablePagination = ((state.context as any)?.tablePagination || undefined) as Record<string, { page: number; pageSize: number; offset?: number; includeTotal?: boolean }> | undefined;
+            const resolvedTablePage = resolveTablePaginationForId(id, currentSql, contextTablePagination);
+            const sqlTokenMatch = String(currentSql || "").match(/\{\{\s*(?:size|offset|page|pageSize|page_size|rowsOnPage|storeSize|storePage)\s*:\s*([^}\s]+)\s*\}\}/i);
+            const sqlTargetId = sqlTokenMatch?.[1]?.trim();
+            const isTableWidget = String((wInfo as any)?.type || "").toLowerCase() === "table";
+            const runtimeDerivedPage = isTableWidget
+                ? (resolvedTablePage
+                    || derivePaginationFromRuntimeParams(id, (state.context as any)?.runtimeParams || {}, sqlTargetId)
+                    || { page: 0, pageSize: 25, offset: 0, includeTotal: true })
+                : undefined;
+            const shouldApplyRuntimePaging = Boolean(runtimeDerivedPage) && isTableWidget;
+            const runtimeSql = shouldApplyRuntimePaging && runtimeDerivedPage
+                ? applyRuntimePaginationToSql(templatedSql, runtimeDerivedPage.page, runtimeDerivedPage.pageSize, runtimeDerivedPage.offset, isMssqlExec)
+                : templatedSql;
+            if (isPlaceholderSqlQuery(runtimeSql)) {
+                yield {
+                    type: "query_error",
+                    widgetId: id,
+                    widgetTitle: wInfo?.title || "Metric",
+                    error: "SQL generation produced placeholder SQL. Regenerate plan/SQL.",
+                    message: `Placeholder SQL detected for ${wInfo?.title || id}`,
+                    sql: runtimeSql
+                };
+                completedQueries++;
+                continue;
+            }
+            const data = await dbGateway.runQuery(runtimeSql, connectionString);
 
             const result = {
                 widgetId: id,
@@ -3853,28 +4199,28 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
                 plan_dim: (wInfo as any)?.dim,
                 data: Array.isArray(data) && !(data as any).error ? data : [],
                 columns: (Array.isArray(data) && data.length > 0 && !(data as any).error) ? Object.keys(data[0]) : [],
-                sql: currentSql,
+                sql: runtimeSql,
                 error: (data as any)?.error || null
             };
 
             results.push(result);
             completedQueries++;
-            
+
             // Yield query completion
-            yield { 
-                type: "query_complete", 
+            yield {
+                type: "query_complete",
                 widgetId: id,
                 widgetTitle: wInfo?.title || "Metric",
                 result: result,
                 completed: completedQueries,
                 total: totalQueries,
                 message: `Completed ${wInfo?.title || id} (${completedQueries}/${totalQueries})`,
-                sql: sql  // Include SQL in completion too
+                sql: runtimeSql
             };
 
         } catch (err: any) {
             completedQueries++;
-            
+
             const errorResult = {
                 widgetId: id,
                 widgetTitle: wInfo?.title || "Metric",
@@ -3888,8 +4234,8 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
             results.push(errorResult);
 
             // Yield query error
-            yield { 
-                type: "query_error", 
+            yield {
+                type: "query_error",
                 widgetId: id,
                 widgetTitle: wInfo?.title || "Metric",
                 error: err.message,
@@ -3903,8 +4249,8 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
     // Check for critical connection errors
     const criticalError = results.find(r => r.error && (r.error.includes("Not connected") || r.error.includes("Connection failed")));
     if (criticalError) {
-        yield { 
-            type: "error", 
+        yield {
+            type: "error",
             message: "Database Connection Failure: The AI could not connect to your Postgres instance. Please check your POSTGRES_URL in .env.",
             results: results
         };
@@ -3912,9 +4258,9 @@ export async function* mcpCallingAgentStream(state: typeof AgentState.State) {
     }
 
     const successCount = results.filter(r => !r.error).length;
-    
-    yield { 
-        type: "complete", 
+
+    yield {
+        type: "complete",
         results: results,
         successCount,
         totalCount: totalQueries,
@@ -3932,15 +4278,6 @@ export async function mcpCallingAgent(state: typeof AgentState.State) {
     const sqlMap = state.queryValidation;
     const connectionString = state.context?.connectionString || state.context?.dbUrl || state.context?.postgresUrl || state.context?.mssqlUrl || undefined;
 
-    // Demo mode: short-circuit with synthetic data so the UI renders even without a DB
-    if ((state.queryPlan as any)?.demo) {
-        const demoResults = buildDemoResults(state.queryPlan as any);
-        return {
-            results: demoResults,
-            status: "Demo data loaded.",
-            messages: [new AIMessage("[EXECUTOR] Using built-in demo dataset (no database required).")]
-        };
-    }
 
     const results: any[] = [];
 
@@ -3948,8 +4285,35 @@ export async function mcpCallingAgent(state: typeof AgentState.State) {
     const tasks = Object.entries(sqlMap).map(async ([id, sql]) => {
         try {
             console.log(`[EXECUTOR] Running widget ${id}...`);
-            const data = await dbGateway.runQuery(sql as string, connectionString);
+            const isMssqlExec = detectIsMssql(connectionString, (state.schema as any)?.connectorType || (state.context as any)?.connectorType);
+            const templatedSql = renderDynamicSqlTemplate(sql as string, (state.context as any)?.runtimeParams || {}, isMssqlExec);
             const wInfo = state.queryPlan?.widgets?.find((w: any) => w.id === id);
+            const contextTablePagination = ((state.context as any)?.tablePagination || undefined) as Record<string, { page: number; pageSize: number; offset?: number; includeTotal?: boolean }> | undefined;
+            const resolvedTablePage = resolveTablePaginationForId(id, sql as string, contextTablePagination);
+            const sqlTokenMatch = String(sql || "").match(/\{\{\s*(?:size|offset|page|pageSize|page_size|rowsOnPage|storeSize|storePage)\s*:\s*([^}\s]+)\s*\}\}/i);
+            const sqlTargetId = sqlTokenMatch?.[1]?.trim();
+            const isTableWidget = String((wInfo as any)?.type || "").toLowerCase() === "table";
+            const runtimeDerivedPage = isTableWidget
+                ? (resolvedTablePage
+                    || derivePaginationFromRuntimeParams(id, (state.context as any)?.runtimeParams || {}, sqlTargetId)
+                    || { page: 0, pageSize: 10, offset: 0, includeTotal: true })
+                : undefined;
+            const shouldApplyRuntimePaging = Boolean(runtimeDerivedPage) && isTableWidget;
+            const runtimeSql = shouldApplyRuntimePaging && runtimeDerivedPage
+                ? applyRuntimePaginationToSql(templatedSql, runtimeDerivedPage.page, runtimeDerivedPage.pageSize, runtimeDerivedPage.offset, isMssqlExec)
+                : templatedSql;
+            if (isPlaceholderSqlQuery(runtimeSql)) {
+                return {
+                    widgetId: id,
+                    widgetTitle: wInfo?.title || "Metric",
+                    type: wInfo?.type || "table",
+                    columns: [],
+                    error: "SQL generation produced placeholder SQL. Regenerate plan/SQL.",
+                    data: [],
+                    sql: runtimeSql
+                };
+            }
+            const data = await dbGateway.runQuery(runtimeSql, connectionString);
 
             if (data && (data as any).error) {
                 return {
@@ -3959,10 +4323,13 @@ export async function mcpCallingAgent(state: typeof AgentState.State) {
                     columns: [],
                     error: (data as any).error,
                     data: [],
-                    sql: sql
+                    sql: runtimeSql
                 };
             }
 
+            const resolvedColumns = Array.isArray(data) && data.length > 0
+                ? Object.keys(data[0] || {}).filter((key) => key !== "__rowKey")
+                : [];
             return {
                 widgetId: id,
                 widgetTitle: wInfo?.title || "Metric",
@@ -3971,8 +4338,8 @@ export async function mcpCallingAgent(state: typeof AgentState.State) {
                 plan_metric: (wInfo as any)?.metric,
                 plan_dim: (wInfo as any)?.dim,
                 data: Array.isArray(data) ? data : [],
-                columns: (Array.isArray(data) && data.length > 0) ? Object.keys(data[0]) : [],
-                sql: sql
+                columns: resolvedColumns,
+                sql: runtimeSql
             };
         } catch (err: any) {
             return {
@@ -4022,23 +4389,23 @@ export async function* analyticsAgentStream(state: typeof AgentState.State) {
         const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
         const analysis = extractJSON(response.content as string) || { insights: ["Data patterns analyzed."] };
 
-        yield { 
-            type: "progress", 
-            stage: "generating_insights", 
-            message: `Generated ${analysis.insights?.length || 0} insights and ${analysis.anomalies?.length || 0} anomaly detections` 
+        yield {
+            type: "progress",
+            stage: "generating_insights",
+            message: `Generated ${analysis.insights?.length || 0} insights and ${analysis.anomalies?.length || 0} anomaly detections`
         };
 
-        yield { 
-            type: "complete", 
+        yield {
+            type: "complete",
             analytics: analysis,
             insights: analysis.insights,
             message: "Analytics analysis complete"
         };
 
     } catch (error) {
-        yield { 
-            type: "error", 
-            message: `Analytics analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}` 
+        yield {
+            type: "error",
+            message: `Analytics analysis failed: ${error instanceof Error ? error.message : 'Unknown error'}`
         };
     }
 }
@@ -4076,9 +4443,9 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
 
     for (const res of results) {
         processedWidgets++;
-        
-        yield { 
-            type: "widget_progress", 
+
+        yield {
+            type: "widget_progress",
             widgetId: res.widgetId,
             widgetTitle: res.widgetTitle,
             stage: "processing",
@@ -4087,8 +4454,8 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
 
         if (res.error || res.type === 'kpi' || res.type === 'table') {
             widgetSpecs.push(res);
-            yield { 
-                type: "widget_complete", 
+            yield {
+                type: "widget_complete",
                 widgetId: res.widgetId,
                 widgetTitle: res.widgetTitle,
                 result: res,
@@ -4106,8 +4473,8 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
             SAMPLE: ${JSON.stringify(res.data.slice(0, 2))}
             Return ONLY JSON. Use "table" for data source.`;
 
-            yield { 
-                type: "widget_progress", 
+            yield {
+                type: "widget_progress",
                 widgetId: res.widgetId,
                 widgetTitle: res.widgetTitle,
                 stage: "generating_spec",
@@ -4120,8 +4487,8 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
             const widgetWithSpec = { ...res, vegaSpec };
             widgetSpecs.push(widgetWithSpec);
 
-            yield { 
-                type: "widget_complete", 
+            yield {
+                type: "widget_complete",
                 widgetId: res.widgetId,
                 widgetTitle: res.widgetTitle,
                 result: widgetWithSpec,
@@ -4131,9 +4498,9 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
         } catch (error) {
             const errorResult = { ...res, error: error instanceof Error ? error.message : 'Visualization generation failed' };
             widgetSpecs.push(errorResult);
-            
-            yield { 
-                type: "widget_error", 
+
+            yield {
+                type: "widget_error",
                 widgetId: res.widgetId,
                 widgetTitle: res.widgetTitle,
                 error: error instanceof Error ? error.message : 'Unknown error',
@@ -4142,8 +4509,8 @@ export async function* chartDesignAgentStream(state: typeof AgentState.State) {
         }
     }
 
-    yield { 
-        type: "complete", 
+    yield {
+        type: "complete",
         results: widgetSpecs,
         message: `Visualization design complete: ${widgetSpecs.filter(w => !w.error).length}/${totalWidgets} successful`
     };
@@ -4241,13 +4608,13 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
 
     const baseResults = results.length > 0 ? results : fallbackFromPlan();
 
-    const normalizedResults = baseResults.map((res, index) => {
+    const normalizedResults = baseResults.map((res: any, index: number) => {
         const fallbackId = res.widgetTitle ? `w_${res.widgetTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_")}` : `widget_${index + 1}`;
         const widgetId = String(res.widgetId || fallbackId);
         return { ...res, widgetId };
     });
 
-    const validIds = new Set(normalizedResults.map((res) => res.widgetId));
+    const validIds = new Set(normalizedResults.map((res: any) => res.widgetId));
     const normalizedLayout = layoutFromState
         .filter((item: any) => item && item.i && validIds.has(String(item.i)))
         .map((item: any) => ({
@@ -4258,7 +4625,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
             h: Number(item.h) || 4,
         }));
 
-    const layoutIds = new Set(normalizedLayout.map((item) => item.i));
+    const layoutIds = new Set(normalizedLayout.map((item: any) => item.i));
     const fallbackLayout: any[] = [];
 
     const getDefaultSize = (type?: string) => {
@@ -4286,7 +4653,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
         return position;
     };
 
-    normalizedResults.forEach((res) => {
+    normalizedResults.forEach((res: any) => {
         if (!layoutIds.has(res.widgetId)) {
             fallbackLayout.push(placeNext(res.widgetId, getDefaultSize(res.type)));
             layoutIds.add(res.widgetId);
@@ -4294,9 +4661,9 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
     });
 
     const mergedLayout = [...normalizedLayout, ...fallbackLayout];
-    const layoutById = new Map(mergedLayout.map((item) => [item.i, item]));
+    const layoutById = new Map(mergedLayout.map((item: any) => [item.i, item]));
 
-    const finalWidgets = normalizedResults.map(res => {
+    const finalWidgets = normalizedResults.map((res: any) => {
         const grid = layoutById.get(res.widgetId) || { x: 0, y: 0, w: 6, h: 4 };
 
         const safeColumns = Array.isArray(res.columns) ? res.columns : [];
@@ -4307,7 +4674,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
             type: res.type,
             goal: res.goal,
             data: res.data,
-            vegaSpec: res.vegaSpec,
+            vegaSpec: (res as any).vegaSpec,
             kpiConfig: res.type === 'kpi' ? {
                 valueField: res.plan_metric || safeColumns.find((c: string) => ['total', 'amount', 'revenue', 'count', 'sum'].some(k => c.toLowerCase().includes(k))) || safeColumns[0],
                 format: 'compact'
@@ -4323,7 +4690,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
         dashboard: {
             id: `dash_${Date.now()}`,
             name: (state.queryPlan as any)?.title || "AI Insight Hub",
-            widgets: finalWidgets.map(w => ({
+            widgets: finalWidgets.map((w: any) => ({
                 ...w,
                 goal: w.goal // Explicitly pass the goal for the UI
             })),
@@ -4380,7 +4747,7 @@ export async function qualityCheckAgent(state: typeof AgentState.State) {
         // Check 1: Empty data
         if (result.data && result.data.length === 0 && !result.error) {
             errors.push(`No data returned for "${result.widgetTitle || result.widgetId}".`);
-            needsRetry.push(result.widgetId);
+            needsRetry.push(String(result.widgetId));
             emptyWidgets.push(result);
             continue;
         }
@@ -4388,7 +4755,7 @@ export async function qualityCheckAgent(state: typeof AgentState.State) {
         // Check 2: Error results
         if (result.error) {
             errors.push(`Execution error for "${result.widgetTitle || result.widgetId}": ${result.error}`);
-            needsRetry.push(result.widgetId);
+            needsRetry.push(String(result.widgetId));
             continue;
         }
 
@@ -4486,11 +4853,13 @@ INSTRUCTIONS:
 Generate ONLY the SQL queries for the failed widgets. Return in the same format as the original SQL generator.
 `;
 
-    // Use the same model as the original SQL generator
-    const model = new ChatOpenAI({
-        modelName: "gpt-4o",
+    // Use shared model initialization with a higher-quality OpenAI fallback for repair tasks.
+    const model = createDefaultChatModel({
+        logPrefix: "[LLM][SQL_REPAIR]",
+        openAIFallbackModel: "gpt-4o",
         temperature: 0.1,
         maxTokens: 4000,
+        timeoutMs: 900000,
     });
 
     try {

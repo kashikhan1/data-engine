@@ -3,7 +3,7 @@ import { z } from "zod";
 // ============================================================================
 // WIDGET TYPES
 // ============================================================================
-export const WidgetTypeSchema = z.enum([
+export const ALL_WIDGET_TYPES = [
     "kpi",
     "line",
     "area",
@@ -17,7 +17,24 @@ export const WidgetTypeSchema = z.enum([
     "scatter",
     "filter",
     "markdown",
-]);
+] as const;
+
+export const PLANNER_WIDGET_TYPE_ORDER = [
+    "kpi",
+    "line",
+    "area",
+    "bar",
+    "pie",
+    "donut",
+    "scatter",
+    "map",
+    "funnel",
+    "cohort",
+    "markdown",
+    "table",
+] as const;
+
+export const WidgetTypeSchema = z.enum(ALL_WIDGET_TYPES);
 
 export type WidgetType = z.infer<typeof WidgetTypeSchema>;
 

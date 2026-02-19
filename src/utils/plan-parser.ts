@@ -28,6 +28,7 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
     const widgets: any[] = [];
     let widgetId = 1;
     const coerceTypeByText = (current: string, title: string, goal: string) => {
+        if (current === 'table' || current === 'markdown') return current;
         const text = `${title} ${goal}`.toLowerCase();
         if (/kpi|key performance|stat|metric/.test(text)) return 'kpi';
         return current;

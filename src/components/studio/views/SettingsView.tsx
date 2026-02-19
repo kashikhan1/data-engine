@@ -15,14 +15,13 @@ const SettingsView: React.FC = () => {
     }, [projectContext]);
 
     const navGroups = [
-                {
-                    label: 'Workspace',
-                    items: [
-                        { name: 'General', icon: 'settings' },
-                        { name: 'Project Overview', icon: 'info' },
-                        { name: 'Admin & Security', icon: 'security' },
-                        { name: 'Members', icon: 'group' },
-                        { name: 'Billing', icon: 'payments' },
+        {
+            label: 'Workspace',
+            items: [
+                { name: 'General', icon: 'settings' },
+                { name: 'Admin & Security', icon: 'security' },
+                { name: 'Members', icon: 'group' },
+                { name: 'Billing', icon: 'payments' },
             ]
         },
         {
@@ -74,8 +73,8 @@ const SettingsView: React.FC = () => {
                                         key={item.name}
                                         onClick={() => setActiveTab(item.name)}
                                         className={`w-full flex items-center gap-3 px-3 py-2 rounded-lg text-sm font-medium transition-colors ${activeTab === item.name
-                                                ? 'bg-[#135bec]/10 text-white'
-                                                : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
+                                            ? 'bg-[#135bec]/10 text-white'
+                                            : 'text-slate-400 hover:text-slate-200 hover:bg-white/5'
                                             }`}
                                     >
                                         <span className={`material-symbols-outlined text-[18px] ${activeTab === item.name ? 'text-[#135bec]' : ''}`}>
@@ -118,49 +117,8 @@ const SettingsView: React.FC = () => {
                         </p>
                     </div>
 
-                    {activeTab === 'Project Overview' ? (
-                        <div className="bg-[#111318] border border-[#2d3748] rounded-2xl overflow-hidden shadow-xl">
-                            <div className="p-6 border-b border-[#2d3748] flex items-center justify-between">
-                                <div>
-                                    <h2 className="text-lg font-bold text-white">About This Project</h2>
-                                    <p className="text-xs text-slate-500 mt-0.5">Give the agents domain context, business goals, and key definitions.</p>
-                                </div>
-                                <div className="flex items-center gap-2">
-                                    <button
-                                        onClick={() => {
-                                            setProjectContext(projectDraft.trim());
-                                            setProjectSavedAt(new Date().toLocaleTimeString());
-                                        }}
-                                        className="px-3 py-1.5 rounded-lg border border-[#2d3748] text-[11px] font-bold text-slate-300 hover:text-white hover:bg-white/5 transition-all"
-                                    >
-                                        Save
-                                    </button>
-                                    <button
-                                        onClick={() => {
-                                            setProjectDraft('');
-                                            setProjectContext('');
-                                            setProjectSavedAt(new Date().toLocaleTimeString());
-                                        }}
-                                        className="px-3 py-1.5 rounded-lg border border-[#2d3748] text-[11px] font-bold text-slate-500 hover:text-white hover:bg-white/5 transition-all"
-                                    >
-                                        Clear
-                                    </button>
-                                </div>
-                            </div>
-                            <div className="p-8 space-y-4">
-                                <textarea
-                                    value={projectDraft}
-                                    onChange={(e) => setProjectDraft(e.target.value)}
-                                    placeholder="Example: We are a B2B subscription analytics platform. Key entities are accounts, subscriptions, invoices, and churn. Primary goals: monitor MRR growth, churn risk, and enterprise segment expansion."
-                                    className="w-full min-h-[220px] bg-[#0b0d11] border border-[#2d3748] rounded-xl p-4 text-sm text-slate-200 focus:outline-none focus:border-[#135bec]/60 transition-colors resize-none"
-                                />
-                                <div className="flex items-center justify-between text-[10px] uppercase tracking-widest text-slate-500">
-                                    <span>Stored locally in this browser</span>
-                                    <span>{projectSavedAt ? `Saved ${projectSavedAt}` : 'Not saved yet'}</span>
-                                </div>
-                            </div>
-                        </div>
-                    ) : activeTab === 'General' ? (
+                    {/* Rendering different tabs */}
+                    {activeTab === 'General' ? (
                         <div className="bg-[#111318] border border-[#2d3748] rounded-2xl overflow-hidden shadow-xl">
                             <div className="p-6 border-b border-[#2d3748] flex items-center justify-between">
                                 <div>
@@ -198,6 +156,40 @@ const SettingsView: React.FC = () => {
                                         </button>
                                     );
                                 })}
+                            </div>
+                        </div>
+                    ) : activeTab === 'Profile' ? (
+                        <div className="bg-[#111318] border border-[#2d3748] rounded-2xl overflow-hidden shadow-xl">
+                            <div className="p-8 flex items-start gap-10">
+                                <div className="flex flex-col items-center gap-4">
+                                    <div className="w-24 h-24 rounded-3xl bg-[#135bec]/20 border border-[#135bec]/40 flex items-center justify-center text-[32px] font-black text-[#135bec] shadow-2xl shadow-blue-900/10">
+                                        M
+                                    </div>
+                                    <button className="px-4 py-2 bg-white/5 border border-white/10 rounded-xl text-[10px] font-black uppercase tracking-widest text-slate-300 hover:text-white transition-all">
+                                        Change Avatar
+                                    </button>
+                                </div>
+                                <div className="flex-1 space-y-6">
+                                    <div className="grid grid-cols-2 gap-6">
+                                        <div className="space-y-2">
+                                            <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Full Name</label>
+                                            <input type="text" defaultValue="Admin User" className="w-full px-4 py-3 bg-[#0a0d11] border border-[#2d3748] rounded-xl text-sm text-white focus:border-[#135bec]/50 outline-none transition-all" />
+                                        </div>
+                                        <div className="space-y-2">
+                                            <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Email Address</label>
+                                            <input type="email" defaultValue="admin@luman.ai" className="w-full px-4 py-3 bg-[#0a0d11] border border-[#2d3748] rounded-xl text-sm text-white focus:border-[#135bec]/50 outline-none transition-all opacity-50 cursor-not-allowed" disabled />
+                                        </div>
+                                    </div>
+                                    <div className="space-y-2">
+                                        <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Job Title</label>
+                                        <input type="text" defaultValue="Principal Platform Engineer" className="w-full px-4 py-3 bg-[#0a0d11] border border-[#2d3748] rounded-xl text-sm text-white focus:border-[#135bec]/50 outline-none transition-all" />
+                                    </div>
+                                    <div className="pt-4 border-t border-[#2d3748] flex justify-end gap-3">
+                                        <button className="px-6 py-2.5 bg-[#135bec] text-white rounded-xl text-xs font-bold hover:bg-blue-600 transition-all shadow-lg shadow-blue-900/20 active:scale-95">
+                                            Save Profile
+                                        </button>
+                                    </div>
+                                </div>
                             </div>
                         </div>
                     ) : (

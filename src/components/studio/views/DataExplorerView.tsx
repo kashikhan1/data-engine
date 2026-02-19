@@ -5,7 +5,7 @@ import { dbGateway } from '@/lib/mcp/client';
 import { useConfigStore, useRunStore, useUIStore } from '@/state/stores';
 import { useCreateRun } from '@/hooks/useRunStream';
 import { AgentTimeline } from '@/components/chat/AgentTimeline';
-import { runSchemaDiscovery } from '@/lib/agents/nodes';
+import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
 
 const DataExplorerView: React.FC = () => {
     const { setDiscoveredTables, connectionStatus, discoveredTables, postgresUrl, canonicalPlan, setCanonicalPlan, projectContext, disabledWidgetTypes } = useConfigStore();
@@ -90,9 +90,9 @@ const DataExplorerView: React.FC = () => {
         setError(null);
         try {
             console.log("[Explorer] Manual sync via runSchemaDiscovery agent...");
-                const storedTablesRaw = localStorage.getItem('schema_selected_tables');
-                const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                const data = await runSchemaDiscovery(undefined, { projectContext }, allowedTables);
+            const storedTablesRaw = localStorage.getItem('schema_selected_tables');
+            const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+            const data = await runSchemaDiscovery(undefined, { projectContext }, allowedTables);
 
             if (data) {
                 setTables(data.tables);
@@ -851,7 +851,7 @@ const DataExplorerView: React.FC = () => {
                                     </div>
                                 ) : records.length > 0 ? (
                                     <div className="border border-[#2d3748]/50 rounded-[40px] overflow-hidden shadow-[0_25px_100px_-20px_rgba(0,0,0,0.8)] bg-[#111318] max-w-[1200px] mx-auto">
-                                        <div className="overflow-x-auto custom-scrollbar">
+                                        <div className="max-h-[600px] overflow-auto custom-scrollbar">
                                             <table className="w-full text-xs text-left border-collapse">
                                                 <thead>
                                                     <tr className="bg-[#1a202c]/30 text-slate-500 font-black uppercase tracking-[3px] border-b border-[#2d3748]/50">

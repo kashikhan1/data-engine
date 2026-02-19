@@ -1,5 +1,5 @@
 import { NextRequest } from "next/server";
-import { runDashboardPlannerStream } from "@/lib/agents/nodes";
+import { runDashboardPlannerStream } from "@/lib/agents/dashboard-planner";
 
 export const maxDuration = 900; // 15 minutes
 
@@ -44,11 +44,11 @@ export async function POST(request: NextRequest) {
 
                 try {
                     // Send an immediate "start" event to keep the connection alive
-                    enqueue(`data: ${JSON.stringify({ chunk: "" })}\n\n`);
+                    enqueue(`data: ${JSON.stringify({ kind: "chunk", chunk: "" })}\n\n`);
 
-                    for await (const chunk of runDashboardPlannerStream(query, schema)) {
+                    for await (const item of runDashboardPlannerStream(query, schema)) {
                         if (signal?.aborted) break;
-                        enqueue(`data: ${JSON.stringify({ chunk })}\n\n`);
+                        enqueue(`data: ${JSON.stringify(item)}\n\n`);
                     }
                     close();
                 } catch (err: any) {

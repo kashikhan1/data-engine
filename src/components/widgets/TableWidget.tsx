@@ -3,6 +3,8 @@
 import React, { useEffect, useMemo, useState } from "react";
 import { ChevronUp, ChevronDown, ChevronLeft, ChevronRight } from "lucide-react";
 import styles from "./TableWidget.module.css";
+import { useDashboardStore, useWorkflowStore } from "@/state/stores";
+import type { Filter } from "@/types/dashboard";
 
 interface Column {
     field: string;
@@ -16,12 +18,56 @@ interface TableWidgetProps {
     data: any[];
     columns: Column[];
     pageSize?: number;
+    widgetId?: string;
+    respectColumnToggles?: boolean;
+    totalRows?: number;
 }
 
-export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) {
+export function TableWidget({ data, columns, pageSize = 10, widgetId, respectColumnToggles = false, totalRows }: TableWidgetProps) {
+    const { dashboard, activeFilters, setFilter, markFiltersActivated } = useDashboardStore();
+    const { setStaleStep } = useWorkflowStore();
+    const searchDimension = useMemo(() => {
+        const filters = (dashboard?.filters || []) as Filter[];
+        const firstSearch = filters.find((f) => f?.type === "search" && typeof f?.dimension === "string");
+        return firstSearch?.dimension || null;
+    }, [dashboard?.filters]);
+    const pageKey = widgetId ? `__page:${widgetId}` : null;
+    const pageSizeKey = widgetId ? `__pageSize:${widgetId}` : null;
+    const offsetKey = widgetId ? `__offset:${widgetId}` : null;
+    const serverSearchKey = widgetId ? (searchDimension || "__search") : searchDimension;
+    const searchColumnKey = widgetId ? "__searchColumn" : null;
+    const widgetSearchColumnKey = widgetId ? `__searchColumn:${widgetId}` : null;
+    const columnPrefsStorageKey = widgetId ? `table_widget_columns:${widgetId}` : null;
     const [sortField, setSortField] = useState<string | null>(null);
     const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
-    const [currentPage, setCurrentPage] = useState(0);
+    const [currentPage, setCurrentPage] = useState(() => {
+        if (!pageKey) return 0;
+        const raw = Number(activeFilters.get(pageKey) ?? 0);
+        return Number.isFinite(raw) && raw >= 0 ? raw : 0;
+    });
+    const [pageSizeState, setPageSizeState] = useState(() => {
+        if (!pageSizeKey) return pageSize;
+        const raw = Number(activeFilters.get(pageSizeKey) ?? pageSize);
+        // Enforce minimum page size of 5 to avoid "1 row" UI issues
+        return Number.isFinite(raw) && raw >= 5 ? raw : (pageSize >= 5 ? pageSize : 10);
+    });
+    const [searchDraft, setSearchDraft] = useState(() => {
+        if (!serverSearchKey) return "";
+        const current = activeFilters.get(serverSearchKey);
+        return typeof current === "string" ? current : "";
+    });
+    const [searchColumn, setSearchColumn] = useState(() => {
+        const fromWidget = widgetSearchColumnKey ? activeFilters.get(widgetSearchColumnKey) : undefined;
+        if (typeof fromWidget === "string" && fromWidget.trim()) return fromWidget;
+        const fromGlobal = searchColumnKey ? activeFilters.get(searchColumnKey) : undefined;
+        if (typeof fromGlobal === "string" && fromGlobal.trim()) return fromGlobal;
+        return "__all";
+    });
+
+    // Define isServerPaginated early as it's used in state init or render
+    const isServerPaginated = Boolean(widgetId);
+    const pageOptions = [10, 25, 50, 100];
+
     const [columnToggles] = useState(() => {
         if (typeof window === "undefined") return null;
         try {
@@ -34,20 +80,43 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
 
     // Auto-generate columns if not provided
     const finalColumns = useMemo(() => {
-        if (columns.length > 0) return columns;
-        if (data.length === 0) return [];
+        if (data.length === 0) return columns;
+        const dataKeys = Object.keys(data[0] || {}).filter((k) => k !== "__rowKey");
+        if (columns.length === 0) {
+            return dataKeys.map((key) => ({
+                field: key,
+                header: key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " "),
+                sortable: true,
+                format: undefined,
+                width: undefined,
+            } as Column));
+        }
 
-        return Object.keys(data[0]).filter(k => k !== '__rowKey').map((key) => ({
-            field: key,
-            header: key.charAt(0).toUpperCase() + key.slice(1).replace(/_/g, " "),
-            sortable: true,
-            format: undefined,
-            width: undefined,
-        } as Column));
+        const existingByField = new Map<string, Column>();
+        columns.forEach((col) => {
+            const field = String(col?.field || "").trim();
+            if (!field) return;
+            existingByField.set(field, col);
+        });
+        const mergedFields = [
+            ...columns.map((col) => String(col?.field || "").trim()).filter(Boolean),
+            ...dataKeys.filter((field) => !existingByField.has(field))
+        ];
+        return mergedFields.map((field) => {
+            const existing = existingByField.get(field);
+            if (existing) return existing;
+            return {
+                field,
+                header: field.charAt(0).toUpperCase() + field.slice(1).replace(/_/g, " "),
+                sortable: true,
+                format: undefined,
+                width: undefined,
+            } as Column;
+        });
     }, [columns, data]);
 
     const allowedColumns = useMemo(() => {
-        if (!columnToggles || data.length === 0) return null;
+        if (!respectColumnToggles || !columnToggles || data.length === 0) return null;
         const dataKeys = Object.keys(data[0] || {}).filter(k => k !== "__rowKey");
         let best: { table: string; overlap: number } | null = null;
         Object.entries(columnToggles as Record<string, any>).forEach(([table, cols]) => {
@@ -63,31 +132,76 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
         const bestTable = (best as { table: string; overlap: number }).table;
         const visible = Object.entries((columnToggles as Record<string, any>)[bestTable] || {})
             .filter(([, settings]: any) => settings?.show !== false)
-            .map(([name]) => name);
+            .map(([name]) => name)
+            .filter((name) => dataKeys.includes(name));
+        if (visible.length === 0) return null;
+        if (visible.length <= 1 && dataKeys.length > 3) return null;
         return new Set(visible);
-    }, [columnToggles, data]);
+    }, [respectColumnToggles, columnToggles, data]);
 
-    const filteredColumns = useMemo(() => {
-        if (!allowedColumns) return finalColumns;
-        return finalColumns.filter((col) => allowedColumns.has(col.field));
-    }, [allowedColumns, finalColumns]);
+    // Initialize visibility based on localStorage OR global prefs (allowedColumns)
+    const [columnVisibility, setColumnVisibility] = useState<Record<string, boolean>>(() => {
+        // 1. Try Widget-specific LocalStorage
+        if (columnPrefsStorageKey && typeof window !== "undefined") {
+            try {
+                const raw = localStorage.getItem(columnPrefsStorageKey);
+                if (raw) {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed === "object") return parsed;
+                }
+            } catch { }
+        }
 
-    const visibleColumns = filteredColumns.length > 0 ? filteredColumns : finalColumns;
+        // 2. Fallback to Global Schema Preferences (if applicable)
+        // We compute the initial visibility map here instead of filtering columns out completely
+        if (allowedColumns && data.length > 0) {
+            const dataKeys = Object.keys(data[0] || {}).filter(k => k !== "__rowKey");
+            const initialMap: Record<string, boolean> = {};
+            dataKeys.forEach(key => {
+                // If it's in the allowed set, it's true. If not, it's false.
+                initialMap[key] = allowedColumns.has(key);
+            });
+            return initialMap;
+        }
+
+        return {};
+    });
+
+    // visibleColumns should be ALL columns so the user can toggle them back on
+    const visibleColumns = finalColumns;
+
+    const displayColumns = useMemo(() => {
+        // If visibility map is empty, show everything (default)
+        if (Object.keys(columnVisibility).length === 0) return visibleColumns;
+
+        const selected = visibleColumns.filter((col) => columnVisibility[col.field] !== false);
+        // If user hid everything, show at least one or show empty
+        return selected.length > 0 ? selected : [];
+    }, [visibleColumns, columnVisibility]);
+
+    const effectiveSortField = sortField && displayColumns.some((col) => col.field === sortField)
+        ? sortField
+        : null;
+    const effectiveSearchColumn = searchColumn === "__all" || visibleColumns.some((col) => col.field === searchColumn)
+        ? searchColumn
+        : "__all";
 
     useEffect(() => {
-        if (!sortField) return;
-        if (!visibleColumns.some((col) => col.field === sortField)) {
-            setSortField(null);
+        if (!columnPrefsStorageKey || typeof window === "undefined") return;
+        try {
+            localStorage.setItem(columnPrefsStorageKey, JSON.stringify(columnVisibility));
+        } catch {
+            // ignore localStorage write failures
         }
-    }, [sortField, visibleColumns]);
+    }, [columnPrefsStorageKey, columnVisibility]);
 
     // Sort data
     const sortedData = useMemo(() => {
-        if (!sortField) return data;
+        if (!effectiveSortField) return data;
 
         return [...data].sort((a, b) => {
-            const aVal = a[sortField];
-            const bVal = b[sortField];
+            const aVal = a[effectiveSortField];
+            const bVal = b[effectiveSortField];
 
             if (typeof aVal === "number" && typeof bVal === "number") {
                 return sortDirection === "asc" ? aVal - bVal : bVal - aVal;
@@ -101,24 +215,156 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
             }
             return bStr.localeCompare(aStr);
         });
-    }, [data, sortField, sortDirection]);
+    }, [data, effectiveSortField, sortDirection]);
 
     // Paginate data
     const paginatedData = useMemo(() => {
-        const start = currentPage * pageSize;
-        return sortedData.slice(start, start + pageSize);
-    }, [sortedData, currentPage, pageSize]);
+        if (isServerPaginated) {
+            return sortedData;
+        }
+        const start = currentPage * pageSizeState;
+        return sortedData.slice(start, start + pageSizeState);
+    }, [sortedData, currentPage, pageSizeState, isServerPaginated]);
 
-    const totalPages = Math.ceil(data.length / pageSize);
+    const totalServerRows = typeof totalRows === "number" && Number.isFinite(totalRows) && totalRows >= 0
+        ? totalRows
+        : null;
+    const debugOffset = currentPage * pageSizeState;
+    const debugStorePage = pageKey ? activeFilters.get(pageKey) : undefined;
+    const debugStoreSize = pageSizeKey ? activeFilters.get(pageSizeKey) : undefined;
+    const totalPages = isServerPaginated
+        ? (totalServerRows !== null ? Math.max(1, Math.ceil(totalServerRows / pageSizeState)) : 0)
+        : Math.ceil(data.length / pageSizeState);
+    const hasNextServerPage = isServerPaginated
+        ? (totalServerRows !== null ? (currentPage + 1) * pageSizeState < totalServerRows : data.length >= pageSizeState)
+        : false;
+    const showPagination = isServerPaginated
+        ? (currentPage > 0 || hasNextServerPage || (totalServerRows !== null && totalServerRows > pageSizeState))
+        : totalPages > 1;
+
+    const searchedData = useMemo(() => {
+        const term = searchDraft.trim().toLowerCase();
+        if (!term) return paginatedData;
+        const searchableFields = effectiveSearchColumn === "__all"
+            ? displayColumns.map((col) => col.field)
+            : [effectiveSearchColumn];
+        if (serverSearchKey && effectiveSearchColumn === "__all") return paginatedData;
+        return paginatedData.filter((row) =>
+            searchableFields.some((field) => String(row?.[field] ?? "").toLowerCase().includes(term))
+        );
+    }, [paginatedData, searchDraft, serverSearchKey, effectiveSearchColumn, displayColumns]);
+    const debugRowsOnPage = Array.isArray(searchedData) ? searchedData.length : 0;
 
     // Handle sort
     const handleSort = (field: string) => {
-        if (sortField === field) {
+        if (effectiveSortField === field) {
             setSortDirection(sortDirection === "asc" ? "desc" : "asc");
         } else {
             setSortField(field);
             setSortDirection("asc");
         }
+    };
+
+    const persistPaging = (nextPage: number, nextPageSize: number) => {
+        if (!widgetId) return;
+        const nextOffset = nextPage * nextPageSize;
+        console.log("[PAGINATION_DEBUG][UI] persistPaging", {
+            widgetId,
+            nextPage,
+            nextPageSize,
+            computedOffset: nextOffset
+        });
+        setFilter(`__page:${widgetId}`, nextPage);
+        setFilter(`__pageSize:${widgetId}`, nextPageSize);
+        setFilter(`__offset:${widgetId}`, nextOffset);
+        markFiltersActivated();
+        setStaleStep(4);
+    };
+
+    useEffect(() => {
+        if (!pageKey) return;
+        const raw = Number(activeFilters.get(pageKey) ?? 0);
+        const next = Number.isFinite(raw) && raw >= 0 ? Math.floor(raw) : 0;
+        if (next !== currentPage) {
+            setCurrentPage(next);
+        }
+    }, [activeFilters, pageKey, currentPage]);
+
+    useEffect(() => {
+        if (!pageSizeKey) return;
+        const raw = Number(activeFilters.get(pageSizeKey) ?? pageSize);
+        // Enforce minimum page size of 5 here too
+        const next = Number.isFinite(raw) && raw >= 5 ? Math.floor(raw) : (pageSize >= 5 ? pageSize : 10);
+        if (next !== pageSizeState) {
+            setPageSizeState(next);
+        }
+    }, [activeFilters, pageSizeKey, pageSize, pageSizeState]);
+
+    useEffect(() => {
+        if (!widgetId) return;
+        const hasPage = pageKey ? activeFilters.has(pageKey) : false;
+        const hasPageSize = pageSizeKey ? activeFilters.has(pageSizeKey) : false;
+        const hasOffset = offsetKey ? activeFilters.has(offsetKey) : false;
+        if (hasPage && hasPageSize && hasOffset) return;
+        persistPaging(currentPage, pageSizeState);
+    }, [widgetId, pageKey, pageSizeKey, offsetKey, activeFilters, currentPage, pageSizeState]);
+
+    useEffect(() => {
+        if (!serverSearchKey) return;
+        const timer = setTimeout(() => {
+            const current = activeFilters.get(serverSearchKey);
+            const currentText = typeof current === "string" ? current : "";
+            const normalizedSearchColumn = effectiveSearchColumn === "__all" ? "" : effectiveSearchColumn;
+            const currentGlobalColumn = searchColumnKey ? activeFilters.get(searchColumnKey) : undefined;
+            const currentWidgetColumn = widgetSearchColumnKey ? activeFilters.get(widgetSearchColumnKey) : undefined;
+            const globalColumnText = typeof currentGlobalColumn === "string" ? currentGlobalColumn : "";
+            const widgetColumnText = typeof currentWidgetColumn === "string" ? currentWidgetColumn : "";
+            if (
+                currentText === searchDraft &&
+                globalColumnText === normalizedSearchColumn &&
+                widgetColumnText === normalizedSearchColumn
+            ) {
+                return;
+            }
+            setFilter(serverSearchKey, searchDraft);
+            if (searchColumnKey) {
+                setFilter(searchColumnKey, normalizedSearchColumn);
+            }
+            if (widgetSearchColumnKey) {
+                setFilter(widgetSearchColumnKey, normalizedSearchColumn);
+            }
+            markFiltersActivated();
+            setStaleStep(4);
+        }, 350);
+        return () => clearTimeout(timer);
+    }, [
+        serverSearchKey,
+        searchDraft,
+        effectiveSearchColumn,
+        searchColumnKey,
+        widgetSearchColumnKey,
+        activeFilters,
+        setFilter,
+        markFiltersActivated,
+        setStaleStep
+    ]);
+
+    const toggleColumnVisibility = (field: string) => {
+        setColumnVisibility((prev) => {
+            const currentVisible = visibleColumns.filter((col) => prev[col.field] !== false);
+            const isCurrentlyVisible = prev[field] !== false;
+            if (isCurrentlyVisible && currentVisible.length <= 1) {
+                return prev;
+            }
+            return {
+                ...prev,
+                [field]: !isCurrentlyVisible
+            };
+        });
+    };
+
+    const resetVisibleColumns = () => {
+        setColumnVisibility({});
     };
 
     // Format cell value
@@ -157,11 +403,60 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
 
     return (
         <div className={styles.container}>
+            <div className={styles.toolbar}>
+                <select
+                    className={styles.searchFieldSelect}
+                    value={effectiveSearchColumn}
+                    onChange={(e) => setSearchColumn(e.target.value || "__all")}
+                    title="Search by column"
+                >
+                    <option value="__all">All columns</option>
+                    {displayColumns.map((col) => (
+                        <option key={col.field} value={col.field}>
+                            {col.header}
+                        </option>
+                    ))}
+                </select>
+                <input
+                    className={styles.searchInput}
+                    type="search"
+                    value={searchDraft}
+                    placeholder={serverSearchKey ? "Search table" : "Search current rows"}
+                    onChange={(e) => setSearchDraft(e.target.value)}
+                />
+                <details className={styles.columnPicker}>
+                    <summary className={styles.columnPickerSummary}>
+                        Columns {displayColumns.length}/{visibleColumns.length}
+                    </summary>
+                    <div className={styles.columnPickerMenu}>
+                        <button
+                            type="button"
+                            className={styles.resetColumnsButton}
+                            onClick={resetVisibleColumns}
+                        >
+                            Reset
+                        </button>
+                        {visibleColumns.map((col) => {
+                            const checked = columnVisibility[col.field] !== false;
+                            return (
+                                <label key={col.field} className={styles.columnOption}>
+                                    <input
+                                        type="checkbox"
+                                        checked={checked}
+                                        onChange={() => toggleColumnVisibility(col.field)}
+                                    />
+                                    <span>{col.header}</span>
+                                </label>
+                            );
+                        })}
+                    </div>
+                </details>
+            </div>
             <div className={styles.tableWrapper}>
                 <table className={styles.table}>
                     <thead>
                         <tr>
-                            {visibleColumns.map((col) => (
+                            {displayColumns.map((col) => (
                                 <th
                                     key={col.field}
                                     className={col.sortable !== false ? styles.sortable : ""}
@@ -185,9 +480,9 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
                         </tr>
                     </thead>
                     <tbody>
-                        {paginatedData.map((row, i) => (
+                        {searchedData.map((row, i) => (
                             <tr key={i}>
-                                {visibleColumns.map((col) => {
+                                {displayColumns.map((col) => {
                                     const value = row[col.field];
                                     const isNumeric = typeof value === "number" || col.format === "currency" || col.format === "percent" || col.format === "number";
                                     const isGrowth = col.field.toLowerCase().includes("growth") || col.field.toLowerCase().includes("delta");
@@ -210,23 +505,57 @@ export function TableWidget({ data, columns, pageSize = 10 }: TableWidgetProps) 
             </div>
 
             {/* Pagination */}
-            {totalPages > 1 && (
+            {showPagination && (
                 <div className={styles.pagination}>
                     <span className={styles.pageInfo}>
-                        {currentPage * pageSize + 1} - {Math.min((currentPage + 1) * pageSize, data.length)} of {data.length}
+                        {isServerPaginated
+                            ? (totalServerRows !== null
+                                ? `Page ${currentPage + 1} of ${totalPages} • ${totalServerRows} rows`
+                                : `Page ${currentPage + 1} • ${data.length} rows`)
+                            : `${currentPage * pageSizeState + 1} - ${Math.min((currentPage + 1) * pageSizeState, data.length)} of ${data.length}`}
                     </span>
+                    {isServerPaginated && (
+                        <span className={styles.pageInfo} style={{ opacity: 0.75 }}>
+                            page={currentPage} size={pageSizeState} offset={debugOffset} rowsOnPage={debugRowsOnPage} total={totalServerRows ?? "?"} storePage={String(debugStorePage ?? "?")} storeSize={String(debugStoreSize ?? "?")}
+                        </span>
+                    )}
+                    <div className={styles.pageSize}>
+                        <span className={styles.pageSizeLabel}>Rows</span>
+                        <select
+                            className={styles.pageSizeSelect}
+                            value={pageSizeState}
+                            onChange={(e) => {
+                                const nextSize = Number(e.target.value) || pageSizeState;
+                                setCurrentPage(0);
+                                setPageSizeState(nextSize);
+                                persistPaging(0, nextSize);
+                            }}
+                        >
+                            {pageOptions.map((opt) => (
+                                <option key={opt} value={opt}>{opt}</option>
+                            ))}
+                        </select>
+                    </div>
                     <div className={styles.pageControls}>
                         <button
                             className={styles.pageButton}
-                            onClick={() => setCurrentPage(Math.max(0, currentPage - 1))}
+                            onClick={() => {
+                                const nextPage = Math.max(0, currentPage - 1);
+                                setCurrentPage(nextPage);
+                                persistPaging(nextPage, pageSizeState);
+                            }}
                             disabled={currentPage === 0}
                         >
                             <ChevronLeft size={16} />
                         </button>
                         <button
                             className={styles.pageButton}
-                            onClick={() => setCurrentPage(Math.min(totalPages - 1, currentPage + 1))}
-                            disabled={currentPage >= totalPages - 1}
+                            onClick={() => {
+                                const nextPage = currentPage + 1;
+                                setCurrentPage(nextPage);
+                                persistPaging(nextPage, pageSizeState);
+                            }}
+                            disabled={isServerPaginated ? !hasNextServerPage : currentPage >= totalPages - 1}
                         >
                             <ChevronRight size={16} />
                         </button>

@@ -1,11 +1,10 @@
 "use client";
 
 import React, { useCallback, useState, useMemo } from "react";
-import GridLayout, { Layout } from "react-grid-layout";
-import { motion, AnimatePresence } from "framer-motion";
-import { Plus, Maximize2, Minimize2, Sparkles, Database, Table, FlaskConical, ArrowUp, Link as LinkIcon, Mic } from "lucide-react";
-import { useEditorStore, useDashboardStore, useRunStore, useWorkflowStore } from "@/state/stores";
-import { useCreateRun } from "@/hooks/useRunStream";
+import GridLayout from "react-grid-layout";
+import { motion } from "framer-motion";
+import { Maximize2, Minimize2, Sparkles, Database } from "lucide-react";
+import { useEditorStore, useDashboardStore, useRunStore, useWorkflowStore, useConfigStore, useUIStore } from "@/state/stores";
 import { WidgetRenderer } from "../widgets/WidgetRenderer";
 import { AgentTimeline } from "../chat/AgentTimeline";
 import AiInsightsWidget from "../studio/widgets/AiInsightsWidget";
@@ -23,6 +22,7 @@ interface DashboardCanvasProps {
     onLayoutChange?: (layout: LayoutItem[]) => void;
     onWidgetClick?: (widgetId: string) => void;
     getWidgetData?: (widgetId: string) => any[] | undefined;
+    getWidgetMeta?: (widgetId: string) => { totalRows?: number } | undefined;
 }
 
 const GRID_COLS = 12;
@@ -36,6 +36,7 @@ export function DashboardCanvas({
     onLayoutChange,
     onWidgetClick,
     getWidgetData,
+    getWidgetMeta,
 }: DashboardCanvasProps) {
     const [containerWidth, setContainerWidth] = useState(1200);
     const [isFullscreen, setIsFullscreen] = useState(false);
@@ -49,26 +50,39 @@ export function DashboardCanvas({
         updateLayout,
     } = useEditorStore();
 
-    const { dashboard, activeFilters, addToRecentQueries } = useDashboardStore();
+    const { dashboard, activeFilters } = useDashboardStore();
     const { isStreaming, steps } = useRunStore();
-    const { createRun, isCreating } = useCreateRun();
-    const { setQuery, setStep, reset: resetWorkflow } = useWorkflowStore();
-    const [input, setInput] = useState("");
+    const { setStep, schemaData } = useWorkflowStore();
+    const { dataSources, selectedDataSourceId, connectionStatus } = useConfigStore();
+    const { setCurrentView } = useUIStore();
 
-    const handleGenerate = useCallback(async () => {
-        const query = input.trim();
-        if (!query) return;
+    const hasConnectedSqlSource = useMemo(() => {
+        const selected = dataSources.find((ds) => ds.id === selectedDataSourceId);
+        const connectedSql = (selected ? [selected] : dataSources).find((ds) => {
+            const type = String(ds?.type || "").toLowerCase();
+            const isSql = type.includes("postgres") || type.includes("mssql") || type.includes("sql");
+            return isSql && String(ds?.status || "").toLowerCase() === "connected";
+        });
+        if (connectedSql) return true;
+        return connectionStatus === "Connected";
+    }, [dataSources, selectedDataSourceId, connectionStatus]);
 
-        try {
-            addToRecentQueries(query);
-            resetWorkflow();
-            setQuery(query);
-            setStep(1); // Start Schema Discovery
-            setInput("");
-        } catch (err) {
-            console.error("Failed to start workflow:", err);
+    const hasSchema = useMemo(() => {
+        if (!schemaData) return false;
+        const tables = Array.isArray(schemaData?.tables) ? schemaData.tables : [];
+        if (tables.length > 0) return true;
+        const schemaInfo = schemaData?.schemaInfo;
+        return !!schemaInfo && Object.keys(schemaInfo).length > 0;
+    }, [schemaData]);
+
+    const handleSetupRouting = useCallback(() => {
+        if (!hasConnectedSqlSource) {
+            setCurrentView("data-sources");
+            return;
         }
-    }, [input, setQuery, setStep, resetWorkflow, addToRecentQueries]);
+        setCurrentView("schema");
+        setStep(1);
+    }, [hasConnectedSqlSource, setCurrentView, setStep]);
 
     const gridLayout = useMemo(() => {
         return layout.map((item) => {
@@ -216,6 +230,7 @@ export function DashboardCanvas({
                                         isSelected={selectedWidgetId === widget.id}
                                         filters={Object.fromEntries(activeFilters)}
                                         data={getWidgetData?.(widget.id)}
+                                        meta={getWidgetMeta?.(widget.id)}
                                     />
                                 </div>
                             ))}
@@ -223,50 +238,29 @@ export function DashboardCanvas({
                     </div>
                 ) : (
                     <div className={styles.emptyState}>
-                        {/* Central Search Box */}
+                        {/* Chat-first setup state */}
                         <div className={styles.searchContainer}>
                             <div className={styles.searchBox}>
                                 <div className={styles.searchIcon}>
                                     <Sparkles size={24} />
                                 </div>
                                 <div className={styles.searchInputWrapper}>
-                                    <textarea
-                                        className={styles.searchInput}
-                                        placeholder="Ask your data a question or describe a dashboard layout..."
-                                        rows={1}
-                                        value={input}
-                                        onChange={(e) => setInput(e.target.value)}
-                                        onKeyDown={(e) => {
-                                            if (e.key === 'Enter' && !e.shiftKey) {
-                                                e.preventDefault();
-                                                handleGenerate();
-                                            }
-                                        }}
-                                        disabled={isCreating || isStreaming}
-                                    />
-                                    <div className={styles.searchActions}>
-                                        <div className={styles.searchTools}>
-                                            <button className={styles.toolButton}>
-                                                <LinkIcon size={16} />
-                                            </button>
-                                            <button className={styles.toolButton}>
-                                                <Mic size={16} />
-                                            </button>
-                                        </div>
-                                        <div className="flex items-center">
-                                            <span className={styles.enterHint}>
-                                                {isCreating || isStreaming ? "Generating..." : (
-                                                    <>Press <span className={styles.kbd}>Enter</span> to generate</>
-                                                )}
-                                            </span>
-                                            <button
-                                                className={styles.generateButton}
-                                                onClick={handleGenerate}
-                                                disabled={!input.trim() || isCreating || isStreaming}
-                                            >
-                                                <ArrowUp size={16} />
-                                            </button>
-                                        </div>
+                                    <div className="text-left">
+                                        <h3 className="text-[18px] font-black tracking-tight text-white">
+                                            Agent Pipeline Is Chat-Driven
+                                        </h3>
+                                        <p className="mt-2 text-sm text-slate-400">
+                                            Use the chat panel to run the pipeline. We’ll route setup based on your connection state.
+                                        </p>
+                                    </div>
+                                    <div className="mt-5 flex items-center gap-3">
+                                        <button className={styles.actionChip} onClick={handleSetupRouting}>
+                                            <Database size={16} className={`${styles.actionIcon} ${styles.green}`} />
+                                            <span>{hasConnectedSqlSource ? "Open Schema Discovery" : "Open Data Sources"}</span>
+                                        </button>
+                                        {hasConnectedSqlSource && hasSchema && (
+                                            <span className="text-xs text-slate-500">Schema detected. You can start from chat anytime.</span>
+                                        )}
                                     </div>
                                 </div>
                             </div>
@@ -278,27 +272,6 @@ export function DashboardCanvas({
                                 <AgentTimeline steps={steps} isStreaming={isStreaming} />
                             </div>
                         )}
-
-                        {/* Quick Actions */}
-                        <div className={styles.quickActions}>
-                            <button className={styles.actionChip} onClick={() => setInput("Connect to Postgres and show database schema")}>
-                                <Database size={16} className={`${styles.actionIcon} ${styles.green}`} />
-                                <span>Add Postgres DB</span>
-                            </button>
-                            <button className={styles.actionChip} onClick={() => setInput("Create a pivot table showing sales by segment and region")}>
-                                <Table size={16} className={`${styles.actionIcon} ${styles.purple}`} />
-                                <span>Create Pivot Table</span>
-                            </button>
-                            <button className={styles.actionChip} onClick={() => setInput("Load sample sales data and show key performance metrics")}>
-                                <FlaskConical size={16} className={`${styles.actionIcon} ${styles.orange}`} />
-                                <span>Load Sample Data</span>
-                            </button>
-                        </div>
-
-                        {/* Tip */}
-                        <p className={styles.tip}>
-                            Tip: Try "<span className={styles.tipLink} onClick={() => setInput("Show me monthly revenue by region for 2023")}>Show me monthly revenue by region for 2023</span>"
-                        </p>
                     </div>
                 )}
             </div>

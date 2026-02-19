@@ -55,13 +55,28 @@ const normalizeSqlForValidation = (sql: string) => {
     return text.trim();
 };
 
+const stripSqlLiteralsAndComments = (sql: string) => {
+    let text = String(sql || "");
+    if (!text) return "";
+    text = text.replace(/\/\*[\s\S]*?\*\//g, " ");
+    text = text.replace(/--.*$/gm, " ");
+    text = text.replace(/'(?:''|[^'])*'/g, "''");
+    text = text.replace(/"(?:\"\"|[^"])*"/g, "\"\"");
+    return text;
+};
+
 const validateSql = (sql: string, connectionString?: string, connectorInstructions?: string) => {
     const trimmed = normalizeSqlForValidation(sql);
     if (!trimmed.toLowerCase().startsWith("select")) {
         return { ok: false, error: "Validation failed: SQL must start with SELECT." };
     }
-    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter"];
-    if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
+    const semicolonIndex = trimmed.indexOf(";");
+    if (semicolonIndex >= 0 && trimmed.slice(semicolonIndex).trim() !== ";") {
+        return { ok: false, error: "Validation failed: multiple SQL statements are not allowed." };
+    }
+    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter", "create", "grant", "revoke"];
+    const sanitized = stripSqlLiteralsAndComments(trimmed).toLowerCase();
+    if (blocked.some((kw) => new RegExp(`\\b${kw}\\b`, "i").test(sanitized))) {
         return { ok: false, error: "Validation failed: unsafe SQL detected." };
     }
     const lower = String(connectionString || "").toLowerCase();
@@ -104,6 +119,49 @@ const formatResultForWidget = (widget: any, result: any) => {
         };
     }
     return result;
+};
+
+const parseFiniteNumber = (value: any) => {
+    const parsed = Number(value);
+    return Number.isFinite(parsed) ? parsed : null;
+};
+
+const buildPaginationConfig = (filters: Record<string, any>, widgetId: string) => {
+    const readNumeric = (keys: string[]) => {
+        for (const key of keys) {
+            if (!Object.prototype.hasOwnProperty.call(filters || {}, key)) continue;
+            const num = parseFiniteNumber(filters[key]);
+            if (num !== null) return num;
+        }
+        return null;
+    };
+
+    const page = readNumeric([`__page:${widgetId}`, `storePage:${widgetId}`, `page:${widgetId}`, "storePage", "page"]);
+    const pageSize = readNumeric([
+        `__pageSize:${widgetId}`,
+        `storeSize:${widgetId}`,
+        `rowsOnPage:${widgetId}`,
+        `size:${widgetId}`,
+        `pageSize:${widgetId}`,
+        `page_size:${widgetId}`,
+        "storeSize",
+        "rowsOnPage",
+        "size",
+        "pageSize",
+        "page_size"
+    ]);
+    const offset = readNumeric([`__offset:${widgetId}`, `offset:${widgetId}`, "offset"]);
+    const normalizedPage = page !== null && page >= 0 ? Math.floor(page) : 0;
+    const normalizedPageSize = pageSize !== null && pageSize > 0 ? Math.min(100, Math.floor(pageSize)) : 25;
+    const normalizedOffset = offset !== null && offset >= 0
+        ? Math.floor(offset)
+        : normalizedPage * normalizedPageSize;
+    return {
+        page: normalizedPage,
+        pageSize: normalizedPageSize,
+        offset: normalizedOffset,
+        includeTotal: true
+    };
 };
 
 export async function POST(request: NextRequest) {
@@ -177,9 +235,22 @@ export async function POST(request: NextRequest) {
                             }
 
                             send({ status: "execution_running", sql, attempt });
+                            const pagination = buildPaginationConfig(filters || {}, widgetId);
+                            const runtimeParams = {
+                                ...((plan?.filters || []).reduce((acc: Record<string, any>, f: any) => {
+                                    if (!f?.dimension) return acc;
+                                    acc[f.dimension] = f.value;
+                                    return acc;
+                                }, {})),
+                                ...(filters || {})
+                            };
                             const exec = await runQueryExecutor({ [widgetId]: sql }, connectionString || undefined, {
                                 connectorInstructions: connectorInstructions || "",
-                                connectorType: connectorType || ""
+                                connectorType: connectorType || "",
+                                tablePagination: {
+                                    [widgetId]: pagination
+                                },
+                                runtimeParams
                             });
                             const result = exec[widgetId];
                             if (result?.status === "error") {

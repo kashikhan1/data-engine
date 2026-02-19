@@ -33,6 +33,7 @@ interface WidgetRendererProps {
     isSelected?: boolean;
     filters?: Record<string, any>;
     data?: any[];
+    meta?: { totalRows?: number };
     onDrilldown?: (selection: any) => void;
     onRegenerate?: () => void;
 }
@@ -43,6 +44,7 @@ export function WidgetRenderer({
     isSelected = false,
     filters = {},
     data,
+    meta,
     onDrilldown,
     onRegenerate,
 }: WidgetRendererProps) {
@@ -443,6 +445,9 @@ export function WidgetRenderer({
                     <TableWidget
                         data={chartData.table}
                         columns={widget.tableConfig?.columns || []}
+                        widgetId={widget.id}
+                        respectColumnToggles={true}
+                        totalRows={meta?.totalRows}
                     />
                 );
 

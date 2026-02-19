@@ -2,9 +2,7 @@ import { StateGraph, START, END } from "@langchain/langgraph";
 import { AgentState, MAX_RETRIES, MAX_QUALITY_RETRIES } from "./state";
 import {
     intentAgent,
-    schemaAgent,
     queryEnhancerAgent,
-    dashboardPlannerAgent,
     multiQueryOrchestratorAgent,
     securityCheckAgent,
     mcpCallingAgent,
@@ -16,8 +14,15 @@ import {
     qualityCheckAgent,
     sqlRepairAgent
 } from "./nodes";
-// No extended-nodes imports needed for now as we are strictly following the 8-agent sequential pipeline.
-// import { errorRecoveryAgent } from "./extended-nodes";
+import { schemaAgent } from "./schema-discovery";
+import { dashboardPlannerAgent } from "./dashboard-planner";
+import { errorRecoveryAgent } from "./extended-nodes";
+import { createLogger } from "../observability";
+import { registerBuiltinSkills } from "../skills";
+
+const log = createLogger("agents.graph");
+registerBuiltinSkills();
+log.debug("graph_init");
 
 const workflow = new StateGraph(AgentState)
     .addNode("intent_understanding", intentAgent)
@@ -29,6 +34,7 @@ const workflow = new StateGraph(AgentState)
     .addNode("query_execution", mcpCallingAgent)
     .addNode("quality_check", qualityCheckAgent)
     .addNode("sql_repair", sqlRepairAgent)
+    .addNode("error_recovery", errorRecoveryAgent)
     .addNode("analytics_agent", analyticsAgent)
     .addNode("visualization_agent", chartDesignAgent)
     .addNode("smart_layout_builder", smartLayoutBuilderAgent)
@@ -49,11 +55,20 @@ workflow.addConditionalEdges("quality_check", (state) => {
     if (state.shouldRepair && state.retryCount < MAX_QUALITY_RETRIES) {
         return "sql_repair";
     }
+    if (Array.isArray(state.errors) && state.errors.length > 0) {
+        return "error_recovery";
+    }
     return "analytics_agent";
 });
 
 // SQL repair goes back to orchestrator for retry execution
 workflow.addEdge("sql_repair", "multi_query_orchestrator");
+workflow.addConditionalEdges("error_recovery", (state) => {
+    if (state.errorRecovery?.retryable && state.retryCount < MAX_RETRIES) {
+        return "multi_query_orchestrator";
+    }
+    return "analytics_agent";
+});
 
 // Normal flow continues to analytics
 workflow.addEdge("analytics_agent", "visualization_agent");

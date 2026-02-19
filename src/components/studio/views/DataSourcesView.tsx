@@ -195,394 +195,47 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
         <main className="flex-1 overflow-y-auto bg-[#0b0d11] p-10 canvas-grid custom-scrollbar">
             <div className="max-w-5xl mx-auto space-y-12">
                 {/* Header Section */}
-                <div className="flex justify-between items-start">
-                    <div className="space-y-2">
-                        <h1 className="text-4xl font-extrabold text-white tracking-tight">Data Source</h1>
-                        <p className="text-slate-400 max-w-xl leading-relaxed text-sm font-medium">
-                            Manage your data connections, configure sync settings, and monitor data freshness. Connect to databases, SaaS tools, and APIs.
-                        </p>
-                    </div>
-                    <div className="flex gap-4">
-                        <button className="flex items-center gap-2.5 px-5 py-2.5 bg-[#1a202c] border border-[#2d3748] rounded-xl text-xs font-bold uppercase tracking-widest text-slate-300 hover:text-white hover:bg-[#232936] transition-all shadow-lg active:scale-95">
-                            <span className="material-symbols-outlined text-[18px]">sync</span>
-                            Sync All
-                        </button>
-                        <button
-                            onClick={() => {
-                                setDbType('PostgreSQL');
-                                setIsPgModalOpen(true);
-                            }}
-                            className="flex items-center gap-2.5 px-6 py-2.5 bg-[#135bec] text-white rounded-xl text-xs font-bold uppercase tracking-widest hover:bg-blue-600 transition-all shadow-[0_0_20px_rgba(19,91,236,0.3)] active:scale-95"
-                        >
-                            <span className="material-symbols-outlined text-[18px]">add</span>
-                            New Source
-                        </button>
-                    </div>
-                </div>
-
-                {/* Summary Stats Cards */}
-                <div className="grid grid-cols-3 gap-6">
-                    <div className="bg-[#111318] border border-[#2d3748] p-8 rounded-2xl flex items-center gap-6 relative overflow-hidden group hover:border-[#2d3748]/80 transition-all shadow-xl">
-                        <div className="absolute top-0 right-0 w-32 h-32 bg-blue-500/5 blur-[80px] -mr-16 -mt-16 group-hover:bg-blue-500/10 transition-colors"></div>
-                        <div className="w-14 h-14 rounded-2xl bg-blue-500/10 text-[#135bec] flex items-center justify-center relative shadow-inner">
-                            <span className="material-symbols-outlined text-[32px]">database</span>
-                        </div>
-                        <div>
-                            <div className="text-4xl font-extrabold text-white tracking-tighter">{dataSources.length}</div>
-                            <div className="text-[10px] text-slate-500 uppercase tracking-[2px] font-black mt-1">Total Sources</div>
-                        </div>
-                    </div>
-                    <div className="bg-[#111318] border border-[#2d3748] p-8 rounded-2xl flex items-center gap-6 relative overflow-hidden group hover:border-[#2d3748]/80 transition-all shadow-xl">
-                        <div className="absolute top-0 right-0 w-32 h-32 bg-green-500/5 blur-[80px] -mr-16 -mt-16 group-hover:bg-green-500/10 transition-colors"></div>
-                        <div className="w-14 h-14 rounded-2xl bg-green-500/10 text-green-500 flex items-center justify-center relative shadow-inner">
-                            <span className="material-symbols-outlined text-[32px]">check_circle</span>
-                        </div>
-                        <div>
-                            <div className="text-4xl font-extrabold text-white tracking-tighter">{healthyCount}</div>
-                            <div className="text-[10px] text-slate-500 uppercase tracking-[2px] font-black mt-1">Healthy</div>
-                        </div>
-                    </div>
-                    <div className="bg-[#111318] border border-[#2d3748] p-8 rounded-2xl flex items-center gap-6 relative overflow-hidden group hover:border-[#2d3748]/80 transition-all shadow-xl">
-                        <div className="absolute top-0 right-0 w-32 h-32 bg-red-500/5 blur-[80px] -mr-16 -mt-16 group-hover:bg-red-500/10 transition-colors"></div>
-                        <div className="w-14 h-14 rounded-2xl bg-red-500/10 text-red-500 flex items-center justify-center relative shadow-inner">
-                            <span className="material-symbols-outlined text-[32px]">error</span>
-                        </div>
-                        <div>
-                            <div className="text-4xl font-extrabold text-white tracking-tighter">{errorCount}</div>
-                            <div className="text-[10px] text-slate-500 uppercase tracking-[2px] font-black mt-1">Failures</div>
+                <div className="relative group">
+                    <div className="absolute -inset-1 bg-gradient-to-r from-blue-600 to-indigo-600 rounded-[2rem] blur opacity-10 group-hover:opacity-20 transition duration-1000 group-hover:duration-200"></div>
+                    <div className="relative bg-[#0f1218]/80 backdrop-blur-xl border border-white/5 p-10 rounded-[2rem] shadow-2xl flex justify-between items-center overflow-hidden">
+                        <div className="absolute top-0 right-0 w-96 h-96 bg-blue-600/10 blur-[100px] -mr-48 -mt-48 animate-pulse"></div>
+                        <div className="space-y-4 relative z-10 w-full">
+                            <div className="flex items-center justify-between">
+                                <div className="inline-flex items-center gap-2 px-3 py-1 rounded-full bg-blue-500/10 border border-blue-500/20 text-[10px] font-bold uppercase tracking-[2px] text-blue-400">
+                                    <span className="relative flex h-2 w-2">
+                                        <span className="animate-ping absolute inline-flex h-full w-full rounded-full bg-blue-400 opacity-75"></span>
+                                        <span className="relative inline-flex rounded-full h-2 w-2 bg-blue-500"></span>
+                                    </span>
+                                    Live Infrastructure
+                                </div>
+                                <div className="flex items-center gap-6">
+                                    <div className="flex flex-col items-end">
+                                        <div className="text-3xl font-black text-white leading-none">{dataSources.length}</div>
+                                        <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mt-1">Systems</div>
+                                    </div>
+                                    <div className="w-px h-8 bg-white/10"></div>
+                                    <button className="p-3 bg-white/5 border border-white/10 rounded-2xl text-slate-400 hover:text-white hover:bg-white/10 hover:border-white/20 transition-all group">
+                                        <span className="material-symbols-outlined text-[20px] group-hover:rotate-180 transition-transform duration-500">sync</span>
+                                    </button>
+                                </div>
+                            </div>
+                            <h1 className="text-6xl font-black text-white tracking-tighter">Data Ingestion</h1>
+                            <p className="text-slate-400 max-w-lg leading-relaxed text-sm font-medium opacity-70">
+                                Connect your enterprise stack. Bridge the gap between raw data and semantic understanding with high-performance throughput.
+                            </p>
                         </div>
                     </div>
                 </div>
 
-                {/* Active Connections */}
-                <div className="space-y-6">
-                    <div className="flex items-center justify-between">
-                        <h2 className="text-2xl font-extrabold text-white tracking-tight">Active Connections</h2>
-                        <div className="bg-[#1a202c] border border-[#2d3748] px-4 py-2 rounded-xl flex items-center gap-3 cursor-pointer hover:bg-[#232936] transition-all shadow-sm group">
-                            <span className="material-symbols-outlined text-slate-500 group-hover:text-white text-[20px]">filter_list</span>
-                            <span className="text-[11px] text-slate-400 font-bold uppercase tracking-widest">All Types</span>
-                            <span className="material-symbols-outlined text-slate-600 text-[18px]">expand_more</span>
+                {/* Integration Protocol Selection */}
+                <div className="space-y-8">
+                    <div className="flex items-end justify-between px-2">
+                        <div className="space-y-1">
+                            <h2 className="text-sm font-black text-slate-500 uppercase tracking-[4px]">Protocols</h2>
+                            <p className="text-3xl font-black text-white tracking-tight">Deploy New Cluster</p>
                         </div>
                     </div>
-
-                    <div className="bg-[#111318] border border-[#2d3748] rounded-[24px] overflow-hidden shadow-2xl">
-                        <div className="grid grid-cols-12 px-8 py-5 border-b border-[#2d3748] text-[10px] font-black text-slate-500 uppercase tracking-[3px] bg-[#1a202c]/30">
-                            <div className="col-span-4">Source Name</div>
-                            <div className="col-span-3 text-center">Type</div>
-                            <div className="col-span-3 text-center">Status</div>
-                            <div className="col-span-2 text-right">Last Sync</div>
-                        </div>
-                        <div className="divide-y divide-[#2d3748]/50">
-                            {dataSources.map((ds) => (
-                                <div key={ds.id} className={`${selectedId === ds.id ? 'bg-[#135bec]/10 relative shadow-[inset_0_0_30px_rgba(19,91,236,0.05)]' : ''}`}>
-                                    <div
-                                        onClick={() => onSelect(ds.id)}
-                                        className={`grid grid-cols-12 px-8 py-6 items-center cursor-pointer transition-all group ${selectedId === ds.id ? 'relative' : 'hover:bg-white/5'}`}
-                                    >
-                                    {selectedId === ds.id && <div className="absolute left-0 top-0 bottom-0 w-1 bg-[#135bec] shadow-[0_0_15px_rgba(19,91,236,0.8)]"></div>}
-                                    <div className="col-span-4 flex items-center gap-4">
-                                        <div className={`w-12 h-12 rounded-xl flex items-center justify-center transition-all shadow-sm ${selectedId === ds.id ? 'bg-[#135bec]/20 text-[#135bec]' : 'bg-[#1a202c] text-slate-500 group-hover:text-white'}`}>
-                                            <span className="material-symbols-outlined text-[24px]">{ds.icon}</span>
-                                        </div>
-                                        <div>
-                                            <div className="text-[15px] font-bold text-white tracking-tight">{ds.name}</div>
-                                            <div className="text-[11px] text-slate-500 font-mono mt-1 opacity-80">{ds.details}</div>
-                                        </div>
-                                    </div>
-                                    <div className="col-span-3 flex justify-center">
-                                        <span className="px-3.5 py-1.5 rounded-lg bg-[#1a202c] border border-[#2d3748] text-[10px] text-slate-300 font-black uppercase tracking-[2px] shadow-inner">
-                                            {ds.type}
-                                        </span>
-                                    </div>
-                                    <div className="col-span-3 flex justify-center">
-                                        <div className="flex items-center gap-3 px-4 py-2 rounded-full bg-[#1a202c]/50 border border-[#2d3748] shadow-sm">
-                                            <div className={`w-2.5 h-2.5 rounded-full ${ds.status === 'Connected' ? 'bg-green-500 glow-success' :
-                                                ds.status === 'Auth Error' || ds.status === 'Error' ? 'bg-red-500 shadow-[0_0_10px_rgba(239,68,68,0.6)]' :
-                                                    'bg-slate-500 animate-pulse'
-                                                }`} />
-                                            <span className={`text-[11px] font-black uppercase tracking-widest ${ds.status === 'Connected' ? 'text-green-500' :
-                                                ds.status === 'Auth Error' || ds.status === 'Error' ? 'text-red-500' :
-                                                    'text-slate-400'
-                                                }`}>{ds.status}</span>
-                                        </div>
-                                    </div>
-                                    <div className="col-span-2 text-right">
-                                        <span className="text-xs text-slate-500 font-bold tracking-tight">{ds.lastSync}</span>
-                                    </div>
-                                </div>
-                                {selectedId === ds.id && ds.type.toLowerCase().includes('mcp') && (
-                                    <div className="px-8 pb-8">
-                                        <div className="bg-[#0f1218] border border-[#2d3748] rounded-[16px] p-5">
-                                            <div className="flex items-center justify-between mb-3">
-                                                <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">
-                                                    MCP Instructions
-                                                </div>
-                                                <button
-                                                    onClick={() => {
-                                                        addDataSource({ ...ds, instructions: connectorInstructions });
-                                                    }}
-                                                    className="px-3 py-1.5 rounded-lg bg-[#135bec] text-white text-[10px] font-black uppercase tracking-widest shadow-lg"
-                                                >
-                                                    Save
-                                                </button>
-                                            </div>
-                                            <textarea
-                                                value={connectorInstructions}
-                                                onChange={(e) => setConnectorInstructions(e.target.value)}
-                                                placeholder="Example: Use TOP for MSSQL. Always filter by DATUM_START. Avoid JSON columns."
-                                                className="w-full min-h-[120px] bg-[#0b0f16] border border-[#1b2230] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
-                                            />
-                                            <div className="text-[11px] text-slate-500 mt-3">
-                                                These instructions are injected into the SQL Engineer prompt for this connector.
-                                            </div>
-                                        </div>
-                                    </div>
-                                )}
-                            </div>
-                            ))}
-                            {dataSources.length === 0 && (
-                                <div className="px-8 py-12 text-center text-slate-500">
-                                    <p className="text-sm font-medium">No active connections found. Connect a data source to get started.</p>
-                                </div>
-                            )}
-                        </div>
-                    </div>
-                </div>
-
-                <div className="space-y-4">
-                        <div className="flex items-center justify-between">
-                            <div>
-                                <h2 className="text-2xl font-extrabold text-white tracking-tight">MCP Instructions</h2>
-                                <p className="text-xs text-slate-500 mt-1">Guidance for SQL generation on the selected connector.</p>
-                            </div>
-                            {selectedDataSource ? (
-                                <button
-                                    onClick={() => {
-                                        addDataSource({ ...selectedDataSource, instructions: connectorInstructions });
-                                    }}
-                                    className="px-4 py-2 rounded-lg bg-[#135bec] text-white text-[11px] font-black uppercase tracking-widest shadow-lg"
-                                >
-                                    Save Instructions
-                                </button>
-                            ) : (
-                                <span className="text-[11px] text-slate-500">Select a connection above</span>
-                            )}
-                        </div>
-                        <div className="bg-[#111318] border border-[#2d3748] rounded-[18px] p-6">
-                            <label className="block text-[10px] text-slate-500 font-black uppercase tracking-[3px] mb-3">
-                                {selectedDataSource ? `${selectedDataSource.name} • ${selectedDataSource.type}` : 'No connector selected'}
-                            </label>
-                            <textarea
-                                value={connectorInstructions}
-                                onChange={(e) => setConnectorInstructions(e.target.value)}
-                                placeholder="Example: Use TOP for MSSQL. Always filter by DATUM_START. Avoid JSON columns."
-                                className="w-full min-h-[140px] bg-[#0b0f16] border border-[#1b2230] rounded-xl px-4 py-3 text-sm text-slate-200 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
-                                disabled={!selectedDataSource}
-                            />
-                            <div className="text-[11px] text-slate-500 mt-3">
-                                These instructions are injected into the SQL Engineer prompt for this connector.
-                            </div>
-                        </div>
-                    </div>
-
-                {/* Connected Schema */}
-                <div className="space-y-6">
-                    <div className="flex items-center justify-between">
-                        <div>
-                            <h2 className="text-2xl font-extrabold text-white tracking-tight">Connected Schema</h2>
-                            <p className="text-xs text-slate-500 mt-1">Selected tables are prioritized for planning and SQL generation.</p>
-                        </div>
-                        <div className="flex items-center gap-3">
-                            <button
-                                onClick={() => setShowSchemaPanel((prev) => !prev)}
-                                className="px-3 py-2 rounded-lg border border-[#2d3748] text-[11px] font-black uppercase tracking-widest text-slate-400 hover:text-white hover:border-[#4b5563] transition-all"
-                            >
-                                {showSchemaPanel ? 'Collapse' : 'Expand'}
-                            </button>
-                            <button
-                                onClick={saveSelection}
-                                disabled={isSchemaSyncing || selectedTables.length === 0}
-                                className="px-4 py-2 rounded-lg bg-[#135bec] text-white text-[11px] font-black uppercase tracking-widest shadow-lg disabled:opacity-50 disabled:cursor-not-allowed"
-                            >
-                                {isSchemaSyncing ? 'Saving...' : 'Save Selection'}
-                            </button>
-                            <span className={`px-3 py-1.5 rounded-full text-[10px] font-black uppercase tracking-[2px] border ${connectionStatus === 'Connected'
-                                ? 'bg-green-500/10 text-green-400 border-green-500/30'
-                                : 'bg-red-500/10 text-red-400 border-red-500/30'
-                                }`}>
-                                {connectionStatus === 'Connected' ? 'Connected' : 'Not Connected'}
-                            </span>
-                        </div>
-                    </div>
-                    {showSchemaPanel && (
-                        <>
-                            <div className="bg-[#0f1218] border border-[#242a36] rounded-[18px] px-4 py-3 flex items-center justify-between">
-                                <div className="flex items-center gap-3 text-xs text-slate-400 font-bold uppercase tracking-widest">
-                                    <span>Selected: {selectedTables.length}</span>
-                                    <span className="text-slate-600">•</span>
-                                    <span>Other: {otherTables.length}</span>
-                                    <span className="text-slate-600">•</span>
-                                    <span>Total: {discoveredTables.length}</span>
-                                </div>
-                                <div className="relative w-64">
-                                    <span className="absolute left-3 top-1/2 -translate-y-1/2 material-symbols-outlined text-slate-600 text-[16px]">search</span>
-                                    <input
-                                        value={schemaSearch}
-                                        onChange={(e) => setSchemaSearch(e.target.value)}
-                                        placeholder="Search tables..."
-                                        className="w-full pl-9 pr-3 py-2 text-xs bg-[#0b0f16] border border-[#1b2230] rounded-lg text-slate-300 placeholder-slate-600 focus:outline-none focus:border-[#135bec]/60"
-                                    />
-                                </div>
-                            </div>
-                            <div className="grid grid-cols-12 gap-6">
-                        <div className="col-span-12 lg:col-span-5 bg-[#0f1218] border border-[#242a36] rounded-[22px] p-6">
-                            <div className="flex items-center justify-between mb-4">
-                                <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">Selected Tables</div>
-                                <span className="text-[10px] text-slate-400 font-bold">{selectedTables.length} tables</span>
-                            </div>
-                            {filteredSelected.length > 0 ? (
-                                <div className="flex flex-col gap-2">
-                                    {filteredSelected.map((table) => (
-                                        <div
-                                            key={table}
-                                            className={`px-3 py-2 rounded-lg border text-sm text-white font-semibold flex items-center justify-between gap-3 transition-all ${activeTable === table
-                                                ? 'bg-[#135bec]/15 border-[#135bec]/60'
-                                                : 'bg-[#141924] border-[#2a3342]'
-                                                }`}
-                                        >
-                                            <button
-                                                onClick={() => selectTable(table)}
-                                                className="flex-1 text-left hover:text-white"
-                                            >
-                                                {table}
-                                            </button>
-                                            <button
-                                                onClick={() => toggleTable(table)}
-                                                className="text-[10px] font-black uppercase tracking-widest text-slate-400 hover:text-red-400"
-                                            >
-                                                Remove
-                                            </button>
-                                        </div>
-                                    ))}
-                                </div>
-                            ) : (
-                                <div className="text-sm text-slate-500">No tables selected.</div>
-                            )}
-                        </div>
-                        <div className="col-span-12 lg:col-span-7 bg-[#0f1218] border border-[#242a36] rounded-[22px] p-6">
-                            <div className="flex items-center justify-between mb-4">
-                                <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">Other Tables</div>
-                                <span className="text-[10px] text-slate-400 font-bold">{otherTables.length} tables</span>
-                            </div>
-                            {filteredOther.length > 0 ? (
-                                <div className="grid grid-cols-2 gap-2">
-                                    {filteredOther.map((table) => (
-                                        <button
-                                            key={table}
-                                            onClick={() => selectTable(table)}
-                                            className="px-3 py-2 rounded-lg bg-[#0b0f16] border border-[#1b2230] text-xs text-slate-400 font-semibold text-left hover:border-slate-500 hover:text-slate-200 transition-all"
-                                        >
-                                            {table}
-                                        </button>
-                                    ))}
-                                </div>
-                            ) : (
-                                <div className="text-sm text-slate-500">No other tables found.</div>
-                            )}
-                        </div>
-                        <div className="col-span-12 bg-[#0f1218] border border-[#242a36] rounded-[22px] p-6">
-                            <div className="flex items-center justify-between mb-4">
-                                <div className="text-[11px] text-slate-500 font-black uppercase tracking-[3px]">
-                                    Table Preview {activeTable ? `• ${activeTable}` : ''}
-                                </div>
-                                <span className="text-[10px] text-slate-400 font-bold">Last 5 records</span>
-                            </div>
-                            {!activeTable && (
-                                <div className="text-sm text-slate-500">Select a table to preview records and toggle columns.</div>
-                            )}
-                            {activeTable && (
-                                <div className="grid grid-cols-12 gap-6">
-                                    <div className="col-span-12 lg:col-span-4">
-                                        <div className="text-[10px] text-slate-500 uppercase tracking-[2px] font-black mb-2">Columns</div>
-                                        <div className="flex flex-col gap-2 max-h-64 overflow-y-auto pr-1">
-                                            {(tableSchemas[activeTable]?.columns || []).map((col: any, idx: number) => {
-                                                const name = col?.column_name || col?.name;
-                                                if (!name) return null;
-                                                const toggles = columnToggles[activeTable]?.[name] || { show: true };
-                                                return (
-                                                    <label key={`${activeTable}-${name}-${idx}`} className="flex items-center justify-between px-3 py-2 rounded-lg bg-[#11141d] border border-[#1f2530] text-xs text-slate-300">
-                                                        <span>{name}</span>
-                                                        <input
-                                                            type="checkbox"
-                                                            checked={toggles.show !== false}
-                                                            onChange={(e) => updateColumnToggle(activeTable, name, e.target.checked)}
-                                                        />
-                                                    </label>
-                                                );
-                                            })}
-                                        </div>
-                                    </div>
-                                    <div className="col-span-12 lg:col-span-8">
-                                        <div className="text-[10px] text-slate-500 uppercase tracking-[2px] font-black mb-2">Preview</div>
-                                        <div className="bg-[#0b0f16] border border-[#1b2230] rounded-lg overflow-hidden">
-                                            <div className="grid grid-cols-12 px-4 py-2 border-b border-[#1b2230] text-[10px] font-black text-slate-500 uppercase tracking-[2px]">
-                                                {(tableSchemas[activeTable]?.columns || [])
-                                                    .filter((col: any) => {
-                                                        const name = col?.column_name || col?.name;
-                                                        if (!name) return false;
-                                                        return columnToggles[activeTable]?.[name]?.show !== false;
-                                                    })
-                                                    .slice(0, 6)
-                                                    .map((col: any, idx: number) => (
-                                                        <div key={`${activeTable}-col-${idx}`} className="col-span-2 truncate">
-                                                            {col?.column_name || col?.name}
-                                                        </div>
-                                                    ))}
-                                            </div>
-                                            <div className="divide-y divide-[#1b2230]">
-                                                {(tablePreviews[activeTable] || []).slice(0, 5).map((row: any, rowIdx: number) => (
-                                                    <div key={`${activeTable}-row-${rowIdx}`} className="grid grid-cols-12 px-4 py-2 text-[11px] text-slate-300">
-                                                        {(tableSchemas[activeTable]?.columns || [])
-                                                            .filter((col: any) => {
-                                                                const name = col?.column_name || col?.name;
-                                                                if (!name) return false;
-                                                                return columnToggles[activeTable]?.[name]?.show !== false;
-                                                            })
-                                                            .slice(0, 6)
-                                                            .map((col: any, idx: number) => {
-                                                                const name = col?.column_name || col?.name;
-                                                                return (
-                                                                    <div key={`${activeTable}-cell-${rowIdx}-${idx}`} className="col-span-2 truncate">
-                                                                        {name && row && name in row ? String(row[name]) : '—'}
-                                                                    </div>
-                                                                );
-                                                            })}
-                                                    </div>
-                                                ))}
-                                                {(tablePreviews[activeTable] || []).length === 0 && (
-                                                    <div className="px-4 py-4 text-sm text-slate-500">No preview rows available.</div>
-                                                )}
-                                            </div>
-                                        </div>
-                                    </div>
-                                </div>
-                            )}
-                            {schemaError && (
-                                <div className="mt-4 text-sm text-red-400">{schemaError}</div>
-                            )}
-                        </div>
-                            </div>
-                        </>
-                    )}
-                </div>
-
-                {/* Available Integrations Section */}
-                <div className="space-y-6 pt-4">
-                    <div className="flex items-center justify-between">
-                        <h2 className="text-2xl font-extrabold text-white tracking-tight">Available Integrations</h2>
-                        <button className="text-[11px] font-black text-[#135bec] uppercase tracking-widest hover:underline underline-offset-8 transition-all">View Marketplace</button>
-                    </div>
-                    <div className="grid grid-cols-4 gap-6">
+                    <div className="grid grid-cols-3 gap-6">
                         {AVAILABLE_INTEGRATIONS.map((int) => (
                             <div
                                 key={int.id}
@@ -597,24 +250,316 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                         setIsPgModalOpen(true);
                                     }
                                 }}
-                                className="bg-[#111318] border border-[#2d3748] rounded-[24px] p-7 flex flex-col items-center text-center gap-4 hover:border-[#135bec]/40 cursor-pointer transition-all group shadow-xl hover:-translate-y-1 active:scale-[0.98]"
+                                className="relative bg-[#11141d]/40 backdrop-blur-md border border-white/[0.03] rounded-[2.5rem] p-10 flex flex-col items-center text-center gap-8 hover:border-blue-500/30 cursor-pointer transition-all group shadow-2xl hover:-translate-y-2 active:scale-[0.98] overflow-hidden"
                             >
+                                <div className="absolute inset-0 bg-gradient-to-br from-blue-600/5 to-transparent opacity-0 group-hover:opacity-100 transition-opacity"></div>
+                                <div className="absolute -bottom-10 -right-10 w-40 h-40 bg-blue-500/5 blur-[60px] group-hover:bg-blue-500/10 transition-colors"></div>
+
                                 <div className="relative">
-                                    <div className={`w-16 h-16 rounded-[20px] bg-gradient-to-br from-[#1a202c] to-[#0b0d11] border border-[#2d3748] flex items-center justify-center text-slate-400 group-hover:text-[#135bec] transition-all group-hover:shadow-[0_0_20px_rgba(19,91,236,0.15)] group-hover:border-[#135bec]/20`}>
-                                        <span className="material-symbols-outlined text-[36px]">{int.icon}</span>
+                                    <div className={`w-24 h-24 rounded-[2rem] bg-[#1a202c]/50 border border-white/[0.05] flex items-center justify-center text-slate-500 group-hover:text-blue-400 transition-all group-hover:shadow-[0_0_50px_rgba(59,130,246,0.15)] group-hover:border-blue-500/20`}>
+                                        <span className="material-symbols-outlined text-[48px] font-light leading-none">{int.icon}</span>
                                     </div>
-                                    <button className="absolute -top-2 -right-2 w-7 h-7 rounded-full bg-[#111318] border border-[#2d3748] text-slate-500 hover:text-white hover:bg-[#135bec] hover:border-[#135bec] transition-all flex items-center justify-center shadow-lg">
-                                        <span className="material-symbols-outlined text-[16px] font-bold">add</span>
-                                    </button>
+                                    <div className="absolute -top-2 -right-2 w-10 h-10 rounded-full bg-blue-500 text-white flex items-center justify-center shadow-2xl opacity-0 group-hover:opacity-100 translate-y-4 group-hover:translate-y-0 transition-all duration-300">
+                                        <span className="material-symbols-outlined text-[20px] font-bold">add</span>
+                                    </div>
                                 </div>
-                                <div>
-                                    <div className="text-sm font-black text-white tracking-tight uppercase">{int.name}</div>
-                                    <div className="text-[10px] text-slate-500 font-bold mt-1.5 tracking-widest uppercase opacity-60">{int.description}</div>
+                                <div className="relative z-10 space-y-3">
+                                    <div className="text-xl font-black text-white tracking-tight">{int.name}</div>
+                                    <div className="text-[10px] text-slate-500 font-bold tracking-[3px] uppercase opacity-50 px-6">{int.description}</div>
                                 </div>
                             </div>
                         ))}
                     </div>
                 </div>
+
+                {/* Active Pipelines Cards */}
+                <div className="space-y-6">
+                    <div className="flex items-center justify-between px-2">
+                        <div className="flex items-center gap-4">
+                            <h2 className="text-sm font-black text-slate-500 uppercase tracking-[4px]">Active Nodes</h2>
+                            <div className="h-6 w-px bg-white/10"></div>
+                            <span className="text-2xl font-black text-white tracking-tight underline decoration-blue-500 underline-offset-8">Fleet Health</span>
+                        </div>
+                    </div>
+
+                    <div className="grid grid-cols-2 gap-8">
+                        {dataSources.map((ds) => (
+                            <div
+                                key={ds.id}
+                                onClick={() => onSelect(ds.id)}
+                                className={`relative group cursor-pointer transition-all duration-500 ${selectedId === ds.id ? 'scale-[1.02]' : 'hover:scale-[1.01]'}`}
+                            >
+                                <div className={`absolute -inset-0.5 rounded-[2.5rem] blur opacity-20 group-hover:opacity-40 transition duration-500 ${ds.status === 'Connected' ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                                <div className={`relative bg-[#0f1218]/90 backdrop-blur-2xl border border-white/5 rounded-[2.5rem] p-8 flex flex-col gap-6 overflow-hidden ${selectedId === ds.id ? 'border-blue-500/30' : ''}`}>
+                                    <div className="flex items-start justify-between relative z-10">
+                                        <div className="flex items-center gap-5">
+                                            <div className={`w-16 h-16 rounded-[1.5rem] flex items-center justify-center shadow-2xl transition-all duration-500 ${selectedId === ds.id ? 'bg-blue-500 text-white scale-110 rotate-3' : 'bg-[#1a202c] text-slate-500'}`}>
+                                                <span className="material-symbols-outlined text-[32px]">{ds.icon}</span>
+                                            </div>
+                                            <div>
+                                                <div className="text-xl font-black text-white tracking-tight">{ds.name}</div>
+                                                <div className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1 opacity-60">{ds.type}</div>
+                                            </div>
+                                        </div>
+                                        <div className={`px-4 py-1.5 rounded-full border text-[9px] font-black uppercase tracking-[2px] backdrop-blur-md ${ds.status === 'Connected' ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
+                                            {ds.status}
+                                        </div>
+                                    </div>
+
+                                    <div className="grid grid-cols-3 gap-4 border-t border-white/5 pt-6 relative z-10">
+                                        <div className="space-y-1">
+                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Latency</div>
+                                            <div className="text-xs font-bold text-slate-200">24ms</div>
+                                        </div>
+                                        <div className="space-y-1">
+                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Uptime</div>
+                                            <div className="text-xs font-bold text-slate-200">99.9%</div>
+                                        </div>
+                                        <div className="space-y-1 text-right">
+                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Last Pulse</div>
+                                            <div className="text-xs font-bold text-slate-200">{ds.lastSync}</div>
+                                        </div>
+                                    </div>
+
+                                    {/* Abstract Data Visualizer (Mock) */}
+                                    <div className="h-1 lg:h-2 w-full bg-white/5 rounded-full overflow-hidden mt-2 relative">
+                                        <div className={`absolute top-0 left-0 h-full w-2/3 transition-all duration-1000 ${ds.status === 'Connected' ? 'bg-gradient-to-r from-green-500 to-emerald-400' : 'bg-red-500'}`}></div>
+                                        <div className="absolute top-0 left-0 h-full w-full opacity-10 blur-sm bg-blue-500"></div>
+                                    </div>
+
+                                    {selectedId === ds.id && (
+                                        <div className="absolute -right-8 -bottom-8 w-32 h-32 bg-blue-500/10 rounded-full blur-[40px] animate-pulse"></div>
+                                    )}
+                                </div>
+                            </div>
+                        ))}
+                        {dataSources.length === 0 && (
+                            <div className="col-span-2 px-10 py-24 text-center space-y-4 bg-white/[0.01] border border-dashed border-white/10 rounded-[3rem]">
+                                <span className="material-symbols-outlined text-6xl text-slate-800 font-light">terminal</span>
+                                <p className="text-xs font-black text-slate-500 uppercase tracking-[4px]">Waiting for ingestion...</p>
+                            </div>
+                        )}
+                    </div>
+                </div>
+
+
+                {/* Connected Schema Explorer */}
+                <div className="space-y-10 pt-10">
+                    <div className="flex items-end justify-between px-2">
+                        <div className="space-y-1">
+                            <h2 className="text-sm font-black text-slate-500 uppercase tracking-[4px]">Semantic Layer</h2>
+                            <p className="text-3xl font-black text-white tracking-tight">Logical Entities</p>
+                        </div>
+                        <div className="flex items-center gap-4">
+                            <button
+                                onClick={saveSelection}
+                                disabled={isSchemaSyncing || selectedTables.length === 0}
+                                className="px-8 py-3 rounded-2xl bg-white text-black text-[10px] font-black uppercase tracking-widest hover:bg-slate-200 transition-all disabled:opacity-30 disabled:grayscale shadow-[0_0_30px_rgba(255,255,255,0.1)] active:scale-95"
+                            >
+                                {isSchemaSyncing ? 'Syncing...' : 'Push to Production'}
+                            </button>
+                            <button
+                                onClick={() => setShowSchemaPanel(!showSchemaPanel)}
+                                className={`w-12 h-12 rounded-2xl border flex items-center justify-center transition-all ${showSchemaPanel ? 'bg-blue-500/10 border-blue-500/30 text-blue-400' : 'bg-white/5 border-white/10 text-slate-500 hover:text-white'}`}
+                            >
+                                <span className={`material-symbols-outlined text-[20px] transition-transform duration-500 ${showSchemaPanel ? 'rotate-180' : ''}`}>expand_more</span>
+                            </button>
+                        </div>
+                    </div>
+
+                    {showSchemaPanel && (
+                        <div className="relative group/panel">
+                            <div className="absolute -inset-0.5 bg-gradient-to-b from-blue-500/10 to-transparent rounded-[3rem] blur opacity-40"></div>
+                            <div className="relative bg-[#0b0d11]/80 backdrop-blur-3xl border border-white/[0.05] rounded-[3rem] overflow-hidden shadow-2xl">
+                                <div className="flex bg-white/[0.02] border-b border-white/[0.05] px-10 py-6 items-center justify-between">
+                                    <div className="flex items-center gap-3">
+                                        <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-green-500/10 border border-green-500/20 text-[9px] font-black text-green-400 uppercase tracking-widest">
+                                            {connectionStatus}
+                                        </div>
+                                        <div className="text-[10px] text-slate-500 font-bold uppercase tracking-[2px] opacity-60">
+                                            Manifest Explorer
+                                        </div>
+                                    </div>
+                                    <div className="relative w-80">
+                                        <span className="absolute left-4 top-1/2 -translate-y-1/2 material-symbols-outlined text-slate-600 text-[18px]">search</span>
+                                        <input
+                                            value={schemaSearch}
+                                            onChange={(e) => setSchemaSearch(e.target.value)}
+                                            placeholder="FILTER TABLES..."
+                                            className="w-full pl-11 pr-4 py-2.5 text-[10px] font-black tracking-widest bg-black/40 border border-white/5 rounded-2xl text-slate-300 placeholder-slate-700 focus:outline-none focus:border-blue-500/50 transition-all"
+                                        />
+                                    </div>
+                                </div>
+                                <div className="grid grid-cols-12 h-[600px]">
+                                    {/* Sidebar: Table List */}
+                                    <div className="col-span-4 border-r border-white/5 flex flex-col">
+                                        <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-8">
+                                            <div className="space-y-4">
+                                                <div className="text-[9px] text-slate-500 font-black uppercase tracking-[3px] px-2 flex justify-between items-center">
+                                                    <span>Mounted ({selectedTables.length})</span>
+                                                    <div className="w-12 h-px bg-white/5"></div>
+                                                </div>
+                                                <div className="space-y-2">
+                                                    {filteredSelected.map(table => (
+                                                        <div
+                                                            key={table}
+                                                            onClick={() => selectTable(table)}
+                                                            className={`group/item relative px-5 py-3.5 rounded-2xl border transition-all cursor-pointer flex items-center justify-between ${activeTable === table ? 'bg-blue-500/10 border-blue-500/30 ring-1 ring-blue-500/20' : 'bg-white/[0.02] border-white/5 hover:border-white/10'}`}
+                                                        >
+                                                            <div className="flex items-center gap-3 overflow-hidden">
+                                                                <span className={`material-symbols-outlined text-[18px] ${activeTable === table ? 'text-blue-400' : 'text-slate-600'}`}>table_rows</span>
+                                                                <span className={`text-xs font-bold truncate ${activeTable === table ? 'text-white' : 'text-slate-400 group-hover/item:text-slate-200'}`}>{table}</span>
+                                                            </div>
+                                                            <button
+                                                                onClick={(e) => { e.stopPropagation(); toggleTable(table); }}
+                                                                className="opacity-0 group-hover/item:opacity-100 p-1 hover:text-red-400 text-slate-600 transition-all"
+                                                            >
+                                                                <span className="material-symbols-outlined text-[16px]">close</span>
+                                                            </button>
+                                                            {activeTable === table && (
+                                                                <div className="absolute right-0 top-1/2 -translate-y-1/2 w-1 h-4 bg-blue-500 rounded-l-full shadow-[0_0_10px_rgba(59,130,246,0.5)]"></div>
+                                                            )}
+                                                        </div>
+                                                    ))}
+                                                </div>
+                                            </div>
+
+                                            <div className="space-y-4">
+                                                <div className="text-[9px] text-slate-500 font-black uppercase tracking-[3px] px-2 flex justify-between items-center">
+                                                    <span>Available ({otherTables.length})</span>
+                                                    <div className="w-12 h-px bg-white/5"></div>
+                                                </div>
+                                                <div className="grid grid-cols-1 gap-2">
+                                                    {filteredOther.map(table => (
+                                                        <button
+                                                            key={table}
+                                                            onClick={() => toggleTable(table)}
+                                                            className="px-5 py-3 rounded-2xl bg-black/20 border border-white/[0.03] text-[11px] text-slate-500 font-bold text-left hover:border-white/10 hover:text-slate-300 transition-all flex items-center gap-3"
+                                                        >
+                                                            <span className="material-symbols-outlined text-[16px] opacity-40">add_box</span>
+                                                            <span className="truncate">{table}</span>
+                                                        </button>
+                                                    ))}
+                                                </div>
+                                            </div>
+                                        </div>
+                                    </div>
+
+                                    {/* Content: Schema Preview */}
+                                    <div className="col-span-8 bg-black/20 flex flex-col relative overflow-hidden">
+                                        {!activeTable && (
+                                            <div className="flex-1 flex flex-col items-center justify-center text-center p-10 space-y-6">
+                                                <div className="w-24 h-24 rounded-full bg-white/[0.02] border border-white/5 flex items-center justify-center">
+                                                    <span className="material-symbols-outlined text-4xl text-slate-800 animate-pulse">data_object</span>
+                                                </div>
+                                                <div className="space-y-2">
+                                                    <div className="text-sm font-black text-slate-500 uppercase tracking-widest">No Subject Selected</div>
+                                                    <p className="text-xs text-slate-600 max-w-[240px] leading-relaxed">Select an entity from the registry to inspect schema mapping and data samples.</p>
+                                                </div>
+                                            </div>
+                                        )}
+
+                                        {activeTable && (
+                                            <div className="flex-1 flex flex-col overflow-hidden">
+                                                <div className="px-10 py-8 space-y-8 flex-1 overflow-y-auto custom-scrollbar">
+                                                    <div className="flex items-end justify-between border-b border-white/5 pb-6">
+                                                        <div className="space-y-2">
+                                                            <div className="text-[9px] text-blue-400 font-black uppercase tracking-[3px]">Schema Signature</div>
+                                                            <h3 className="text-3xl font-black text-white tracking-tighter">{activeTable}</h3>
+                                                        </div>
+                                                        <div className="text-right space-y-1">
+                                                            <div className="text-[9px] text-slate-500 font-black uppercase tracking-widest">Cardinality</div>
+                                                            <div className="text-xs font-bold text-slate-300">~1.2k Records Evaluated</div>
+                                                        </div>
+                                                    </div>
+
+                                                    <div className="grid grid-cols-2 gap-10">
+                                                        {/* Columns Section */}
+                                                        <div className="space-y-5">
+                                                            <div className="flex items-center justify-between">
+                                                                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Field Mapping</h4>
+                                                                <span className="text-[9px] text-slate-600 font-bold">{tableSchemas[activeTable]?.columns?.length || 0} Total</span>
+                                                            </div>
+                                                            <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
+                                                                {(tableSchemas[activeTable]?.columns || []).map((col: any, idx: number) => {
+                                                                    const name = col?.column_name || col?.name;
+                                                                    const toggles = columnToggles[activeTable]?.[name] || { show: true };
+                                                                    return (
+                                                                        <div
+                                                                            key={name}
+                                                                            className={`group/field px-4 py-3 rounded-2xl border flex items-center justify-between transition-all ${toggles.show !== false ? 'bg-white/[0.03] border-white/5' : 'bg-transparent border-white/[0.02] opacity-40'}`}
+                                                                        >
+                                                                            <div className="flex items-center gap-3">
+                                                                                <div className={`w-1.5 h-1.5 rounded-full ${toggles.show !== false ? 'bg-blue-400 shadow-[0_0_8px_rgba(96,165,250,0.5)]' : 'bg-slate-600'}`}></div>
+                                                                                <div className="flex flex-col">
+                                                                                    <span className="text-xs font-bold text-slate-300">{name}</span>
+                                                                                    <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest mt-0.5">{col?.data_type || 'VARCHAR'}</span>
+                                                                                </div>
+                                                                            </div>
+                                                                            <label className="relative inline-flex items-center cursor-pointer">
+                                                                                <input
+                                                                                    type="checkbox"
+                                                                                    className="sr-only peer"
+                                                                                    checked={toggles.show !== false}
+                                                                                    onChange={(e) => updateColumnToggle(activeTable, name, e.target.checked)}
+                                                                                />
+                                                                                <div className="w-8 h-4 bg-white/5 rounded-full peer peer-checked:bg-blue-500/20 after:content-[''] after:absolute after:top-[2px] after:left-[2px] after:bg-slate-600 peer-checked:after:bg-blue-400 after:rounded-full after:h-3 after:w-3 after:transition-all peer-checked:after:translate-x-4 border border-white/10 group-hover/field:border-white/20 transition-colors"></div>
+                                                                            </label>
+                                                                        </div>
+                                                                    );
+                                                                })}
+                                                            </div>
+                                                        </div>
+
+                                                        {/* Snapshot Section */}
+                                                        <div className="space-y-5">
+                                                            <div className="flex items-center justify-between">
+                                                                <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Data Snapshot</h4>
+                                                                <span className="text-[9px] text-slate-600 font-bold uppercase">Raw Buffer</span>
+                                                            </div>
+                                                            <div className="bg-black/40 border border-white/5 rounded-[2rem] overflow-hidden">
+                                                                <div className="p-4 overflow-x-auto custom-scrollbar-h">
+                                                                    <table className="w-full text-left border-collapse">
+                                                                        <thead>
+                                                                            <tr className="border-b border-white/5">
+                                                                                <th className="px-3 py-2 text-[8px] font-black text-slate-600 uppercase tracking-widest">Index</th>
+                                                                                {(tableSchemas[activeTable]?.columns || []).filter((c: any) => columnToggles[activeTable]?.[c.column_name || c.name]?.show !== false).slice(0, 2).map((col: any) => (
+                                                                                    <th key={col.column_name || col.name} className="px-3 py-2 text-[8px] font-black text-slate-600 uppercase tracking-widest truncate max-w-[80px]">
+                                                                                        {col.column_name || col.name}
+                                                                                    </th>
+                                                                                ))}
+                                                                            </tr>
+                                                                        </thead>
+                                                                        <tbody className="divide-y divide-white/[0.02]">
+                                                                            {(tablePreviews[activeTable] || []).slice(0, 4).map((row: any, i: number) => (
+                                                                                <tr key={i} className="hover:bg-white/[0.01] transition-colors">
+                                                                                    <td className="px-3 py-2 text-[9px] font-mono text-slate-700">{i + 1}</td>
+                                                                                    {(tableSchemas[activeTable]?.columns || []).filter((c: any) => columnToggles[activeTable]?.[c.column_name || c.name]?.show !== false).slice(0, 2).map((col: any) => (
+                                                                                        <td key={col.column_name || col.name} className="px-3 py-2 text-[10px] text-slate-400 font-medium truncate max-w-[80px]">
+                                                                                            {String(row[col.column_name || col.name] || '—')}
+                                                                                        </td>
+                                                                                    ))}
+                                                                                </tr>
+                                                                            ))}
+                                                                        </tbody>
+                                                                    </table>
+                                                                </div>
+                                                                <div className="bg-white/[0.02] px-4 py-3 flex justify-center">
+                                                                    <button className="text-[8px] font-black text-slate-500 uppercase tracking-widest hover:text-white transition-all">View Full Registry</button>
+                                                                </div>
+                                                            </div>
+                                                        </div>
+                                                    </div>
+                                                </div>
+                                            </div>
+                                        )}
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    )}
+                </div>
+
             </div>
 
             <NewMcpAgentModal isOpen={isMcpModalOpen} onClose={() => setIsMcpModalOpen(false)} />

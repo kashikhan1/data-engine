@@ -9,7 +9,8 @@ import DataSourcesView from './views/DataSourcesView';
 import SettingsView from './views/SettingsView';
 import WorkbenchView from './views/WorkbenchView';
 import { ACTIVE_CONNECTIONS } from '@/lib/studio-constants';
-import { useDashboardStore, useEditorStore, useRunStore, useConfigStore, useUIStore, AppView, useWorkflowStore } from '@/state/stores';
+import { useDashboardStore, useEditorStore, useRunStore, useConfigStore, useUIStore, AppView, useWorkflowStore, useAuthStore } from '@/state/stores';
+import { LoginPage } from '@/components/auth/LoginPage';
 import { dbGateway } from '@/lib/mcp/client';
 import { DataSource } from '@/types/dashboard';
 import { Widget } from '@/types/studio';
@@ -31,7 +32,7 @@ const StudioApp: React.FC = () => {
     const { dashboard, isLoading: isDashboardLoading } = useDashboardStore();
     const { selectedWidgetId, selectWidget, localLayout, localWidgets } = useEditorStore();
     const { partialResults } = useRunStore();
-    const { postgresUrl, setConnectionStatus, dataSources } = useConfigStore();
+    const { postgresUrl, setConnectionStatus, dataSources, selectedDataSourceId, connectionStatus } = useConfigStore();
 
     // Auto-connect to Database on mount
     const { setPostgresUrl, addDataSource } = useConfigStore();
@@ -78,9 +79,43 @@ const StudioApp: React.FC = () => {
     }, []); // Run once on mount
 
     // Workflow State
-    const { currentStep, query: workflowQuery, setStep, reset: resetWorkflow, executionResults } = useWorkflowStore();
+    const { currentStep, query: workflowQuery, setStep, executionResults, schemaData } = useWorkflowStore();
 
-    const isEditorView = currentView === 'build' || currentView === 'data-sources';
+    const isEditorView = currentView === 'build' || currentView === 'data-sources' || currentView === 'schema';
+
+    useEffect(() => {
+        if (currentView !== 'build') return;
+        if (workflowQuery) return;
+
+        const hasSchema = (() => {
+            if (!schemaData) return false;
+            const tables = Array.isArray(schemaData?.tables) ? schemaData.tables : [];
+            if (tables.length > 0) return true;
+            const info = schemaData?.schemaInfo;
+            return !!info && Object.keys(info).length > 0;
+        })();
+        if (hasSchema) return;
+
+        const hasConnectedSqlSource = (() => {
+            const selected = dataSources.find((ds) => ds.id === selectedDataSourceId);
+            const candidates = selected ? [selected] : dataSources;
+            const connected = candidates.find((ds) => {
+                const type = String(ds?.type || "").toLowerCase();
+                const isSql = type.includes('postgres') || type.includes('mssql') || type.includes('sql');
+                return isSql && String(ds?.status || '').toLowerCase() === 'connected';
+            });
+            if (connected) return true;
+            return connectionStatus === 'Connected';
+        })();
+
+        if (!hasConnectedSqlSource) {
+            setCurrentView('data-sources');
+            return;
+        }
+
+        setCurrentView('schema');
+        setStep(1);
+    }, [currentView, workflowQuery, schemaData, dataSources, selectedDataSourceId, connectionStatus, setCurrentView, setStep]);
 
     // Compute layout and widgets
     const widgets = useMemo(() => {
@@ -174,6 +209,12 @@ const StudioApp: React.FC = () => {
         return cols.join(' ');
     }, [isEditorView, showCopilot, showInspector]);
 
+    const { isAuthenticated } = useAuthStore();
+
+    if (!isAuthenticated) {
+        return <LoginPage />;
+    }
+
     return (
         <div className="flex h-screen w-full flex-col bg-[var(--bg-app)] text-white overflow-hidden font-sans antialiased">
             <Header />
@@ -210,7 +251,7 @@ const StudioApp: React.FC = () => {
                 {isEditorView && showInspector && (
                     <div className="relative h-full border-l border-[#2d3748]">
                         <InspectorSidebar
-                            currentView={currentView as 'build' | 'data-sources'}
+                            currentView={currentView === 'data-sources' ? 'data-sources' : 'build'}
                             selectedWidget={widgets.find(w => w.id === selectedWidgetId) as any}
                             selectedDataSource={ACTIVE_CONNECTIONS[1]}
                         />

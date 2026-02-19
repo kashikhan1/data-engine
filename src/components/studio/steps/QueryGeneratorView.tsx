@@ -5,6 +5,7 @@ import { useConfigStore, useDashboardStore, useWorkflowStore } from '@/state/sto
 import { executeQuery } from '@/app/actions/mcp';
 import { repairFailedQuery } from '@/lib/agents/nodes';
 import {
+    App,
     Button,
     Card,
     Typography,
@@ -13,7 +14,6 @@ import {
     Alert,
     Tag,
     Collapse,
-    message,
     Input,
     Divider
 } from 'antd';
@@ -86,7 +86,7 @@ export const QueryGeneratorView: React.FC = () => {
         error?: string;
     }>>({});
     const executionResultsRef = useRef<Record<string, any>>({});
-    const [messageApi, contextHolder] = message.useMessage();
+    const { message: messageApi } = App.useApp();
     const messageQueueRef = useRef<Array<() => void>>([]);
     const [messageTick, setMessageTick] = useState(0);
     const enqueueMessage = useCallback((fn: () => void) => {
@@ -654,7 +654,6 @@ export const QueryGeneratorView: React.FC = () => {
 
     return (
         <div style={{ padding: '24px', height: '100%', overflowY: 'auto' }}>
-            {contextHolder}
             <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, padding: '16px 20px', borderRadius: 16, border: '1px solid #242a36', background: '#0f1218' }}>
                 <div>
                     <Title level={2} style={{ margin: 0 }}>
@@ -767,10 +766,10 @@ export const QueryGeneratorView: React.FC = () => {
                     {streamExecutionError && (
                         <Alert
                             type="error"
-                            message="Streaming execution error"
-                            description={streamExecutionError}
+                            title={<span style={{ color: '#fff' }}>Streaming execution error</span>}
+                            description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{streamExecutionError}</span>}
                             showIcon
-                            style={{ marginBottom: 12 }}
+                            style={{ marginBottom: 12, background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                         />
                     )}
 
@@ -799,8 +798,8 @@ export const QueryGeneratorView: React.FC = () => {
                                     </div>
                                     <Tag color={
                                         query.status === 'complete' ? 'success' :
-                                        query.status === 'error' ? 'error' :
-                                        'processing'
+                                            query.status === 'error' ? 'error' :
+                                                'processing'
                                     }>
                                         {query.status}
                                     </Tag>
@@ -836,10 +835,10 @@ export const QueryGeneratorView: React.FC = () => {
                     {Object.values(streamWidgets).some(w => w.status === 'complete' && w.result) && (
                         <>
                             <Divider>Widget Previews</Divider>
-                            <div style={{ 
-                                display: 'grid', 
-                                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))', 
-                                gap: 16 
+                            <div style={{
+                                display: 'grid',
+                                gridTemplateColumns: 'repeat(auto-fit, minmax(280px, 1fr))',
+                                gap: 16
                             }}>
                                 {Object.values(streamWidgets)
                                     .filter(w => w.status === 'complete' && w.result)
@@ -889,10 +888,11 @@ export const QueryGeneratorView: React.FC = () => {
                                         children: (
                                             <div style={{ display: 'flex', flexDirection: 'column', gap: 8 }}>
                                                 <Alert
-                                                    title="Error message"
-                                                    description={entry.error ? entry.error.split('\n')[0] : 'Unknown error'}
                                                     type="error"
+                                                    title={<span style={{ color: '#fff' }}>Error message</span>}
+                                                    description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{entry.error ? entry.error.split('\n')[0] : 'Unknown error'}</span>}
                                                     showIcon
+                                                    style={{ background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                                                 />
                                                 <pre style={{ margin: 0, whiteSpace: 'pre-wrap', color: '#e2e8f0' }}>
                                                     {entry.error}
@@ -963,11 +963,11 @@ export const QueryGeneratorView: React.FC = () => {
                                 />
                                 {status?.status === 'error' && (
                                     <Alert
-                                        title="Syntax Error"
-                                        description={status.message}
+                                        title={<span style={{ color: '#fff' }}>Syntax Error</span>}
+                                        description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{status.message}</span>}
                                         type="error"
                                         showIcon
-                                        style={{ marginTop: 8 }}
+                                        style={{ marginTop: 12, background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                                     />
                                 )}
                             </Card>

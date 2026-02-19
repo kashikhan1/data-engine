@@ -134,6 +134,11 @@ export const useRunStore = create<RunStore>()(
                         state.partialDashboard = event.envelope.dashboard || null;
                         state.isStreaming = false;
                         state.completedAt = event.ts;
+                        state.steps = state.steps.map((step) =>
+                            step.status === "running"
+                                ? { ...step, status: "done", completedAt: event.ts }
+                                : step
+                        );
 
                         if (event.envelope.dashboard) {
                             dashboardStore.setDashboard(event.envelope.dashboard as any);
@@ -147,14 +152,25 @@ export const useRunStore = create<RunStore>()(
                         state.error = event.message;
                         state.isStreaming = false;
                         state.completedAt = event.ts;
+                        state.steps = state.steps.map((step) =>
+                            step.status === "running"
+                                ? { ...step, status: "fail", completedAt: event.ts, message: step.message || event.message }
+                                : step
+                        );
                         break;
                     }
                 }
             }),
 
             endRun: (success, error) => set((state) => {
+                const now = new Date().toISOString();
                 state.isStreaming = false;
-                state.completedAt = new Date().toISOString();
+                state.completedAt = now;
+                state.steps = state.steps.map((step) =>
+                    step.status === "running"
+                        ? { ...step, status: success ? "done" : "fail", completedAt: now }
+                        : step
+                );
                 if (!success && error) {
                     state.error = error;
                 }
@@ -453,11 +469,15 @@ export const useDashboardStore = create<DashboardStore>()(
                 }),
 
                 setFilter: (dimension, value) => set((state) => {
-                    state.activeFilters.set(dimension, value);
+                    const next = new Map(state.activeFilters);
+                    next.set(dimension, value);
+                    state.activeFilters = next;
                 }),
 
                 clearFilter: (dimension) => set((state) => {
-                    state.activeFilters.delete(dimension);
+                    const next = new Map(state.activeFilters);
+                    next.delete(dimension);
+                    state.activeFilters = next;
                 }),
 
                 clearAllFilters: () => set((state) => {
@@ -739,7 +759,6 @@ export const useWorkflowStore = create<WorkflowStore>()(
 
                 setSchemaData: (data) => set((state) => {
                     // Optimization: If schema is identical, do not cascade clear
-                    // This prevents accidental wipes if the discovery runs but returns same data
                     const isSame = JSON.stringify(data) === JSON.stringify(state.schemaData);
                     if (isSame && state.schemaData !== null) {
                         return;
@@ -768,16 +787,14 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     state.userPlan = plan; // Default user plan to AI plan
                     state.error = null;
 
-                    // Mark downstream as stale, but preserve data so UI doesn't emptiness
-                    // This fixes the issue where rerunning the plan appeared to wipe subsequent steps
+                    // Mark downstream as stale
                     state.staleStep = 3;
 
-                    // Clear prior dashboard data so new plan doesn't render old widgets
+                    // Clear ALL downstream data on plan update
+                    state.aiQueries = null;
+                    state.userQueries = null;
                     state.executionResults = null;
                     state.dashboardConfig = null;
-
-                    // Explicitly preserve downstream data (redundant with Immer but explicit for safety)
-                    // state.aiQueries and state.executionResults remain untouched
                 }),
 
                 setUserPlan: (plan) => set((state) => {
@@ -843,21 +860,74 @@ export const useWorkflowStore = create<WorkflowStore>()(
             })),
             {
                 name: 'workflow-store',
+                version: 1,
+                migrate: (persisted: any) => {
+                    if (!persisted || typeof persisted !== 'object') return persisted;
+                    return {
+                        currentStep: persisted.currentStep,
+                        userSchemaNotes: persisted.userSchemaNotes,
+                        schemaTimestamp: persisted.schemaTimestamp,
+                        sqlErrorLog: persisted.sqlErrorLog
+                    };
+                },
                 partialize: (state) => ({
                     // Only persist lightweight state
                     currentStep: state.currentStep,
-                    query: state.query,
                     userSchemaNotes: state.userSchemaNotes,
                     schemaTimestamp: state.schemaTimestamp,
+                    sqlErrorLog: state.sqlErrorLog,
                     aiPlan: state.aiPlan,
                     userPlan: state.userPlan,
                     aiQueries: state.aiQueries,
                     userQueries: state.userQueries,
-                    sqlErrorLog: state.sqlErrorLog,
-                    // EXCLUDE: schemaData (too big), executionResults (too big)
+                    // EXCLUDE: schemaData (too big), executionResults (too big), query (want fresh start)
                 })
             }
         ),
         { name: "workflow-store" }
+    )
+);
+// ============================================================================
+// AUTH STORE (User login/logout)
+// ============================================================================
+export interface AuthUser {
+    id: string;
+    email: string;
+    name: string;
+    avatar?: string;
+}
+
+interface AuthState {
+    isAuthenticated: boolean;
+    user: AuthUser | null;
+}
+
+interface AuthStore extends AuthState {
+    login: (user: AuthUser) => void;
+    logout: () => void;
+}
+
+const initialAuthState: AuthState = {
+    isAuthenticated: false,
+    user: null,
+};
+
+export const useAuthStore = create<AuthStore>()(
+    devtools(
+        persist(
+            immer((set) => ({
+                ...initialAuthState,
+                login: (user) => set((state) => {
+                    state.isAuthenticated = true;
+                    state.user = user;
+                }),
+                logout: () => set((state) => {
+                    state.isAuthenticated = false;
+                    state.user = null;
+                }),
+            })),
+            { name: "auth-store" }
+        ),
+        { name: "auth-store" }
     )
 );

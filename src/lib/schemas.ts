@@ -1,4 +1,5 @@
 import { z } from "zod";
+import { WidgetTypeSchema } from "@/types/dashboard";
 
 export const MetricSchema = z.object({
     id: z.string(),
@@ -14,7 +15,7 @@ export const DimensionSchema = z.object({
     type: z.enum(["string", "number", "boolean", "time", "date"]),
 });
 
-export const WidgetTypeSchema = z.enum(["kpi", "line", "bar", "table", "cohort", "funnel", "map", "scatter", "pie", "donut"]);
+export { WidgetTypeSchema };
 
 export const WidgetSpecSchema = z.object({
     id: z.string(),

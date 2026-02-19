@@ -28,7 +28,6 @@ export const metadata: Metadata = {
 
 import { AntdRegistry } from '@ant-design/nextjs-registry';
 import { ConfigProvider, theme, App } from 'antd';
-import FakeAuthGate from "@/components/auth/FakeAuthGate";
 
 export default function RootLayout({
   children,
@@ -74,7 +73,7 @@ export default function RootLayout({
             }}
           >
             <App>
-              <FakeAuthGate>{children}</FakeAuthGate>
+              {children}
             </App>
           </ConfigProvider>
         </AntdRegistry>

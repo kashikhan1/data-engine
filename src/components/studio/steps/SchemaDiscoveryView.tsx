@@ -2,7 +2,7 @@
 
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useWorkflowStore, useConfigStore } from '@/state/stores';
-import { runSchemaDiscovery } from '@/lib/agents/nodes';
+import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
 import {
     Button,
     Card,
@@ -50,7 +50,8 @@ export const SchemaDiscoveryView: React.FC = () => {
         setError,
         setStep,
         staleStep,
-        setStaleStep
+        setStaleStep,
+        query
     } = useWorkflowStore();
     const { postgresUrl, connectionStatus, projectContext } = useConfigStore();
 
@@ -174,75 +175,67 @@ export const SchemaDiscoveryView: React.FC = () => {
 
     const applyColumnToggles = (baseData: any, toggles: Record<string, Record<string, { show?: boolean; filterable?: boolean }>>) => {
         if (!baseData) return baseData;
-        const maskedSchemaInfo: Record<string, any> = {};
-        const maskedSampleData: Record<string, any[]> = {};
+        const visibleColumns: Record<string, string[]> = {};
+        const filterableColumns: Record<string, string[]> = {};
         const maskedInsights: Record<string, any> = {};
 
         Object.entries(baseData.schemaInfo || {}).forEach(([tableName, info]: [string, any]) => {
             const columns = Array.isArray(info?.columns) ? info.columns : [];
-            const allowedColumns = columns.filter((col: any) => {
-                const name = col?.name || col?.column_name;
-                if (!name) return false;
-                return getColumnToggle(tableName, name, toggles).show;
-            });
-            maskedSchemaInfo[tableName] = { ...info, columns: allowedColumns };
+            const baseVisible = Array.isArray(baseData.visibleColumns?.[tableName])
+                ? baseData.visibleColumns[tableName]
+                : columns.map((c: any) => c?.name || c?.column_name).filter(Boolean);
+            const baseFilterable = Array.isArray(baseData.filterableColumns?.[tableName])
+                ? baseData.filterableColumns[tableName]
+                : (baseData.tableInsights?.[tableName]?.filters || []).map((f: any) => f.column).filter(Boolean);
 
-            const rows = Array.isArray(baseData.sampleData?.[tableName]) ? baseData.sampleData[tableName] : [];
-            const allowedLower = new Set(
-                allowedColumns
-                    .map((col: any) => col?.name || col?.column_name)
-                    .filter(Boolean)
-                    .map((name: string) => name.toLowerCase())
-            );
-            maskedSampleData[tableName] = rows.map((row: any) => {
-                const filtered: Record<string, any> = {};
-                Object.entries(row || {}).forEach(([key, value]) => {
-                    if (key === '__rowKey') {
-                        filtered.__rowKey = value;
-                        return;
-                    }
-                    if (allowedLower.has(String(key).toLowerCase())) {
-                        filtered[key] = value;
-                    }
-                });
-                return filtered;
+            const visibleSet = new Set<string>();
+            const filterableSet = new Set<string>(baseFilterable);
+            baseVisible.forEach((col: string) => visibleSet.add(col));
+
+            columns.forEach((col: any) => {
+                const name = col?.name || col?.column_name;
+                if (!name) return;
+                const toggle = getColumnToggle(tableName, name, toggles);
+                if (toggle.show === false) {
+                    visibleSet.delete(name);
+                } else if (toggle.show === true) {
+                    visibleSet.add(name);
+                }
+                if (toggle.filterable === false) {
+                    filterableSet.delete(name);
+                } else if (toggle.filterable === true) {
+                    filterableSet.add(name);
+                }
             });
+
+            visibleColumns[tableName] = Array.from(visibleSet);
+            filterableColumns[tableName] = Array.from(filterableSet);
 
             const insight = baseData.tableInsights?.[tableName];
             if (insight) {
-                const allowedSet = new Set(allowedColumns.map((c: any) => c?.name || c?.column_name));
                 const allowedFilters = (insight.filters || []).filter((f: any) => {
                     if (!f?.column) return false;
-                    const toggled = getColumnToggle(tableName, f.column, toggles);
-                    return toggled.show && toggled.filterable;
-                });
-                const filteredMatrix = insight.dataMatrix ? {
-                    ...insight.dataMatrix,
-                    categoricalCandidates: (insight.dataMatrix.categoricalCandidates || []).filter((c: any) => allowedSet.has(c.column)),
-                    numericCandidates: (insight.dataMatrix.numericCandidates || []).filter((c: any) => allowedSet.has(c.column))
-                } : undefined;
-                const filteredKpis = (insight.kpis || []).filter((k: any) => {
-                    if (!k?.column || k.column === "*") return true;
-                    return allowedSet.has(k.column);
+                    return filterableSet.has(f.column);
                 });
                 maskedInsights[tableName] = {
                     ...insight,
-                    filters: allowedFilters,
-                    dataMatrix: filteredMatrix,
-                    kpis: filteredKpis
+                    filters: allowedFilters
                 };
             }
         });
 
         return {
             ...baseData,
-            schemaInfo: maskedSchemaInfo,
-            sampleData: maskedSampleData,
+            visibleColumns,
+            filterableColumns,
             tableInsights: maskedInsights
         };
     };
 
-    const buildFilterCandidatesFromTableInsights = (tableInsights: Record<string, any>) => {
+    const buildFilterCandidatesFromTableInsights = (tableInsights: Record<string, any>, filterableColumns?: Record<string, string[]>) => {
+        if (filterableColumns && Object.keys(filterableColumns).length > 0) {
+            return detectFilterCandidatesFromColumns(rawSchemaData?.schemaInfo || {}, filterableColumns);
+        }
         const dateColumns: { table: string; column: string; type: string }[] = [];
         const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
         const entityColumns: { viaTable: string; from: string; to: string }[] = [];
@@ -289,6 +282,46 @@ export const SchemaDiscoveryView: React.FC = () => {
         };
     };
 
+    const detectFilterCandidatesFromColumns = (schemaInfo: Record<string, any>, filterable: Record<string, string[]>) => {
+        const dateColumns: { table: string; column: string; type: string }[] = [];
+        const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
+        const entityColumns: { viaTable: string; from: string; to: string }[] = [];
+
+        Object.entries(filterable || {}).forEach(([table, columns]) => {
+            const info = schemaInfo?.[table];
+            const cols = info?.columns || [];
+            columns.forEach((column) => {
+                const match = cols.find((c: any) => (c?.name || c?.column_name) === column);
+                const type = String(match?.type || match?.data_type || '').toLowerCase();
+                if (/date|time|timestamp/.test(type)) {
+                    dateColumns.push({ table, column, type });
+                } else {
+                    categoricalColumns.push({ table, column, distinct: [] });
+                }
+            });
+        });
+
+        const primaryDate = dateColumns[0];
+        const summaryLines: string[] = [];
+        if (primaryDate) {
+            summaryLines.push(`Date range filter: ${primaryDate.table}.${primaryDate.column}`);
+        }
+        if (categoricalColumns.length > 0) {
+            summaryLines.push(`Categorical filters: ${categoricalColumns.slice(0, 5).map(c => `${c.table}.${c.column}`).join(', ')}${categoricalColumns.length > 5 ? ' ...' : ''}`);
+        }
+        if (entityColumns.length > 0) {
+            summaryLines.push(`Entity filters: ${entityColumns.slice(0, 5).map(e => e.from).join(', ')}${entityColumns.length > 5 ? ' ...' : ''}`);
+        }
+
+        return {
+            dateColumns,
+            categoricalColumns,
+            entityColumns,
+            primaryDate,
+            summary: summaryLines.join('\n') || 'No filterable dimensions detected.'
+        };
+    };
+
     const recomputeSchemaData = (nextOverrides?: Record<string, any>, nextColumnToggles?: Record<string, Record<string, { show?: boolean; filterable?: boolean }>>) => {
         if (!rawSchemaData) return;
         const overrides = nextOverrides ?? insightOverrides;
@@ -299,7 +332,9 @@ export const SchemaDiscoveryView: React.FC = () => {
             tableInsights: mergedInsights
         };
         const maskedData = applyColumnToggles(baseData, toggles);
-        const filterCandidates = maskedData.tableInsights ? buildFilterCandidatesFromTableInsights(maskedData.tableInsights) : rawSchemaData.filterCandidates;
+        const filterCandidates = maskedData.tableInsights
+            ? buildFilterCandidatesFromTableInsights(maskedData.tableInsights, maskedData.filterableColumns)
+            : rawSchemaData.filterCandidates;
         const nextData = {
             ...maskedData,
             filterCandidates,
@@ -347,7 +382,7 @@ export const SchemaDiscoveryView: React.FC = () => {
                 throw lastError || new Error("Schema discovery failed.");
             };
             const semanticEnabled = overrideOptions?.enableSemanticSearch ?? enableSemanticSearch;
-            const tableKpisEnabled = true;
+            const tableKpisEnabled = false;
             const tableMatrixEnabled = overrideOptions?.enableTableMatrix ?? enableTableMetrics;
             const storedTablesRaw = localStorage.getItem(SELECTED_TABLES_KEY);
             const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
@@ -360,7 +395,9 @@ export const SchemaDiscoveryView: React.FC = () => {
             const mergedInsights = buildMergedInsights(data.tableInsights, storedOverrides);
             const baseData = { ...data, tableInsights: mergedInsights };
             const maskedData = applyColumnToggles(baseData, storedToggles);
-            const filterCandidates = maskedData.tableInsights ? buildFilterCandidatesFromTableInsights(maskedData.tableInsights) : data.filterCandidates;
+            const filterCandidates = maskedData.tableInsights
+                ? buildFilterCandidatesFromTableInsights(maskedData.tableInsights, maskedData.filterableColumns)
+                : data.filterCandidates;
             const nextData = {
                 ...maskedData,
                 connectionString: postgresUrl,
@@ -453,8 +490,7 @@ export const SchemaDiscoveryView: React.FC = () => {
                 ...(columnToggles[tableName] || {}),
                 [columnName]: {
                     ...(columnToggles[tableName]?.[columnName] || {}),
-                    [key]: value,
-                    ...(key === 'show' && value === false ? { filterable: false } : {})
+                    [key]: value
                 }
             }
         };
@@ -604,13 +640,6 @@ export const SchemaDiscoveryView: React.FC = () => {
                                 <Text type="secondary" style={{ fontSize: 12 }}>Semantic Search</Text>
                             </Space>
                         </Tooltip>
-                        <Tooltip title="KPI agent runs automatically before planning.">
-                            <Space size="small">
-                                <Switch checked={enableTableMetrics} onChange={handleToggleMetrics} disabled />
-                                <Text type="secondary" style={{ fontSize: 12 }}>KPI Agent (Always On)</Text>
-                                <Tag color="green">Active</Tag>
-                            </Space>
-                        </Tooltip>
                     </Space>
                     <Button
                         icon={<ReloadOutlined />}
@@ -624,7 +653,7 @@ export const SchemaDiscoveryView: React.FC = () => {
                         type="primary"
                         icon={<ArrowRightOutlined />}
                         onClick={() => setStep(2)}
-                        disabled={!schemaData}
+                        disabled={!schemaData || isProcessing || !query?.trim()}
                     >
                         Continue to Plan
                     </Button>
@@ -633,27 +662,61 @@ export const SchemaDiscoveryView: React.FC = () => {
 
             {connectionStatus !== "Connected" && (
                 <Alert
-                    title="Database connection required"
-                    description="Schema discovery needs an active database connection. Open the Data Sources panel and connect your database before refreshing."
+                    title={<span style={{ color: '#fff' }}>Database connection required</span>}
+                    description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>Schema discovery needs an active database connection. Open the Data Sources panel and connect your database before refreshing.</span>}
                     type="warning"
                     showIcon
-                    style={{ marginBottom: 24 }}
+                    style={{ marginBottom: 24, background: 'rgba(250, 173, 20, 0.1)', border: '1px solid rgba(250, 173, 20, 0.3)' }}
                 />
             )}
 
             {error && (
                 <Alert
-                    title="Discovery Error"
-                    description={error}
+                    title={<span style={{ color: '#fff' }}>Discovery Error</span>}
+                    description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{error}</span>}
                     type="error"
                     showIcon
-                    style={{ marginBottom: 24 }}
+                    style={{ marginBottom: 24, background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
                     action={
                         <Button size="small" danger onClick={() => handleDiscover()}>
                             Retry
                         </Button>
                     }
                 />
+            )}
+
+            {!query?.trim() && schemaData && (
+                <div style={{
+                    padding: '24px 32px',
+                    borderRadius: '16px',
+                    background: 'linear-gradient(135deg, rgba(19, 91, 236, 0.1) 0%, rgba(99, 102, 241, 0.05) 100%)',
+                    border: '1px solid rgba(19, 91, 236, 0.2)',
+                    marginBottom: 32,
+                    display: 'flex',
+                    alignItems: 'center',
+                    gap: 20
+                }}>
+                    <div style={{
+                        width: 48,
+                        height: 48,
+                        borderRadius: '14px',
+                        background: 'rgba(19, 91, 236, 0.2)',
+                        display: 'flex',
+                        alignItems: 'center',
+                        justifyContent: 'center',
+                        color: '#135bec',
+                        boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+                    }}>
+                        <InfoCircleOutlined style={{ fontSize: 24 }} />
+                    </div>
+                    <div style={{ flex: 1 }}>
+                        <Title level={4} style={{ margin: '0 0 4px 0', color: '#fff', fontSize: 18 }}>Strategic Intent Needed</Title>
+                        <Text style={{ color: 'rgba(248, 250, 252, 0.8)', fontSize: 14, lineHeight: 1.5, display: 'block' }}>
+                            Success! You've discovered the schema. Now, the AI needs a specific objective or query to architect your dashboard blueprint.
+                            Please enter your request in the chat panel to the left.
+                        </Text>
+                    </div>
+                </div>
             )}
 
             {!schemaData && !isProcessing && (
@@ -946,38 +1009,69 @@ export const SchemaDiscoveryView: React.FC = () => {
                                             </div>
                                         )}
 
-                                        {schemaData.tableInsights[tableName]?.filters && (
-                                            <div style={{ marginTop: 12 }}>
-                                                <Text strong type="secondary">Filterable Dimensions</Text>
-                                                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                    {schemaData.tableInsights[tableName].filters.map((filter: any, idx: number) => (
-                                                        <Tag
-                                                            key={`${tableName}-filter-${filter.id}-${idx}`}
-                                                            color="purple"
-                                                            style={{ margin: 0 }}
-                                                            closable
-                                                            closeIcon={<span style={{ fontSize: 12, marginLeft: 4 }}>×</span>}
-                                                            onClose={(e) => {
-                                                                e.preventDefault();
-                                                                removeFilter(tableName, filter.title);
-                                                            }}
-                                                        >
-                                                            {filter.title}
-                                                        </Tag>
+                                        {/* Query Examples with Results */}
+                                        {schemaData.tableInsights[tableName]?.queryExamples && schemaData.tableInsights[tableName].queryExamples.length > 0 && (
+                                            <div style={{ marginTop: 16, padding: '12px', borderRadius: 8, background: 'rgba(19, 91, 236, 0.05)', border: '1px solid rgba(19, 91, 236, 0.2)' }}>
+                                                <Text strong type="secondary" style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                    <span style={{ fontSize: 14 }}>🧪</span>
+                                                    Query Examples (Executed)
+                                                </Text>
+                                                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                                                    {schemaData.tableInsights[tableName].queryExamples.slice(0, 5).map((example: any, idx: number) => (
+                                                        <details key={`query-${idx}`} style={{ borderRadius: 6, overflow: 'hidden', background: 'rgba(0,0,0,0.2)' }}>
+                                                            <summary style={{ cursor: 'pointer', padding: '8px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                                    <Tag color={example.error ? 'red' : 'green'} style={{ margin: 0, fontSize: 10 }}>
+                                                                        {example.error ? '✗' : '✓'}
+                                                                    </Tag>
+                                                                    <Text style={{ fontSize: 11 }}>{example.description}</Text>
+                                                                </div>
+                                                                {example.executionTime && (
+                                                                    <Text type="secondary" style={{ fontSize: 10 }}>
+                                                                        {example.executionTime}ms
+                                                                    </Text>
+                                                                )}
+                                                            </summary>
+                                                            <div style={{ padding: '8px 10px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                                                                <Text code style={{ fontSize: 10, display: 'block', padding: '6px', background: 'rgba(0,0,0,0.3)', borderRadius: 4, marginBottom: 8, overflow: 'auto' }}>
+                                                                    {example.sql}
+                                                                </Text>
+                                                                
+                                                                    {example.error ? (
+                                                                        <Alert message={example.error} type="error" style={{ fontSize: 10 }} />
+                                                                    ) : example.results && example.results.length > 0 ? (
+                                                                    <div style={{ marginTop: 6 }}>
+                                                                        <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 4 }}>
+                                                                            Results ({example.results.length} rows):
+                                                                        </Text>
+                                                                        <div style={{ maxHeight: 120, overflow: 'auto' }}>
+                                                                            <Table
+                                                                                size="small"
+                                                                                pagination={false}
+                                                                                dataSource={example.results.map((row: any, ridx: number) => ({ ...row, key: ridx }))}
+                                                                                columns={Object.keys(example.results[0] || {}).map((key) => ({
+                                                                                    title: key,
+                                                                                    dataIndex: key,
+                                                                                    key: key,
+                                                                                    render: (val: any) => (
+                                                                                        <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10 }}>
+                                                                                            {String(val)}
+                                                                                        </div>
+                                                                                    )
+                                                                                }))}
+                                                                            />
+                                                                        </div>
+                                                                    </div>
+                                                                ) : (
+                                                                    <Text type="secondary" style={{ fontSize: 10 }}>No results</Text>
+                                                                )}
+                                                            </div>
+                                                        </details>
                                                     ))}
-                                                </div>
-                                                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                                    <Input
-                                                        size="small"
-                                                        placeholder="Add filter dimension"
-                                                        value={filterDrafts[tableName] || ''}
-                                                        onChange={(e) => setFilterDrafts((prev) => ({ ...prev, [tableName]: e.target.value }))}
-                                                        onPressEnter={() => addFilter(tableName)}
-                                                    />
-                                                    <Button size="small" onClick={() => addFilter(tableName)}>Add</Button>
                                                 </div>
                                             </div>
                                         )}
+
                                     </div>
                                 )}
 
@@ -1019,7 +1113,6 @@ export const SchemaDiscoveryView: React.FC = () => {
                                                                     <Switch
                                                                         size="small"
                                                                         checked={toggles.filterable}
-                                                                        disabled={!toggles.show}
                                                                         onChange={(checked) => updateColumnToggle(tableName, name, 'filterable', checked)}
                                                                     />
                                                                 </div>
@@ -1044,18 +1137,18 @@ export const SchemaDiscoveryView: React.FC = () => {
                                                 const { __rowKey, ...rest } = row || {};
                                                 return { ...rest, __rowKey: __rowKey || `row-${idx}` };
                                             })}
-                                            columns={Object.keys(schemaData.sampleData[tableName]?.[0] || {})
-                                                .filter(key => key !== '__rowKey')
-                                                .map(key => ({
-                                                title: key,
-                                                dataIndex: key,
-                                                key: key,
-                                                render: (val: any) => (
-                                                    <div style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                        {String(val)}
-                                                    </div>
-                                                )
-                                            }))}
+                                            columns={(schemaData.visibleColumns?.[tableName] || Object.keys(schemaData.sampleData[tableName]?.[0] || {}))
+                                                .filter((key: string) => key !== '__rowKey')
+                                                .map((key: string) => ({
+                                                    title: key,
+                                                    dataIndex: key,
+                                                    key: key,
+                                                    render: (val: any) => (
+                                                        <div style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                            {String(val)}
+                                                        </div>
+                                                    )
+                                                }))}
                                             rowKey="__rowKey"
                                         />
                                     </div>

@@ -189,3 +189,36 @@
     border: 1px solid rgba(59, 130, 246, 0.5) !important;
     color: #e2e8f0 !important;
 }
+
+/* Ant Design Dropdown Global Overrides for Dark Mode */
+:global(.ant-select-dropdown) {
+    background-color: #0f172a !important;
+    border: 1px solid rgba(148, 163, 184, 0.15) !important;
+    box-shadow: 0 12px 30px rgba(0, 0, 0, 0.6) !important;
+    padding: 6px !important;
+    border-radius: 14px !important;
+}
+
+:global(.ant-select-item) {
+    border-radius: 8px !important;
+    color: rgba(148, 163, 184, 0.9) !important;
+    margin: 2px 0 !important;
+    font-size: 13px !important;
+    transition: all 0.2s !important;
+    padding: 8px 12px !important;
+}
+
+:global(.ant-select-item-option-active) {
+    background-color: rgba(59, 130, 246, 0.12) !important;
+    color: #ffffff !important;
+}
+
+:global(.ant-select-item-option-selected) {
+    background-color: #135bec !important;
+    color: #ffffff !important;
+    font-weight: 700 !important;
+}
+
+:global(.ant-select-item-empty) {
+    color: rgba(148, 163, 184, 0.5) !important;
+}

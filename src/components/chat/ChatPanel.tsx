@@ -1,27 +1,107 @@
 "use client";
 
-import React, { useState, useRef, useEffect } from "react";
-import { Send, Sparkles, Lightbulb, History, X, ChevronLeft, ChevronDown, ChevronUp } from "lucide-react";
+import React, { useState, useRef, useEffect, useMemo } from "react";
+import { Send, Sparkles, Lightbulb, History, X, ChevronLeft, ChevronDown, ChevronUp, LayoutDashboard, MessageSquare, FileBarChart, Database, Table2, AlertCircle, CheckCircle2, Loader2, FileText, TrendingUp, ChevronRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useRunStore, useDashboardStore, useConfigStore, useWorkflowStore, useUIStore } from "@/state/stores";
-import { runSchemaDiscovery, runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from "@/lib/agents/nodes";
+import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from "@/lib/agents/nodes";
+import { runSchemaDiscovery } from "@/lib/agents/schema-discovery";
+import { buildExecutionContext as buildSharedExecutionContext } from "@/lib/execution-context";
+import { getPaginationForId } from "@/lib/pagination";
 import { AgentTimeline } from "./AgentTimeline";
 import styles from "./Chat.module.css";
+
+type ChatMode = 'dashboard' | 'chat' | 'report';
 
 interface Message {
     id: string;
     type: "user" | "ai" | "system" | "error";
     content: string;
     timestamp: string;
+    qaResult?: QAResult | null;
+    reportResult?: ReportResult | null;
 }
 
-const SUGGESTION_CHIPS = [
-    "Show revenue by country for last month",
-    "Weekly active users trend",
-    "Top 10 products by sales",
-    "Customer retention cohort analysis",
-    "Compare Q3 vs Q4 revenue",
-];
+interface QAResult {
+    sql: string;
+    data: any[];
+    columns: string[];
+    rowCount: number;
+    repaired?: boolean;
+    error?: string;
+    humanReadableSummary?: string;
+}
+
+interface ReportSection {
+    id: string;
+    title: string;
+    description: string;
+    sql: string;
+    data: any[];
+    columns: string[];
+    rowCount: number;
+    error?: string;
+}
+
+interface ReportResult {
+    title: string;
+    summary: string;
+    keyMetrics?: Array<{ name: string; value: string; context: string }>;
+    insights: string[];
+    trends?: Array<{ description: string; significance: string }>;
+    anomalies?: string[];
+    recommendation?: string;
+    recommendations?: string[];
+    risks?: string[];
+    sections: ReportSection[];
+    generatedAt: string;
+    question: string;
+}
+
+const SUGGESTION_CHIPS: Record<ChatMode, string[]> = {
+    dashboard: [
+        "Show revenue by country for last month",
+        "Weekly active users trend",
+        "Top 10 products by sales",
+        "Customer retention cohort analysis",
+        "Compare Q3 vs Q4 revenue",
+    ],
+    chat: [
+        "How many orders were placed today?",
+        "What are the top 5 customers by revenue?",
+        "Show all products with low stock",
+        "Average order value per category",
+        "List recent transactions",
+    ],
+    report: [
+        "Monthly sales performance report",
+        "Customer acquisition analysis",
+        "Inventory health overview",
+        "Revenue breakdown by region and product",
+        "User engagement summary for this quarter",
+    ],
+};
+
+const MODE_CONFIG: Record<ChatMode, { label: string; icon: any; description: string; color: string }> = {
+    dashboard: {
+        label: "Dashboard",
+        icon: LayoutDashboard,
+        description: "Create interactive visual dashboards",
+        color: "#3b82f6"
+    },
+    chat: {
+        label: "Chat",
+        icon: MessageSquare,
+        description: "Ask questions and get instant results",
+        color: "#10b981"
+    },
+    report: {
+        label: "Report",
+        icon: FileBarChart,
+        description: "Generate comprehensive data reports",
+        color: "#8b5cf6"
+    },
+};
 
 interface ChatPanelProps {
     onCollapse?: () => void;
@@ -29,14 +109,18 @@ interface ChatPanelProps {
 
 export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const [input, setInput] = useState("");
+    const [chatMode, setChatMode] = useState<ChatMode>('dashboard');
     const [messages, setMessages] = useState<Message[]>([
         {
             id: "welcome",
             type: "ai",
-            content: "Hello! I'm your AI Data Analyst. Ask me anything about your data and I'll create interactive dashboards for you.",
+            content: "Hello! I'm your AI Data Analyst. Choose a mode and ask me anything about your data.",
             timestamp: new Date().toISOString(),
         },
     ]);
+    const [qaLoading, setQaLoading] = useState(false);
+    const [reportLoading, setReportLoading] = useState(false);
+    const [expandedSections, setExpandedSections] = useState<Set<string>>(new Set());
     const [showSuggestions, setShowSuggestions] = useState(true);
     const [showHistory, setShowHistory] = useState(false);
     const [awaitingSqlContinue, setAwaitingSqlContinue] = useState(false);
@@ -45,7 +129,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const messagesEndRef = useRef<HTMLDivElement>(null);
 
     const { isStreaming, steps, error: runError, startRun, handleEvent, endRun } = useRunStore();
-    const { recentQueries, addToRecentQueries, activeFilters, filtersActivated, setDashboard } = useDashboardStore();
+    const { recentQueries, addToRecentQueries, activeFilters, filtersActivated, setDashboard, dashboard } = useDashboardStore();
     const {
         schemaData,
         userPlan,
@@ -65,7 +149,9 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setDashboardConfig,
         reset: resetWorkflow,
         setProcessing,
+        isProcessing,
         currentStep,
+        staleStep,
         setError,
         setStaleStep,
         addSqlError,
@@ -105,11 +191,26 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         dashboard: string[];
     }>({ sql: [], execute: [], dashboard: [] });
     const [showLivePanel, setShowLivePanel] = useState(true);
+    const autoRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+    const autoRefreshInFlightRef = useRef(false);
     const connectors = (dataSources || []).filter((ds) => {
         const type = ds.type?.toLowerCase() || "";
         return type.includes("mcp") || type.includes("postgres") || type.includes("mssql");
     });
     const selectedConnector = connectors.find((ds) => ds.id === selectedDataSourceId) || null;
+    const resolvedConnectionString = selectedConnector?.connectionString || postgresUrl || schemaData?.connectionString || undefined;
+    const resolvedConnectorType = selectedConnector?.type || schemaData?.connectorType || "";
+    const resolvedConnectorInstructions = selectedConnector?.instructions || schemaData?.connectorInstructions || "";
+    const hasConnectedSqlSource = useMemo(() => {
+        const candidates = selectedConnector ? [selectedConnector] : connectors;
+        const connected = candidates.some((ds) => {
+            const type = String(ds?.type || "").toLowerCase();
+            const isSql = type.includes("postgres") || type.includes("mssql") || type.includes("sql");
+            const status = String(ds?.status || "").toLowerCase();
+            return isSql && status === "connected" && Boolean(ds?.connectionString);
+        });
+        return connected || Boolean(resolvedConnectionString);
+    }, [connectors, selectedConnector, resolvedConnectionString]);
 
     const handleSelectConnector = (ds: any) => {
         setSelectedDataSourceId(ds.id);
@@ -125,6 +226,31 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             }
         }
     }, [connectors, postgresUrl, selectedDataSourceId, setPostgresUrl, setSelectedDataSourceId]);
+
+    const buildPaginationConfigForId = (id: string) => {
+        return getPaginationForId(Object.fromEntries(activeFilters), id, {
+            includeTotal: true,
+            allowGlobalFallback: true
+        });
+    };
+
+    const buildExecutionContext = (planFilters: any[] = [], planWidgets: any[] = []) => {
+        return buildSharedExecutionContext({
+            planFilters,
+            activeFilters,
+            candidateWidgets: getExecutionWidgets(planWidgets),
+            includeTotal: true,
+            allowGlobalFallback: true
+        });
+    };
+
+    const getExecutionWidgets = (fallback: any[] = []) => {
+        const dashboardWidgets = dashboard?.widgets || [];
+        if (dashboardWidgets.length > 0) return dashboardWidgets;
+        const workflowWidgets = dashboardConfig?.widgets || [];
+        if (workflowWidgets.length > 0) return workflowWidgets;
+        return fallback;
+    };
 
     const loadManualSchema = () => {
         try {
@@ -177,7 +303,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 sampleData,
                 tableCounts,
                 relationships,
-                connectionString: postgresUrl,
+                connectionString: resolvedConnectionString,
                 filterCandidates: null,
                 rawAnalysis: "Loaded schema from local selection.",
                 filterSummary: "",
@@ -192,24 +318,60 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         const runId = `local_${Date.now()}`;
         const startedAt = new Date().toISOString();
         startRun(runId);
+        setAwaitingSqlContinue(false);
+        setPipelineLogs([]);
+        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
         setDashboardConfig(null);
         setDashboard(null);
         setIsPipelineRunning(true);
         setProcessing(true);
         setError(null);
         setStaleStep(null);
-        resetWorkflow();
+
+        // IMPORTANT: Do NOT reset schema if it exists. We only want to clear the plan and downstream.
+        // resetWorkflow(); // This was clearing schemaData which is bad if we are just re-planning.
+
+        // Manually reset downstream state instead of full reset
+        setAiPlan(null as any);
+        setUserPlan(null as any);
+        setAiQueries(null as any);
+        setUserQueries(null as any);
+        setExecutionResults(null as any);
+        setDashboardConfig(null);
+
+        setCurrentView('build');
         setQuery(query);
         setStep(1);
 
         const sendStep = (step: any, status: any, message?: string) => {
+            const ts = new Date().toISOString();
             handleEvent({
                 type: "step",
                 step,
                 status,
                 message,
-                ts: new Date().toISOString()
+                ts
             } as any);
+            if (message) {
+                handleEvent({
+                    type: "log",
+                    step,
+                    message,
+                    ts
+                } as any);
+                setPipelineLogs((prev) => [...prev, `${String(step).toUpperCase()} [${String(status).toUpperCase()}] ${message}`]);
+                const stage =
+                    step === "sql" ? "sql"
+                        : step === "execute" ? "execute"
+                            : (step === "viz" || step === "narrative") ? "dashboard"
+                                : null;
+                if (stage) {
+                    setPipelineStageLogs((prev) => ({
+                        ...prev,
+                        [stage]: [...prev[stage as "sql" | "execute" | "dashboard"], `${String(status).toUpperCase()}: ${message}`]
+                    }));
+                }
+            }
         };
 
         try {
@@ -223,8 +385,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         try {
                             const storedTablesRaw = localStorage.getItem('schema_selected_tables');
                             const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                            if (allowedTables.length > 0 && postgresUrl) {
-                                const data = await runSchemaDiscovery(postgresUrl, {
+                            if (allowedTables.length > 0 && resolvedConnectionString) {
+                                const data = await runSchemaDiscovery(resolvedConnectionString, {
                                     enableSemanticSearch: false,
                                     enableTableKpis: true,
                                     enableTableMatrix: true,
@@ -267,8 +429,14 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     query,
                     schema: {
                         ...resolvedSchema,
-                        disabledWidgetTypes
-                    }
+                        disabledWidgetTypes,
+                        connectorInstructions: resolvedConnectorInstructions,
+                        connectorType: resolvedConnectorType,
+                        connectionString: resolvedConnectionString
+                    },
+                    connectorInstructions: resolvedConnectorInstructions,
+                    connectorType: resolvedConnectorType,
+                    connectionString: resolvedConnectionString
                 })
             });
             if (!planResponse.ok || !planResponse.body) {
@@ -278,6 +446,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             const planDecoder = new TextDecoder();
             let planBuffer = '';
             let planText = '';
+            let plannerAgents: string | null = null;
             while (true) {
                 const { done, value } = await planReader.read();
                 if (done) break;
@@ -291,6 +460,27 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         const data = JSON.parse(trimmed.substring(6));
                         if (data.chunk) {
                             planText += data.chunk;
+                            if (!plannerAgents && planText.includes("EVENT_STREAM:")) {
+                                const marker = "EVENT_STREAM:";
+                                const idx = planText.indexOf(marker);
+                                if (idx !== -1) {
+                                    const payload = planText.slice(idx + marker.length);
+                                    const eventLines = payload.split('\n');
+                                    for (const eventLine of eventLines) {
+                                        const eventTrimmed = eventLine.trim();
+                                        if (!eventTrimmed.startsWith('{')) continue;
+                                        try {
+                                            const evt = JSON.parse(eventTrimmed);
+                                            if (evt?.type === 'planner_agents' && typeof evt.content === 'string') {
+                                                plannerAgents = evt.content;
+                                                break;
+                                            }
+                                        } catch {
+                                            // ignore malformed event lines
+                                        }
+                                    }
+                                }
+                            }
                             setPlanDraft(planText);
                             setUserPlan({
                                 title: "AI Analytics Dashboard",
@@ -336,26 +526,19 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 : cleanedPlanText;
             const finalizedPlan = {
                 title,
-                rawPlan: normalizedPlanText,
-                widgets: parsedWidgets
+                rawPlan: plannerAgents
+                    ? `${normalizedPlanText}\n\nEVENT_STREAM:\n{"type":"planner_agents","content":"${plannerAgents}"}`
+                    : normalizedPlanText,
+                widgets: parsedWidgets,
+                plannerAgents
             };
             setAiPlan(finalizedPlan);
             setUserPlan(finalizedPlan);
             sendStep("plan", "done", "Plan ready");
-
-            // Pause pipeline until user continues
-            setAwaitingSqlContinue(true);
+            setAwaitingSqlContinue(false);
             setActiveOutputTab('plan');
             setShowPipelineOutput(true);
             setCurrentView("build");
-            endRun(true);
-            setMessages(prev => [...prev, {
-                id: `ai-${Date.now()}`,
-                type: "ai",
-                content: "Plan is ready. Review/edit it, then click Continue to generate SQL.",
-                timestamp: new Date().toISOString(),
-            }]);
-            return;
 
             // Step 3: SQL generation
             setStep(3);
@@ -368,7 +551,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     schema: resolvedSchema,
                     filters: Object.fromEntries(activeFilters),
                     applyFilters: filtersActivated,
-                    errorLog: sqlErrorLog
+                    errorLog: sqlErrorLog,
+                    connectorInstructions: resolvedConnectorInstructions,
+                    connectorType: resolvedConnectorType,
+                    connectionString: resolvedConnectionString
                 })
             });
             if (!sqlResponse.ok) {
@@ -424,9 +610,12 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             queryList.forEach((q) => {
                 execQueryMap[q.id] = q.sql;
             });
-            const execResults = await runQueryExecutor(execQueryMap, postgresUrl || undefined, {
-                connectorInstructions: selectedConnector?.instructions || "",
-                connectorType: selectedConnector?.type || ""
+            const initialExecContext = buildExecutionContext(((finalizedPlan as any).filters) || [], finalizedPlan.widgets || []);
+            const execResults = await runQueryExecutor(execQueryMap, resolvedConnectionString, {
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                tablePagination: initialExecContext.tablePagination,
+                runtimeParams: initialExecContext.runtimeParams
             });
             const resultsList = Object.entries(execResults).map(([id, result]: [string, any]) => ({
                 id,
@@ -492,32 +681,269 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             setIsPipelineRunning(false);
         }
     };
+    // ─── Chat Q&A Handler ───
+    const handleChatQA = async (query: string) => {
+        setQaLoading(true);
+        const thinkingId = `thinking-${Date.now()}`;
+        setMessages(prev => [...prev, {
+            id: thinkingId,
+            type: "system",
+            content: "Analyzing your question...",
+            timestamp: new Date().toISOString(),
+        }]);
+
+        try {
+            const resolvedSchema = await ensureSchema();
+            if (!resolvedSchema) throw new Error("No schema available.");
+
+            const response = await fetch('/api/chat-qa', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    question: query,
+                    schema: resolvedSchema,
+                    connectorInstructions: resolvedConnectorInstructions,
+                    connectorType: resolvedConnectorType,
+                    connectionString: resolvedConnectionString
+                })
+            });
+
+            if (!response.ok || !response.body) throw new Error("Chat Q&A connection failed.");
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let lastStatus = '';
+            let result: QAResult | null = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data:')) continue;
+                    try {
+                        const payload = JSON.parse(trimmed.slice(5).trim());
+                        if (payload.message && payload.status !== lastStatus) {
+                            lastStatus = payload.status;
+                            setMessages(prev => prev.map(m =>
+                                m.id === thinkingId ? { ...m, content: payload.message } : m
+                            ));
+                        }
+                        if (payload.status === 'completed') {
+                            result = {
+                                sql: payload.sql,
+                                data: payload.data || [],
+                                columns: payload.columns || [],
+                                rowCount: payload.rowCount || 0,
+                                repaired: payload.repaired || false,
+                                humanReadableSummary: payload.humanReadableSummary || ''
+                            };
+                        }
+                        if (payload.status === 'error') {
+                            result = {
+                                sql: payload.sql || '',
+                                data: [],
+                                columns: [],
+                                rowCount: 0,
+                                error: payload.message
+                            };
+                        }
+                    } catch { /* ignore malformed */ }
+                }
+            }
+
+            // Remove thinking message
+            setMessages(prev => prev.filter(m => m.id !== thinkingId));
+
+            if (result && !result.error) {
+                const displayContent = result.humanReadableSummary 
+                    ? result.humanReadableSummary 
+                    : `✅ Query returned ${result!.rowCount} rows`;
+                setMessages(prev => [...prev, {
+                    id: `qa-${Date.now()}`,
+                    type: "ai",
+                    content: displayContent,
+                    timestamp: new Date().toISOString(),
+                    qaResult: result
+                }]);
+            } else {
+                setMessages(prev => [...prev, {
+                    id: `qa-error-${Date.now()}`,
+                    type: "error",
+                    content: result?.error || "Query failed.",
+                    timestamp: new Date().toISOString(),
+                    qaResult: result
+                }]);
+            }
+        } catch (err: any) {
+            setMessages(prev => prev.filter(m => m.id !== thinkingId));
+            setMessages(prev => [...prev, {
+                id: `error-${Date.now()}`,
+                type: "error",
+                content: `Chat Q&A failed: ${err.message || String(err)}`,
+                timestamp: new Date().toISOString(),
+            }]);
+        } finally {
+            setQaLoading(false);
+        }
+    };
+
+    // ─── Report Handler ───
+    const handleReport = async (query: string) => {
+        setReportLoading(true);
+        const thinkingId = `thinking-${Date.now()}`;
+        setMessages(prev => [...prev, {
+            id: thinkingId,
+            type: "system",
+            content: "Preparing report...",
+            timestamp: new Date().toISOString(),
+        }]);
+
+        try {
+            const resolvedSchema = await ensureSchema();
+            if (!resolvedSchema) throw new Error("No schema available.");
+
+            const response = await fetch('/api/report/stream', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({
+                    question: query,
+                    schema: resolvedSchema,
+                    connectorInstructions: resolvedConnectorInstructions,
+                    connectorType: resolvedConnectorType,
+                    connectionString: resolvedConnectionString
+                })
+            });
+
+            if (!response.ok || !response.body) throw new Error("Report API connection failed.");
+
+            const reader = response.body.getReader();
+            const decoder = new TextDecoder();
+            let buffer = '';
+            let lastStatus = '';
+            let report: ReportResult | null = null;
+
+            while (true) {
+                const { done, value } = await reader.read();
+                if (done) break;
+                buffer += decoder.decode(value, { stream: true });
+                const lines = buffer.split('\n');
+                buffer = lines.pop() || '';
+                for (const line of lines) {
+                    const trimmed = line.trim();
+                    if (!trimmed.startsWith('data:')) continue;
+                    try {
+                        const payload = JSON.parse(trimmed.slice(5).trim());
+                        if (payload.message && payload.status !== lastStatus) {
+                            lastStatus = payload.status;
+                            setMessages(prev => prev.map(m =>
+                                m.id === thinkingId ? { ...m, content: payload.message } : m
+                            ));
+                        }
+                        if (payload.status === 'completed' && payload.report) {
+                            report = payload.report;
+                        }
+                        if (payload.status === 'error') {
+                            throw new Error(payload.message);
+                        }
+                    } catch (e: any) {
+                        if (e.message && e.message !== 'Unexpected end of JSON input') throw e;
+                    }
+                }
+            }
+
+            setMessages(prev => prev.filter(m => m.id !== thinkingId));
+
+            if (report) {
+                setMessages(prev => [...prev, {
+                    id: `report-${Date.now()}`,
+                    type: "ai",
+                    content: `📊 Report: ${report!.title}`,
+                    timestamp: new Date().toISOString(),
+                    reportResult: report
+                }]);
+            } else {
+                setMessages(prev => [...prev, {
+                    id: `error-${Date.now()}`,
+                    type: "error",
+                    content: "Report generation returned no results.",
+                    timestamp: new Date().toISOString(),
+                }]);
+            }
+        } catch (err: any) {
+            setMessages(prev => prev.filter(m => m.id !== thinkingId));
+            setMessages(prev => [...prev, {
+                id: `error-${Date.now()}`,
+                type: "error",
+                content: `Report failed: ${err.message || String(err)}`,
+                timestamp: new Date().toISOString(),
+            }]);
+        } finally {
+            setReportLoading(false);
+        }
+    };
+
     const handleSend = async () => {
         const query = input.trim();
-        if (!query || isPipelineRunning || isStreaming) return;
+        if (!query || isPipelineRunning || isStreaming || qaLoading || reportLoading) return;
+        if (!hasConnectedSqlSource || !resolvedConnectionString) {
+            setMessages(prev => [...prev, {
+                id: `error-${Date.now()}`,
+                type: "error",
+                content: "No SQL data source is connected. Open Data Sources, connect Postgres/MSSQL, then try again.",
+                timestamp: new Date().toISOString(),
+            }]);
+            setCurrentView("data-sources");
+            return;
+        }
 
         // Add user message
         const userMessage: Message = {
             id: `user-${Date.now()}`,
             type: "user",
-            content: query,
+            content: `${MODE_CONFIG[chatMode].label}: ${query}`,
             timestamp: new Date().toISOString(),
         };
         setMessages(prev => [...prev, userMessage]);
         setInput("");
         setShowSuggestions(false);
 
+        addToRecentQueries(query);
+
+        // Route based on mode
+        if (chatMode === 'chat') {
+            await handleChatQA(query);
+            return;
+        }
+
+        if (chatMode === 'report') {
+            await handleReport(query);
+            return;
+        }
+
+        // Dashboard mode (existing pipeline)
         try {
-            addToRecentQueries(query);
             setMessages(prev => [...prev, {
                 id: `ai-${Date.now()}`,
                 type: "ai",
-                content: "Running schema → plan. I’ll wait for your approval before SQL.",
+                content: "Running full pipeline: schema → plan → SQL → execution → dashboard.",
                 timestamp: new Date().toISOString(),
             }]);
             await runSequentialPipeline(query);
-        } catch (err) {
+        } catch (err: any) {
             console.error("Pipeline failed:", err);
+            setError(err.message || String(err));
+            setProcessing(false);
+            setMessages(prev => [...prev, {
+                id: `error-${Date.now()}`,
+                type: "error",
+                content: `Pipeline failed: ${err.message || String(err)}`,
+                timestamp: new Date().toISOString(),
+            }]);
         }
     };
 
@@ -541,6 +967,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
     const plan = userPlan || aiPlan;
     const queries = userQueries || aiQueries || [];
+    const filterKey = JSON.stringify(Object.fromEntries(Array.from(activeFilters.entries())));
     const resolvedTables = schemaData?.tables || Object.keys(schemaData?.schemaInfo || {});
     const executionSummary = Array.isArray(executionResults) ? executionResults : [];
 
@@ -579,8 +1006,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 try {
                     const storedTablesRaw = localStorage.getItem('schema_selected_tables');
                     const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                    if (allowedTables.length > 0 && postgresUrl) {
-                        const data = await runSchemaDiscovery(postgresUrl, {
+                    if (allowedTables.length > 0 && resolvedConnectionString) {
+                        const data = await runSchemaDiscovery(resolvedConnectionString, {
                             enableSemanticSearch: false,
                             enableTableKpis: true,
                             enableTableMatrix: true,
@@ -616,17 +1043,17 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         const response = await fetch('/api/sql/stream', {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    plan: planToUse,
-                    schema: schemaToUse,
-                    connectorInstructions: selectedConnector?.instructions || "",
-                    connectorType: selectedConnector?.type || "",
-                    connectionString: selectedConnector?.connectionString || postgresUrl,
-                    filters: Object.fromEntries(activeFilters),
-                    applyFilters: filtersActivated,
-                    errorLog: sqlErrorLog
-                })
-            });
+            body: JSON.stringify({
+                plan: planToUse,
+                schema: schemaToUse,
+                connectorInstructions: resolvedConnectorInstructions,
+                connectorType: resolvedConnectorType,
+                connectionString: resolvedConnectionString,
+                filters: Object.fromEntries(activeFilters),
+                applyFilters: filtersActivated,
+                errorLog: sqlErrorLog
+            })
+        });
         if (!response.ok || !response.body) {
             throw new Error("SQL generator connection failed.");
         }
@@ -678,9 +1105,34 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         queryList.forEach((q: any) => {
             queryMap[q.id] = q.sql;
         });
-        const execResults = await runQueryExecutor(queryMap, postgresUrl || undefined, {
-            connectorInstructions: selectedConnector?.instructions || "",
-            connectorType: selectedConnector?.type || ""
+        const executionContext = buildExecutionContext((userPlan || aiPlan)?.filters || [], (userPlan || aiPlan)?.widgets || []);
+        const tablePagination = executionContext.tablePagination;
+        const runtimeParams = executionContext.runtimeParams;
+        const runtimePaginationParams = Object.fromEntries(
+            Object.entries(runtimeParams).filter(([key]) =>
+                key.startsWith("__page:")
+                || key.startsWith("__pageSize:")
+                || key.startsWith("__offset:")
+                || key === "page"
+                || key === "size"
+                || key === "pageSize"
+                || key === "page_size"
+                || key === "storePage"
+                || key === "storeSize"
+                || key === "rowsOnPage"
+                || key === "offset"
+            )
+        );
+        console.log("[PAGINATION_DEBUG][CHAT] executeQueries", {
+            queryIds: Object.keys(queryMap),
+            tablePagination,
+            runtimePaginationParams
+        });
+        const execResults = await runQueryExecutor(queryMap, resolvedConnectionString, {
+            connectorInstructions: resolvedConnectorInstructions,
+            connectorType: resolvedConnectorType,
+            tablePagination,
+            runtimeParams
         });
         const resultsList = Object.entries(execResults).map(([id, result]: [string, any]) => ({
             id,
@@ -715,12 +1167,12 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                             errorMessage: res.error || 'Execution failed',
                             schema: {
                                 ...schemaData,
-                                connectorInstructions: selectedConnector?.instructions || schemaData?.connectorInstructions,
-                                connectorType: selectedConnector?.type || schemaData?.connectorType,
-                                connectionString: selectedConnector?.connectionString || schemaData?.connectionString || postgresUrl
+                                connectorInstructions: resolvedConnectorInstructions || schemaData?.connectorInstructions,
+                                connectorType: resolvedConnectorType || schemaData?.connectorType,
+                                connectionString: resolvedConnectionString || schemaData?.connectionString || postgresUrl
                             },
                             errorLog: sqlErrorLog,
-                            connectionString: postgresUrl || undefined
+                            connectionString: resolvedConnectionString
                         });
                         return { id: res.id, repairResult };
                     } catch (repairErr: any) {
@@ -742,9 +1194,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     .map(async (entry: any) => {
                         const { id, repairResult } = entry;
                         nextQueries = nextQueries.map((q: any) => q.id === id ? { ...q, sql: repairResult.sql } : q);
-                        const rerun = await runQueryExecutor({ [id]: repairResult.sql }, postgresUrl || undefined, {
-                            connectorInstructions: selectedConnector?.instructions || "",
-                            connectorType: selectedConnector?.type || ""
+                        const rerun = await runQueryExecutor({ [id]: repairResult.sql }, resolvedConnectionString, {
+                            connectorInstructions: resolvedConnectorInstructions,
+                            connectorType: resolvedConnectorType,
+                            tablePagination: {
+                                [id]: buildPaginationConfigForId(id)
+                            },
+                            runtimeParams: buildExecutionContext((userPlan || aiPlan)?.filters || [], []).runtimeParams
                         });
                         return { id, fixed: rerun[id], repairResult };
                     });
@@ -779,6 +1235,39 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         return finalDashboard;
     };
 
+    useEffect(() => {
+        const shouldAutoRefresh = staleStep === 4;
+        if (!shouldAutoRefresh) return;
+        if (!plan || !schemaData || !queries || queries.length === 0) return;
+        if (isStreaming || isPipelineRunning || isProcessing || autoRefreshInFlightRef.current) return;
+
+        if (autoRefreshTimerRef.current) {
+            clearTimeout(autoRefreshTimerRef.current);
+        }
+
+        autoRefreshTimerRef.current = setTimeout(async () => {
+            autoRefreshInFlightRef.current = true;
+            try {
+                setStep(4);
+                setActiveOutputTab('execute');
+                const resultsList = await executeQueries(queries);
+                await assembleDashboard(plan, queries, resultsList || [], schemaData);
+                setStep(5);
+                setStaleStep(null);
+            } catch (err: any) {
+                setError(err?.message || "Failed to refresh dashboard data.");
+            } finally {
+                autoRefreshInFlightRef.current = false;
+            }
+        }, 120);
+
+        return () => {
+            if (autoRefreshTimerRef.current) {
+                clearTimeout(autoRefreshTimerRef.current);
+            }
+        };
+    }, [staleStep, plan, queries, schemaData, filterKey, isStreaming, isPipelineRunning, isProcessing, setError, setStep, setStaleStep]);
+
     const streamSqlAndExecuteParallel = async (
         planToUse: any,
         schemaToUse: any,
@@ -800,9 +1289,9 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 filters: Object.fromEntries(activeFilters),
                 applyFilters: filtersActivated,
                 errorLog: sqlErrorLog,
-                connectorType: selectedConnector?.type || "",
-                connectorInstructions: selectedConnector?.instructions || "",
-                connectionString: selectedConnector?.connectionString || postgresUrl
+                connectorType: resolvedConnectorType,
+                connectorInstructions: resolvedConnectorInstructions,
+                connectionString: resolvedConnectionString
             })
         });
         if (!response.ok || !response.body) {
@@ -1007,23 +1496,57 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setUserPlan(nextPlan);
         const runId = `local_continue_${Date.now()}`;
         startRun(runId);
+        setAwaitingSqlContinue(false);
+        setPipelineLogs([]);
+        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
         setDashboardConfig(null);
         setDashboard(null);
         setIsPipelineRunning(true);
         setProcessing(true);
         setError(null);
         const sendStep = (step: any, status: any, message?: string) => {
+            const ts = new Date().toISOString();
             handleEvent({
                 type: "step",
                 step,
                 status,
                 message,
-                ts: new Date().toISOString()
+                ts
             } as any);
+            if (message) {
+                handleEvent({
+                    type: "log",
+                    step,
+                    message,
+                    ts
+                } as any);
+                setPipelineLogs((prev) => [...prev, `${String(step).toUpperCase()} [${String(status).toUpperCase()}] ${message}`]);
+                const stage =
+                    step === "sql" ? "sql"
+                        : step === "execute" ? "execute"
+                            : (step === "viz" || step === "narrative") ? "dashboard"
+                                : null;
+                if (stage) {
+                    setPipelineStageLogs((prev) => ({
+                        ...prev,
+                        [stage]: [...prev[stage as "sql" | "execute" | "dashboard"], `${String(status).toUpperCase()}: ${message}`]
+                    }));
+                }
+            }
         };
         try {
             await streamSqlAndExecuteParallel(nextPlan, schemaToUse, sendStep);
             endRun(true);
+        } catch (err: any) {
+            const message = err?.message || "Pipeline failed";
+            handleEvent({
+                type: "error",
+                message,
+                ts: new Date().toISOString()
+            } as any);
+            setError(message);
+            endRun(false, message);
+            throw err;
         } finally {
             setProcessing(false);
             setIsPipelineRunning(false);
@@ -1173,6 +1696,209 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         );
     };
 
+    // ─── Q&A Result Renderer ───
+    const renderQAResult = (qa: QAResult) => {
+        if (qa.error) {
+            return (
+                <div className={styles.qaResult}>
+                    <div className={styles.qaError}>
+                        <AlertCircle size={16} />
+                        <span>{qa.error}</span>
+                    </div>
+                    {qa.sql && (
+                        <div className={styles.qaSqlBlock}>
+                            <div className={styles.qaSqlHeader}>
+                                <Database size={14} />
+                                <span>Generated SQL</span>
+                            </div>
+                            <pre className={styles.qaSqlCode}>{qa.sql}</pre>
+                        </div>
+                    )}
+                </div>
+            );
+        }
+        return (
+            <div className={styles.qaResult}>
+                <div className={styles.qaStats}>
+                    <span className={styles.qaStat}>
+                        <Table2 size={14} />
+                        {qa.rowCount} rows
+                    </span>
+                    <span className={styles.qaStat}>
+                        <Database size={14} />
+                        {qa.columns.length} columns
+                    </span>
+                    {qa.repaired && (
+                        <span className={styles.qaStatRepaired}>
+                            <CheckCircle2 size={14} />
+                            Auto-repaired
+                        </span>
+                    )}
+                </div>
+                {qa.data.length > 0 && (
+                    <div className={styles.qaTableWrapper}>
+                        <table className={styles.qaTable}>
+                            <thead>
+                                <tr>
+                                    {qa.columns.map((col, i) => (
+                                        <th key={i}>{col}</th>
+                                    ))}
+                                </tr>
+                            </thead>
+                            <tbody>
+                                {qa.data.slice(0, 20).map((row, ri) => (
+                                    <tr key={ri}>
+                                        {qa.columns.map((col, ci) => (
+                                            <td key={ci}>{row[col] != null ? String(row[col]) : '—'}</td>
+                                        ))}
+                                    </tr>
+                                ))}
+                            </tbody>
+                        </table>
+                        {qa.data.length > 20 && (
+                            <div className={styles.qaTableMore}>
+                                Showing 20 of {qa.rowCount} rows
+                            </div>
+                        )}
+                    </div>
+                )}
+                <details className={styles.qaSqlDetails}>
+                    <summary className={styles.qaSqlSummary}>
+                        <Database size={14} />
+                        <span>View SQL</span>
+                    </summary>
+                    <pre className={styles.qaSqlCode}>{qa.sql}</pre>
+                </details>
+            </div>
+        );
+    };
+
+    // ─── Report Result Renderer ───
+    const renderReportResult = (report: ReportResult) => {
+        return (
+            <div className={styles.reportResult}>
+                <div className={styles.reportHeader}>
+                    <FileText size={20} />
+                    <div>
+                        <h3 className={styles.reportTitle}>{report.title}</h3>
+                        <span className={styles.reportDate}>
+                            {new Date(report.generatedAt).toLocaleString()}
+                        </span>
+                    </div>
+                </div>
+
+                {report.summary && (
+                    <div className={styles.reportSummary}>
+                        <h4>Executive Summary</h4>
+                        <p>{report.summary}</p>
+                    </div>
+                )}
+
+                {report.insights && report.insights.length > 0 && (
+                    <div className={styles.reportInsights}>
+                        <h4><TrendingUp size={16} /> Key Insights</h4>
+                        <ul>
+                            {report.insights.map((insight, i) => (
+                                <li key={i}>{insight}</li>
+                            ))}
+                        </ul>
+                    </div>
+                )}
+
+                {report.sections && report.sections.length > 0 && (
+                    <div className={styles.reportSections}>
+                        {report.sections.map((section) => {
+                            const isExpanded = expandedSections.has(section.id);
+                            return (
+                                <div key={section.id} className={styles.reportSection}>
+                                    <button
+                                        className={styles.reportSectionHeader}
+                                        onClick={() => {
+                                            setExpandedSections(prev => {
+                                                const next = new Set(prev);
+                                                if (next.has(section.id)) next.delete(section.id);
+                                                else next.add(section.id);
+                                                return next;
+                                            });
+                                        }}
+                                    >
+                                        <div className={styles.reportSectionTitle}>
+                                            <ChevronRight
+                                                size={16}
+                                                className={isExpanded ? styles.reportChevronOpen : ''}
+                                            />
+                                            <span>{section.title}</span>
+                                            <span className={styles.reportSectionBadge}>
+                                                {section.error ? '❌ Error' : `${section.rowCount} rows`}
+                                            </span>
+                                        </div>
+                                        <span className={styles.reportSectionDesc}>{section.description}</span>
+                                    </button>
+                                    {isExpanded && (
+                                        <div className={styles.reportSectionBody}>
+                                            {section.error ? (
+                                                <div className={styles.qaError}>
+                                                    <AlertCircle size={14} />
+                                                    <span>{section.error}</span>
+                                                </div>
+                                            ) : section.data.length > 0 ? (
+                                                <div className={styles.qaTableWrapper}>
+                                                    <table className={styles.qaTable}>
+                                                        <thead>
+                                                            <tr>
+                                                                {section.columns.map((col, i) => (
+                                                                    <th key={i}>{col}</th>
+                                                                ))}
+                                                            </tr>
+                                                        </thead>
+                                                        <tbody>
+                                                            {section.data.slice(0, 15).map((row, ri) => (
+                                                                <tr key={ri}>
+                                                                    {section.columns.map((col, ci) => (
+                                                                        <td key={ci}>{row[col] != null ? String(row[col]) : '—'}</td>
+                                                                    ))}
+                                                                </tr>
+                                                            ))}
+                                                        </tbody>
+                                                    </table>
+                                                    {section.data.length > 15 && (
+                                                        <div className={styles.qaTableMore}>
+                                                            Showing 15 of {section.rowCount} rows
+                                                        </div>
+                                                    )}
+                                                </div>
+                                            ) : (
+                                                <span className={styles.outputEmpty}>No data returned</span>
+                                            )}
+                                            <details className={styles.qaSqlDetails}>
+                                                <summary className={styles.qaSqlSummary}>
+                                                    <Database size={14} />
+                                                    <span>View SQL</span>
+                                                </summary>
+                                                <pre className={styles.qaSqlCode}>{section.sql}</pre>
+                                            </details>
+                                        </div>
+                                    )}
+                                </div>
+                            );
+                        })}
+                    </div>
+                )}
+
+                {report.recommendation && (
+                    <div className={styles.reportRecommendation}>
+                        <h4>💡 Recommendation</h4>
+                        <p>{report.recommendation}</p>
+                    </div>
+                )}
+            </div>
+        );
+    };
+
+    const isAnyLoading = isPipelineRunning || isStreaming || qaLoading || reportLoading;
+    const activeSuggestions = SUGGESTION_CHIPS[chatMode];
+    const modeColor = MODE_CONFIG[chatMode].color;
+
     return (
         <div className={styles.container}>
             {/* Header */}
@@ -1199,6 +1925,28 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         </button>
                     )}
                 </div>
+            </div>
+
+            {/* ─── Mode Selector ─── */}
+            <div className={styles.modeSelector}>
+                {(Object.keys(MODE_CONFIG) as ChatMode[]).map((mode) => {
+                    const cfg = MODE_CONFIG[mode];
+                    const Icon = cfg.icon;
+                    const isActive = chatMode === mode;
+                    return (
+                        <button
+                            key={mode}
+                            className={`${styles.modeButton} ${isActive ? styles.modeButtonActive : ''}`}
+                            style={isActive ? { borderColor: cfg.color, background: `${cfg.color}18` } : {}}
+                            onClick={() => setChatMode(mode)}
+                            disabled={isAnyLoading}
+                            title={cfg.description}
+                        >
+                            <Icon size={16} style={isActive ? { color: cfg.color } : {}} />
+                            <span style={isActive ? { color: cfg.color } : {}}>{cfg.label}</span>
+                        </button>
+                    );
+                })}
             </div>
 
             {/* History Panel */}
@@ -1244,6 +1992,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         className={`${styles.message} ${styles[msg.type]}`}
                     >
                         {msg.content}
+                        {msg.qaResult && renderQAResult(msg.qaResult)}
+                        {msg.reportResult && renderReportResult(msg.reportResult)}
                     </motion.div>
                 ))}
 
@@ -1424,10 +2174,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     >
                         <div className={styles.suggestionsHeader}>
                             <Lightbulb size={16} />
-                            <span>Try asking</span>
+                            <span>Try asking ({MODE_CONFIG[chatMode].label})</span>
                         </div>
                         <div className={styles.chips}>
-                            {SUGGESTION_CHIPS.map((suggestion, i) => (
+                            {activeSuggestions.map((suggestion, i) => (
                                 <button
                                     key={i}
                                     className={styles.chip}
@@ -1448,18 +2198,19 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         ref={inputRef}
                         type="text"
                         className={styles.input}
-                        placeholder="Ask for a report..."
+                        placeholder={chatMode === 'dashboard' ? 'Describe the dashboard you want...' : chatMode === 'chat' ? 'Ask a question about your data...' : 'What report should I generate?'}
                         value={input}
                         onChange={(e) => setInput(e.target.value)}
                         onKeyDown={handleKeyDown}
-                        disabled={isPipelineRunning || isStreaming}
+                        disabled={isAnyLoading}
                     />
                     <button
                         className={styles.sendButton}
                         onClick={handleSend}
-                        disabled={!input.trim() || isPipelineRunning || isStreaming}
+                        disabled={!input.trim() || isAnyLoading}
+                        style={{ background: modeColor }}
                     >
-                        {isPipelineRunning || isStreaming ? (
+                        {isAnyLoading ? (
                             <div className={styles.spinner} />
                         ) : (
                             <Send size={18} />
