@@ -24,16 +24,6 @@ export async function POST(request: NextRequest) {
                 try {
                     send({ status: "started", message: "Preparing report..." });
 
-                    // Get today's date
-                    const today = new Date();
-                    const todayStr = today.toISOString().split('T')[0];
-                    const todayFormatted = today.toLocaleDateString('en-US', { 
-                        weekday: 'long', 
-                        year: 'numeric', 
-                        month: 'long', 
-                        day: 'numeric' 
-                    });
-
                     // Build COMPACT schema context (budget-aware for small context models)
                     const MAX_COLS_PER_TABLE = 20;
                     const SCHEMA_CHAR_BUDGET = 6000;
@@ -67,32 +57,6 @@ export async function POST(request: NextRequest) {
                         totalChars += line.length;
                     }
 
-                    // Validate if question is related to schema
-                    const questionLower = question.toLowerCase();
-                    const schemaKeywords = [
-                        ...tables,
-                        ...tables.flatMap((t: string) => {
-                            const info = schema.schemaInfo?.[t];
-                            return info?.columns?.map((c: any) => c.name || c.column_name) || [];
-                        }),
-                        'order', 'customer', 'product', 'sale', 'revenue', 'date', 'count', 'sum', 
-                        'average', 'total', 'revenue', 'sales', 'users', 'items', 'transaction',
-                        'report', 'analysis', 'show', 'get', 'find', 'what', 'how many', 'list', 'top', 'bottom'
-                    ].map((k: string) => k.toLowerCase());
-                    
-                    const isRelatedToSchema = schemaKeywords.some((keyword: string) => 
-                        questionLower.includes(keyword)
-                    ) || questionLower.match(/\b(where|when|which|who|what|how many|show|get|find|list|report|analysis)\b/);
-
-                    if (!isRelatedToSchema) {
-                        send({
-                            status: "error",
-                            message: "I don't have context about that topic. I can only generate reports about your database schema. Please ask about your data, tables, or specific business metrics."
-                        });
-                        controller.close();
-                        return;
-                    }
-
                     const isMssql = (connectorType || "").toLowerCase().includes("mssql") ||
                         (connectorInstructions || "").toLowerCase().includes("mssql") ||
                         (connectionString || "").toLowerCase().includes("mssql");
@@ -102,46 +66,14 @@ export async function POST(request: NextRequest) {
                     // Step 1: Generate multiple queries for the report
                     send({ status: "planning", message: "Planning report structure..." });
 
-                    const helperFunctions = isMssql ? `
-**MSSQL Helper Functions:**
-- Today's date: CAST(GETDATE() AS DATE)
-- Add/subtract days: DATEADD(day, N, date_col) or DATEADD(day, -N, date_col)
-- Date difference: DATEDIFF(day, start, end)
-- Truncate to month: DATEADD(month, DATEDIFF(month, 0, date_col), 0)
-- Case-insensitive search: col LIKE '%term%'
-- Pagination: OFFSET N ROWS FETCH NEXT M ROWS ONLY or TOP N
-- Safe division: numerator / NULLIF(denominator, 0)
-- Handle NULL: ISNULL(col, 0) or COALESCE(col, 0)
-- String concat: col1 + ' ' + col2
-- Row number: ROW_NUMBER() OVER (ORDER BY col)` : `
-**PostgreSQL Helper Functions:**
-- Today's date: CURRENT_DATE
-- Add/subtract days: date_col + INTERVAL 'N days' or date_col - INTERVAL 'N days'
-- Date difference: (end_date::date - start_date::date)
-- Truncate to month: DATE_TRUNC('month', date_col)
-- Case-insensitive search: col ILIKE '%term%'
-- Pagination: LIMIT N OFFSET M
-- Safe division: numerator / NULLIF(denominator, 0)
-- Handle NULL: COALESCE(col, 0)
-- String concat: col1 || ' ' || col2 or CONCAT(col1, ' ', col2)
-- Row number: ROW_NUMBER() OVER (ORDER BY col)
-- Conditional count: COUNT(*) FILTER (WHERE condition)`;
-
                     const planPrompt = `You are a data analyst. Plan 2-5 ${dialect} SQL queries for a report answering: "${question}"
-
-DATABASE TYPE: ${dialect}
-TODAY'S DATE: ${todayFormatted} (${todayStr})
-Use this date when processing relative date queries like "today", "this week", "last month", etc.
-
-${helperFunctions}
 
 SCHEMA:
 ${schemaLines.join("\n")}
 ${connectorInstructions ? `\nNOTES: ${connectorInstructions}` : ""}
 
 Return a JSON array: [{"id":"section_1","title":"...","description":"...","sql":"SELECT ..."}]
-Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY valid JSON.
-NOTE: For PostgreSQL, avoid \`COALESCE(interval, 0)\`. Cast timestamps to date before subtraction or use \`EXTRACT(DAY FROM (A - B))::integer\`.`;
+Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY valid JSON.`;
 
                     const model = await createDefaultChatModel();
                     const planResponse = await model.invoke([
@@ -237,8 +169,7 @@ NOTE: For PostgreSQL, avoid \`COALESCE(interval, 0)\`. Cast timestamps to date b
                             if (result.error) {
                                 // Try repair
                                 const repairResponse = await model.invoke([
-                                    new SystemMessage(`Fix this ${dialect} SQL query. Return ONLY the corrected SQL. 
-NOTE: If the error is "COALESCE types interval and integer cannot be matched", ensure \`COALESCE\` arguments match (e.g., cast timestamps to dates before subtraction or use EXTRACT).`),
+                                    new SystemMessage(`Fix this ${dialect} SQL query. Return ONLY the corrected SQL.`),
                                     new HumanMessage(`SQL: ${sql}\nError: ${result.error}\nSchema: ${schemaLines.slice(0, 15).join("\n")}`)
                                 ]);
                                 let repairedSql = typeof repairResponse.content === "string"
@@ -297,198 +228,42 @@ NOTE: If the error is "COALESCE types interval and integer cannot be matched", e
                         }
                     }
 
-                    // Step 3: Advanced ML/AI Analysis
-                    send({ status: "analyzing", message: "Performing advanced data analysis..." });
-
-                    // Calculate statistical summaries for each section
-                    const analysisResults = reportSections.map(section => {
-                        if (section.data.length === 0) return null;
-                        
-                        const stats: any = {
-                            rowCount: section.rowCount,
-                            numericColumns: {},
-                            dateRange: null,
-                            categories: {}
-                        };
-                        
-                        // Analyze first row to detect column types
-                        const sampleRow = section.data[0];
-                        section.columns.forEach(col => {
-                            const values = section.data.map((row: any) => row[col]).filter(v => v !== null && v !== undefined);
-                            
-                            // Check if numeric
-                            if (values.length > 0 && typeof values[0] === 'number') {
-                                const nums = values as number[];
-                                stats.numericColumns[col] = {
-                                    min: Math.min(...nums),
-                                    max: Math.max(...nums),
-                                    avg: nums.reduce((a, b) => a + b, 0) / nums.length,
-                                    sum: nums.reduce((a, b) => a + b, 0)
-                                };
-                            }
-                            
-                            // Check if date
-                            if (values.length > 0 && !isNaN(Date.parse(values[0]))) {
-                                const dates = values.map(v => new Date(v)).sort((a, b) => a.getTime() - b.getTime());
-                                stats.dateRange = {
-                                    earliest: dates[0].toISOString(),
-                                    latest: dates[dates.length - 1].toISOString()
-                                };
-                            }
-                            
-                            // Check if categorical (low cardinality)
-                            if (values.length > 0) {
-                                const unique = [...new Set(values)];
-                                if (unique.length <= 10 && unique.length > 1) {
-                                    stats.categories[col] = unique.length;
-                                }
-                            }
-                        });
-                        
-                        return {
-                            title: section.title,
-                            stats
-                        };
-                    }).filter(Boolean);
-
-                    // Detect trends and anomalies
-                    const trends: Array<{ section: string; metric: string; change: string; direction: string }> = [];
-                    const anomalies: string[] = [];
-                    
-                    reportSections.forEach(section => {
-                        if (section.data.length < 2) return;
-                        
-                        // Look for time-based trends
-                        const dateCol = section.columns.find(col => {
-                            const val = section.data[0]?.[col];
-                            return val && !isNaN(Date.parse(val));
-                        });
-                        
-                        if (dateCol) {
-                            const sorted = [...section.data].sort((a: any, b: any) => 
-                                new Date(a[dateCol]).getTime() - new Date(b[dateCol]).getTime()
-                            );
-                            
-                            // Simple trend detection
-                            const first = sorted[0];
-                            const last = sorted[sorted.length - 1];
-                            const numericCols = section.columns.filter(col => typeof first[col] === 'number');
-                            
-                            numericCols.forEach(col => {
-                                const change = ((last[col] - first[col]) / Math.abs(first[col] || 1)) * 100;
-                                if (Math.abs(change) > 10) {
-                                    trends.push({
-                                        section: section.title,
-                                        metric: col,
-                                        change: change.toFixed(1),
-                                        direction: change > 0 ? 'increasing' : 'decreasing'
-                                    });
-                                }
-                            });
-                        }
-                    });
-
-                    send({ status: "generating_narrative", message: "Generating AI insights..." });
+                    // Step 3: Generate narrative/insights
+                    send({ status: "generating_narrative", message: "Generating report narrative..." });
 
                     const dataContext = reportSections
                         .filter(s => s.data.length > 0)
-                        .map((s, idx) => {
-                            const analysis = analysisResults[idx];
-                            const sampleJson = JSON.stringify(s.data.slice(0, 3));
-                            const truncated = sampleJson.length > 400 ? sampleJson.slice(0, 400) + "..." : sampleJson;
-                            return `${s.title} (${s.rowCount} rows)
-Stats: ${JSON.stringify(analysis?.stats || {})}
-Sample: ${truncated}`;
-                        }).join("\n\n");
+                        .map(s => {
+                            const sampleJson = JSON.stringify(s.data.slice(0, 2));
+                            const truncated = sampleJson.length > 500 ? sampleJson.slice(0, 500) + "..." : sampleJson;
+                            return `${s.title} (${s.rowCount} rows): ${truncated}`;
+                        }).join("\n");
 
-                    const trendsContext = trends.length > 0 
-                        ? `\n\nDETECTED TRENDS:\n${trends.map(t => `- ${t.section} - ${t.metric}: ${t.change}% ${t.direction}`).join("\n")}`
-                        : "";
+                    const narrativePrompt = `Analyze these query results and write a report for: "${question}"
 
-                    const narrativePrompt = `You are an expert ML/AI Data Analyst. Analyze this data comprehensively for: "${question}"
-
+DATA:
 ${dataContext}
-${trendsContext}
 
-Provide a comprehensive analysis including:
-1. Executive Summary (key findings in 2-3 sentences)
-2. Statistical Insights (min, max, averages, totals where relevant)
-3. Trends & Patterns (direction, magnitude, significance)
-4. Anomalies & Outliers (anything unusual)
-5. Correlations (relationships between variables)
-6. Actionable Recommendations (specific next steps)
-7. Risk Assessment (potential issues or concerns)
+Return JSON: {"title":"...","summary":"2-3 sentence executive summary","insights":["insight1","insight2",...],"recommendation":"next steps"}
+Return ONLY valid JSON.`;
 
-Return JSON:
-{
-  "title": "Descriptive report title",
-  "summary": "Executive summary",
-  "keyMetrics": [{"name": "", "value": "", "context": ""}],
-  "insights": ["insight 1", "insight 2"],
-  "trends": [{"description": "", "significance": "high/medium/low"}],
-  "anomalies": ["anomaly 1"],
-  "recommendations": ["action 1", "action 2"],
-  "risks": ["risk 1"]
-}
-
-Return ONLY valid JSON. Be specific and data-driven in your analysis.`;
-
-                    let narrative: {
-                        title: string;
-                        summary: string;
-                        keyMetrics: Array<{ name: string; value: string; context: string }>;
-                        insights: string[];
-                        trends: any[];
-                        anomalies: string[];
-                        recommendations: string[];
-                        risks: string[];
-                    } = {
-                        title: question,
-                        summary: "",
-                        keyMetrics: [],
-                        insights: [],
-                        trends: [],
-                        anomalies: [],
-                        recommendations: [],
-                        risks: []
-                    };
-
+                    let narrative = { title: question, summary: "", insights: [] as string[], recommendation: "" };
                     try {
                         const narrativeResponse = await model.invoke([
-                            new SystemMessage("You are a senior data scientist and business analyst. Provide specific, actionable insights backed by data."),
+                            new SystemMessage("You are a business analyst. Return ONLY valid JSON."),
                             new HumanMessage(narrativePrompt)
                         ]);
                         let narrativeText = typeof narrativeResponse.content === "string"
                             ? narrativeResponse.content
                             : String(narrativeResponse.content);
                         narrativeText = narrativeText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-                        
-                        const parsed = JSON.parse(narrativeText);
-                        narrative = {
-                            title: parsed.title || question,
-                            summary: parsed.summary || "Analysis completed.",
-                            keyMetrics: parsed.keyMetrics || [],
-                            insights: parsed.insights || [],
-                            trends: parsed.trends || [],
-                            anomalies: parsed.anomalies || [],
-                            recommendations: parsed.recommendations || [],
-                            risks: parsed.risks || []
-                        };
-                    } catch (err) {
-                        console.error("[REPORT_API] Narrative parsing failed:", err);
+                        narrative = JSON.parse(narrativeText);
+                    } catch {
                         narrative = {
                             title: question,
-                            summary: `Analysis of ${reportSections.reduce((acc, s) => acc + s.rowCount, 0)} total records across ${reportSections.length} sections.`,
-                            keyMetrics: reportSections.map(s => ({
-                                name: s.title,
-                                value: `${s.rowCount} rows`,
-                                context: "Record count"
-                            })),
-                            insights: reportSections.map(s => `${s.title}: ${s.rowCount} records analyzed`),
-                            trends: trends,
-                            anomalies: [],
-                            recommendations: ["Review detailed sections below for specific findings."],
-                            risks: []
+                            summary: "Report generated from data analysis.",
+                            insights: reportSections.map(s => `${s.title}: ${s.rowCount} records found`),
+                            recommendation: "Review the detailed data sections below for more information."
                         };
                     }
 

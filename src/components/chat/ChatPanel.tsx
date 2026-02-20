@@ -29,7 +29,6 @@ interface QAResult {
     rowCount: number;
     repaired?: boolean;
     error?: string;
-    humanReadableSummary?: string;
 }
 
 interface ReportSection {
@@ -46,13 +45,8 @@ interface ReportSection {
 interface ReportResult {
     title: string;
     summary: string;
-    keyMetrics?: Array<{ name: string; value: string; context: string }>;
     insights: string[];
-    trends?: Array<{ description: string; significance: string }>;
-    anomalies?: string[];
-    recommendation?: string;
-    recommendations?: string[];
-    risks?: string[];
+    recommendation: string;
     sections: ReportSection[];
     generatedAt: string;
     question: string;
@@ -739,8 +733,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                 data: payload.data || [],
                                 columns: payload.columns || [],
                                 rowCount: payload.rowCount || 0,
-                                repaired: payload.repaired || false,
-                                humanReadableSummary: payload.humanReadableSummary || ''
+                                repaired: payload.repaired || false
                             };
                         }
                         if (payload.status === 'error') {
@@ -760,13 +753,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             setMessages(prev => prev.filter(m => m.id !== thinkingId));
 
             if (result && !result.error) {
-                const displayContent = result.humanReadableSummary 
-                    ? result.humanReadableSummary 
-                    : `✅ Query returned ${result!.rowCount} rows`;
                 setMessages(prev => [...prev, {
                     id: `qa-${Date.now()}`,
                     type: "ai",
-                    content: displayContent,
+                    content: `✅ Query returned ${result!.rowCount} rows`,
                     timestamp: new Date().toISOString(),
                     qaResult: result
                 }]);

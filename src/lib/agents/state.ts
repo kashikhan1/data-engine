@@ -7,11 +7,13 @@ import {
     ExecutionPlanSchema,
     QualityReportSchema,
     ErrorRecoverySchema,
+    TemplateSchema,
+    MetadataSchema,
 } from "../schemas";
 import { z } from "zod";
 
 type JsonRow = Record<string, unknown>;
-type SchemaInfo = Record<string, { columns?: JsonRow[];[key: string]: unknown }>;
+type SchemaInfo = Record<string, { columns?: JsonRow[]; [key: string]: unknown }>;
 type SampleData = Record<string, JsonRow[]>;
 type QueryValidationMap = Record<string, string>;
 type Relationship = {
@@ -39,7 +41,7 @@ type RuntimeContext = {
     runtimeParams?: Record<string, unknown>;
     [key: string]: unknown;
 };
-type SecurityClearance = { approved?: boolean;[key: string]: unknown };
+type SecurityClearance = { approved?: boolean; [key: string]: unknown };
 type QueryExecutionResult = {
     widgetId: string | number;
     widgetTitle: string;
@@ -114,6 +116,12 @@ export const AgentState = Annotation.Root({
         reducer: (x, y) => y ?? x,
     }),
     errorRecovery: Annotation<z.infer<typeof ErrorRecoverySchema> | null>({
+        reducer: (x, y) => y ?? x,
+    }),
+    templates: Annotation<z.infer<typeof TemplateSchema>[]>({
+        reducer: (x, y) => y,
+    }),
+    metadata: Annotation<z.infer<typeof MetadataSchema> | null>({
         reducer: (x, y) => y ?? x,
     }),
     schemaRelationships: Annotation<Relationship[]>({

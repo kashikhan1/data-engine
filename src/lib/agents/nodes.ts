@@ -1,15 +1,15 @@
 'use server';
 
 import { AgentState } from "./state";
-import { QueryPlanSchema } from "../schemas";
+import { QueryPlanSchema, DashboardLayoutSchema } from "../schemas";
 import { createDefaultChatModel } from "../llm/model";
-
+import { z } from "zod";
 import { HumanMessage, SystemMessage, AIMessage } from "@langchain/core/messages";
 import { dbGateway } from "../mcp/server";
 import { PLANNER_WIDGET_TYPE_ORDER } from "@/types/dashboard";
 import { AGENT_ROLES, SQL_GENERATION_RULES } from "./prompts";
 import { extractJSON, invokeModelWithRetry as invokeModelWithRetryUtil, streamModelWithRetry as streamModelWithRetryUtil } from "./llm-utils";
-import { categorizeDataType, getColumnName, isTemporalType, isTextType } from "./data-type-utils";
+import { categorizeDataType, getColumnName, isNumericType, isTemporalType, isTextType } from "./data-type-utils";
 import {
     runSchemaDiscovery as runSchemaDiscoveryImpl,
     schemaAgent as schemaAgentImpl,
@@ -22,7 +22,7 @@ import {
     normalizeSqlForValidation,
     stripSqlLiteralsAndComments,
     detectIsMssql,
-
+    validateSqlWithInstructions,
     isPlaceholderSqlQuery,
     renderDynamicSqlTemplate,
     applyRuntimePaginationToSql,
@@ -364,6 +364,7 @@ function computeVisibleColumns(tableSchema: any) {
     return scored
         .filter((c: { name: string; score: number }) => c.name)
         .sort((a: { name: string; score: number }, b: { name: string; score: number }) => b.score - a.score)
+        .slice(0, 8)
         .map((c: { name: string; score: number }) => c.name);
 }
 
@@ -2776,40 +2777,6 @@ export async function runQueryGenerator(
     const systemPrompt = isMssql ? `You are SQL Agent, a Senior SQL Server (MSSQL) Engineer and query optimizer.
 Connector instructions are mandatory and override any conflicting guidance.
 
-### DATABASE CONNECTION INFO
-Type: Microsoft SQL Server (MSSQL)
-${connectorInstructionsTrimmed ? `Special Instructions: ${connectorInstructionsTrimmed}` : ''}
-
-### HELPER FUNCTION REFERENCE
-**Date Functions:**
-- Get today's date: CAST(GETDATE() AS DATE) or CONVERT(DATE, GETDATE())
-- Get current timestamp: GETDATE()
-- Add days: DATEADD(day, N, date_col)
-- Subtract days: DATEADD(day, -N, date_col)
-- Date difference in days: DATEDIFF(day, start_date, end_date)
-- Truncate to month: DATEADD(month, DATEDIFF(month, 0, date_col), 0)
-- Truncate to year: DATEADD(year, DATEDIFF(year, 0, date_col), 0)
-- Format date: CONVERT(VARCHAR, date_col, 120) -- yields YYYY-MM-DD HH:MM:SS
-
-**String Functions:**
-- Case-insensitive LIKE: col LIKE '%term%'
-- Concatenate: col1 + ' ' + col2
-- Uppercase: UPPER(col)
-- Lowercase: LOWER(col)
-- Trim: LTRIM(RTRIM(col))
-- Substring: SUBSTRING(col, start, length)
-
-**Aggregation Helpers:**
-- Safe division: numerator / NULLIF(denominator, 0)
-- Handle NULL: ISNULL(col, default_value) or COALESCE(col, default_value)
-- Conditional count: COUNT(CASE WHEN condition THEN 1 END)
-- Running total: SUM(col) OVER (ORDER BY date_col)
-- Row number: ROW_NUMBER() OVER (ORDER BY col)
-
-**Pagination:**
-- TOP N: SELECT TOP N * FROM table
-- OFFSET/FETCH: OFFSET N ROWS FETCH NEXT M ROWS ONLY
-
 ### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
 1. **NO LIMIT** - Use TOP or OFFSET/FETCH.
 2. **DATE MATH** - Use GETDATE(), DATEADD, DATEDIFF.
@@ -2938,45 +2905,6 @@ Example:
 ]`
         : `You are SQL Agent, a Senior PostgreSQL Engineer and query optimizer.
 
-### DATABASE CONNECTION INFO
-Type: PostgreSQL
-${connectorInstructionsTrimmed ? `Special Instructions: ${connectorInstructionsTrimmed}` : ''}
-
-### HELPER FUNCTION REFERENCE
-**Date Functions:**
-- Get today's date: CURRENT_DATE
-- Get current timestamp: NOW() or CURRENT_TIMESTAMP
-- Add days: date_col + INTERVAL 'N days'
-- Subtract days: date_col - INTERVAL 'N days'
-- Date difference in days: (end_date::date - start_date::date)
-- Truncate to day: DATE_TRUNC('day', date_col)
-- Truncate to month: DATE_TRUNC('month', date_col)
-- Truncate to year: DATE_TRUNC('year', date_col)
-- Extract day/month/year: EXTRACT(DAY FROM date_col), EXTRACT(MONTH FROM date_col), EXTRACT(YEAR FROM date_col)
-- Format date: TO_CHAR(date_col, 'YYYY-MM-DD')
-
-**String Functions:**
-- Case-insensitive LIKE: col ILIKE '%term%'
-- Concatenate: col1 || ' ' || col2 or CONCAT(col1, ' ', col2)
-- Uppercase: UPPER(col)
-- Lowercase: LOWER(col)
-- Trim: TRIM(col)
-- Substring: SUBSTRING(col FROM start FOR length)
-- Replace: REPLACE(col, 'old', 'new')
-
-**Aggregation Helpers:**
-- Safe division: numerator / NULLIF(denominator, 0)
-- Handle NULL: COALESCE(col, default_value)
-- Conditional count: COUNT(*) FILTER (WHERE condition)
-- Conditional sum: SUM(CASE WHEN condition THEN col ELSE 0 END)
-- Running total: SUM(col) OVER (ORDER BY date_col)
-- Row number: ROW_NUMBER() OVER (ORDER BY col)
-- Rank: RANK() OVER (ORDER BY col)
-
-**Pagination:**
-- LIMIT: LIMIT N
-- OFFSET: OFFSET N LIMIT M
-
 ### CRITICAL: POSTGRESQL SYNTAX RULES (MANDATORY)
 1. **NO DATEDIFF()** - This function DOES NOT EXIST in PostgreSQL.
    - USE: \`date1 - date2\` for the difference in days.
@@ -2988,10 +2916,6 @@ ${connectorInstructionsTrimmed ? `Special Instructions: ${connectorInstructionsT
 7. **Handle NULLs** - Use \`COALESCE(SUM(col), 0)\` for metrics to avoid returning null to the UI.
 8. **Explicit Aggregations** - Every column in SELECT must either be in GROUP BY or be an aggregate function.
 9. **Division by Zero** - Protect divisions: \`numerator / NULLIF(denominator, 0)\`.
-10. **COALESCE TYPE SAFETY** - PostgreSQL will error if you \`COALESCE(interval, 0)\`.
-    - If calculating days difference using \`(A - B)\` where A or B are TIMESTAMPS, it returns an \`interval\`.
-    - You MUST cast to date FIRST (\`A::date - B::date\`) to get an integer, OR cast the interval to an integer: \`EXTRACT(DAY FROM (A - B))::integer\`.
-    - Always ensure your \`COALESCE\` arguments are the same type.
 
 ### DATABASE SCHEMA (STRICT TRUTH)
 ${simplifiedSchema}
@@ -3793,22 +3717,8 @@ export async function intentAgent(state: typeof AgentState.State) {
     const lastMessage = state.messages[state.messages.length - 1];
     const query = typeof lastMessage.content === 'string' ? lastMessage.content : "Overview of data";
     const focusTable = state.context?.focusTable;
-    
-    // Get today's date
-    const today = new Date();
-    const todayStr = today.toISOString().split('T')[0];
-    const todayFormatted = today.toLocaleDateString('en-US', { 
-        weekday: 'long', 
-        year: 'numeric', 
-        month: 'long', 
-        day: 'numeric' 
-    });
 
     const prompt = `You are an Intent Parsing Agent (Senior Analyst). Extract user goals into JSON.
-    
-    TODAY'S DATE: ${todayFormatted} (${todayStr})
-    Use this when interpreting date-related queries like "today", "this week", "last month", etc.
-    
     FIELDS: intent (short string), entities (tables involved), metrics (requested values), dimensions (grouping), filters (where clause ideas).
     ${focusTable ? `CONTEXT: The user is currently inspecting the '${focusTable}' table. Prioritize this entity.` : ''}
     QUERY: "${query}"`;
@@ -3949,7 +3859,7 @@ function buildFallbackSql(plan: any, schemaInfo: Record<string, any> | undefined
     const temporalCol = columns.find((c: any) => isTemporalType(c.data_type || c.type || ""));
     const textCol = columns.find((c: any) => isTextType(c.data_type || c.type || ""));
     const idCol = columns.find((c: any) => c.isPrimary || getName(c) === "id") || columns[0];
-    const columnNames = columns.map((c: any) => quoteCol(c)).join(", ") || "*";
+    const columnNames = columns.slice(0, 8).map((c: any) => quoteCol(c)).join(", ") || "*";
 
     const map: Record<string, string> = {};
     const widgets = Array.isArray(plan?.widgets) && plan.widgets.length > 0
@@ -4608,13 +4518,13 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
 
     const baseResults = results.length > 0 ? results : fallbackFromPlan();
 
-    const normalizedResults = baseResults.map((res: any, index: number) => {
+    const normalizedResults = baseResults.map((res, index) => {
         const fallbackId = res.widgetTitle ? `w_${res.widgetTitle.toLowerCase().replace(/[^a-z0-9]+/g, "_")}` : `widget_${index + 1}`;
         const widgetId = String(res.widgetId || fallbackId);
         return { ...res, widgetId };
     });
 
-    const validIds = new Set(normalizedResults.map((res: any) => res.widgetId));
+    const validIds = new Set(normalizedResults.map((res) => res.widgetId));
     const normalizedLayout = layoutFromState
         .filter((item: any) => item && item.i && validIds.has(String(item.i)))
         .map((item: any) => ({
@@ -4625,7 +4535,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
             h: Number(item.h) || 4,
         }));
 
-    const layoutIds = new Set(normalizedLayout.map((item: any) => item.i));
+    const layoutIds = new Set(normalizedLayout.map((item) => item.i));
     const fallbackLayout: any[] = [];
 
     const getDefaultSize = (type?: string) => {
@@ -4653,7 +4563,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
         return position;
     };
 
-    normalizedResults.forEach((res: any) => {
+    normalizedResults.forEach((res) => {
         if (!layoutIds.has(res.widgetId)) {
             fallbackLayout.push(placeNext(res.widgetId, getDefaultSize(res.type)));
             layoutIds.add(res.widgetId);
@@ -4661,9 +4571,9 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
     });
 
     const mergedLayout = [...normalizedLayout, ...fallbackLayout];
-    const layoutById = new Map(mergedLayout.map((item: any) => [item.i, item]));
+    const layoutById = new Map(mergedLayout.map((item) => [item.i, item]));
 
-    const finalWidgets = normalizedResults.map((res: any) => {
+    const finalWidgets = normalizedResults.map(res => {
         const grid = layoutById.get(res.widgetId) || { x: 0, y: 0, w: 6, h: 4 };
 
         const safeColumns = Array.isArray(res.columns) ? res.columns : [];
@@ -4690,7 +4600,7 @@ export async function widgetRendererAgent(state: typeof AgentState.State) {
         dashboard: {
             id: `dash_${Date.now()}`,
             name: (state.queryPlan as any)?.title || "AI Insight Hub",
-            widgets: finalWidgets.map((w: any) => ({
+            widgets: finalWidgets.map(w => ({
                 ...w,
                 goal: w.goal // Explicitly pass the goal for the UI
             })),

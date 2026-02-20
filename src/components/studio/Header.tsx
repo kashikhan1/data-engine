@@ -19,7 +19,7 @@ const Header: React.FC = () => {
                     </div>
                     <div className="flex flex-col">
                         <h1 className="text-[12px] font-black leading-none tracking-[1.5px] text-white uppercase font-sans">
-                            LUMAN AI DATA ENGINE
+                            LUMEN AI DATA ENGINE
                         </h1>
                         <span className="text-[8px] text-slate-500 font-bold mt-1 tracking-widest uppercase font-sans">
                             PRO EDITION v2.4
@@ -80,7 +80,7 @@ const Header: React.FC = () => {
                                 label: (
                                     <div className="flex flex-col px-1 py-1">
                                         <span className="text-white font-bold text-xs">{user?.name || 'User'}</span>
-                                        <span className="text-slate-500 text-[10px]">{user?.email || 'user@luman.ai'}</span>
+                                        <span className="text-slate-500 text-[10px]">{user?.email || 'user@lumen.ai'}</span>
                                     </div>
                                 ),
                             },

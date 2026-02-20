@@ -177,7 +177,7 @@ const SettingsView: React.FC = () => {
                                         </div>
                                         <div className="space-y-2">
                                             <label className="text-[11px] font-bold text-slate-500 uppercase tracking-widest">Email Address</label>
-                                            <input type="email" defaultValue="admin@luman.ai" className="w-full px-4 py-3 bg-[#0a0d11] border border-[#2d3748] rounded-xl text-sm text-white focus:border-[#135bec]/50 outline-none transition-all opacity-50 cursor-not-allowed" disabled />
+                                            <input type="email" defaultValue="admin@lumen.ai" className="w-full px-4 py-3 bg-[#0a0d11] border border-[#2d3748] rounded-xl text-sm text-white focus:border-[#135bec]/50 outline-none transition-all opacity-50 cursor-not-allowed" disabled />
                                         </div>
                                     </div>
                                     <div className="space-y-2">

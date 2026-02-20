@@ -688,9 +688,6 @@ Connector instructions are mandatory and override any conflicting guidance.
    - Example: \`(CURRENT_DATE - first_used_at)\`
 2. **NO window functions inside aggregates** - You cannot do \`SUM(count(*) OVER (...))\`.
 3. **DATE_TRUNC** - Always cast to timestamp: \`DATE_TRUNC('day', col::timestamp)\`.
-4. **COALESCE TYPE MISMATCH** - PostgreSQL DOES NOT allow \`COALESCE(interval, integer)\`.
-   - If the error is "COALESCE types interval and integer cannot be matched", you MUST cast the interval to an integer using \`EXTRACT(EPOCH FROM ...)\` or similar, OR cast the second argument to an interval.
-   - For days difference: USE \`EXTRACT(DAY FROM (end_date::timestamp - start_date::timestamp))::integer\` to get a simple integer that matches your fallback (e.g., 0).
 
 ${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ""}
 

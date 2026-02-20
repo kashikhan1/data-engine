@@ -11,7 +11,7 @@ export const LoginPage: React.FC = () => {
     const [isLoading, setIsLoading] = useState(false);
     const login = useAuthStore((state) => state.login);
 
-    const requiredEmail = process.env.NEXT_PUBLIC_FAKE_AUTH_EMAIL || 'admin@luman.ai';
+    const requiredEmail = process.env.NEXT_PUBLIC_FAKE_AUTH_EMAIL || 'admin@lumen.ai';
     const requiredPassword = process.env.NEXT_PUBLIC_FAKE_AUTH_PASSWORD || 'admin123';
 
     const handleLogin = async (e: React.FormEvent) => {
@@ -43,7 +43,7 @@ export const LoginPage: React.FC = () => {
                     <div className="w-16 h-16 bg-[#135bec] rounded-2xl flex items-center justify-center text-white shadow-xl shadow-blue-900/40 mb-6">
                         <span className="material-symbols-outlined text-[32px] font-bold">auto_awesome</span>
                     </div>
-                    <h1 className="text-2xl font-black text-white uppercase tracking-[4px]">Luman AI</h1>
+                    <h1 className="text-2xl font-black text-white uppercase tracking-[4px]">Lumen AI</h1>
                     <p className="text-slate-500 text-[10px] font-bold uppercase tracking-widest mt-2">Enterprise Data Engine</p>
                 </div>
 
