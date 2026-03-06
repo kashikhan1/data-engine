@@ -13,7 +13,7 @@
  */
 
 import 'dotenv/config';
-import { runSchemaDiscovery } from './src/lib/agents/nodes';
+import { runSchemaDiscovery } from './src/lib/agents/schema-discovery';
 import * as fs from 'fs';
 import * as path from 'path';
 

@@ -516,9 +516,10 @@
 
 .livePanel {
     display: grid;
-    grid-template-columns: repeat(3, minmax(0, 1fr));
+    grid-template-columns: repeat(auto-fit, minmax(170px, 1fr));
     gap: 0.75rem;
     margin-bottom: 0.5rem;
+    align-items: stretch;
 }
 
 .livePanelHeader {
@@ -558,6 +559,16 @@
     background: rgba(2, 6, 23, 0.55);
     border-radius: 12px;
     padding: 0.6rem 0.75rem;
+    min-height: 150px;
+    display: flex;
+    flex-direction: column;
+    gap: 0.35rem;
+}
+
+.liveTitleRow {
+    display: flex;
+    align-items: center;
+    justify-content: space-between;
 }
 
 .liveTitle {
@@ -565,18 +576,54 @@
     text-transform: uppercase;
     letter-spacing: 0.08em;
     color: rgba(226, 232, 240, 0.7);
-    margin-bottom: 0.35rem;
+}
+
+.liveCount {
+    font-size: 0.62rem;
+    font-weight: 700;
+    letter-spacing: 0.08em;
+    color: rgba(191, 219, 254, 0.95);
+    background: rgba(30, 64, 175, 0.22);
+    border: 1px solid rgba(59, 130, 246, 0.45);
+    border-radius: 999px;
+    padding: 0.1rem 0.45rem;
+}
+
+.liveLatest {
+    font-size: 0.72rem;
+    color: #dbeafe;
+    background: rgba(15, 23, 42, 0.6);
+    border: 1px solid rgba(59, 130, 246, 0.25);
+    border-radius: 8px;
+    padding: 0.35rem 0.45rem;
+    line-height: 1.35;
+    word-break: break-word;
+}
+
+.liveLines {
+    margin-top: 0.15rem;
+    max-height: 170px;
+    overflow-y: auto;
+    padding-right: 0.2rem;
 }
 
 .liveLine {
-    font-size: 0.75rem;
-    color: rgba(226, 232, 240, 0.9);
-    padding: 2px 0;
+    font-size: 0.72rem;
+    color: rgba(226, 232, 240, 0.88);
+    padding: 3px 0;
+    line-height: 1.35;
+    border-bottom: 1px dashed rgba(148, 163, 184, 0.14);
+}
+
+.liveLine:last-child {
+    border-bottom: none;
 }
 
 .liveEmpty {
-    font-size: 0.75rem;
+    font-size: 0.72rem;
     color: rgba(148, 163, 184, 0.7);
+    line-height: 1.35;
+    min-height: 18px;
 }
 
 .outputMeta {
@@ -1078,4 +1125,96 @@
     font-size: 0.78rem;
     color: #cbd5e1;
     line-height: 1.6;
+}
+
+/* ─── Section narrative (AI insight per section) ─── */
+.reportSectionNarrative {
+    font-size: 0.77rem;
+    color: #94a3b8;
+    line-height: 1.6;
+    padding: 8px 12px;
+    background: rgba(99, 102, 241, 0.05);
+    border-left: 2px solid rgba(139, 92, 246, 0.35);
+    border-radius: 0 6px 6px 0;
+    margin-bottom: 10px;
+    font-style: italic;
+}
+
+/* ─── KPI cards for single-row summary sections ─── */
+.reportKpiGrid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(120px, 1fr));
+    gap: 10px;
+    margin-bottom: 6px;
+}
+
+.reportKpiCard {
+    display: flex;
+    flex-direction: column;
+    gap: 4px;
+    padding: 12px 14px;
+    background: rgba(30, 41, 59, 0.6);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    border-radius: 10px;
+    text-align: center;
+}
+
+.reportKpiLabel {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #64748b;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.reportKpiValue {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: #e2e8f0;
+    line-height: 1.2;
+}
+
+/* ─── Follow-up suggestion chips ─── */
+.followUpArea {
+    display: flex;
+    flex-direction: column;
+    gap: 8px;
+    padding: 10px 12px;
+    margin: 0 4px 4px;
+    border-radius: 10px;
+    background: rgba(15, 21, 27, 0.5);
+    border: 1px solid rgba(148, 163, 184, 0.07);
+}
+
+.followUpLabel {
+    font-size: 0.68rem;
+    font-weight: 600;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+}
+
+.followUpChips {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 6px;
+}
+
+.followUpChip {
+    background: rgba(30, 41, 59, 0.7);
+    border: 1px solid rgba(148, 163, 184, 0.12);
+    color: #94a3b8;
+    font-size: 0.72rem;
+    padding: 5px 10px;
+    border-radius: 20px;
+    cursor: pointer;
+    transition: all 0.15s;
+    text-align: left;
+    font-family: inherit;
+}
+
+.followUpChip:hover {
+    background: rgba(99, 102, 241, 0.15);
+    border-color: rgba(139, 92, 246, 0.4);
+    color: #c4b5fd;
 }

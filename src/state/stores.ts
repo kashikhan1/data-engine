@@ -2,6 +2,7 @@ import { create } from "zustand";
 import { devtools, persist } from "zustand/middleware";
 import { immer } from "zustand/middleware/immer";
 import { enableMapSet } from "immer";
+import type { TodoListState, TodoItem, TodoSummary } from "@/lib/agents/todo-types";
 
 enableMapSet();
 import type {
@@ -266,7 +267,7 @@ const initialEditorState: EditorState = {
 
 export const useEditorStore = create<EditorStore>()(
     devtools(
-        immer((set, get) => ({
+        immer((set) => ({
             ...initialEditorState,
 
             selectWidget: (id) => set((state) => {
@@ -544,6 +545,7 @@ export const useDashboardStore = create<DashboardStore>()(
 // ============================================================================
 export interface ConfigState {
     postgresUrl: string;
+    mssqlUrl: string;
     connectionStatus: "Connected" | "Disconnected" | "Connecting" | "Error";
     dataSources: DataSource[];
     selectedDataSourceId: string | null;
@@ -555,6 +557,7 @@ export interface ConfigState {
 
 interface ConfigStore extends ConfigState {
     setPostgresUrl: (url: string) => void;
+    setMssqlUrl: (url: string) => void;
     setConnectionStatus: (status: ConfigState["connectionStatus"]) => void;
     addDataSource: (ds: DataSource) => void;
     removeDataSource: (id: string) => void;
@@ -563,10 +566,12 @@ interface ConfigStore extends ConfigState {
     setCanonicalPlan: (plan: string | null) => void;
     setProjectContext: (context: string) => void;
     setDisabledWidgetTypes: (types: string[]) => void;
+    updateDataSource: (id: string, updates: Partial<DataSource>) => void;
 }
 
 const initialConfigState: ConfigState = {
-    postgresUrl: "postgresql://localhost:5432/postgres",
+    postgresUrl: "",
+    mssqlUrl: "",
     connectionStatus: "Disconnected",
     dataSources: [
         {
@@ -574,12 +579,12 @@ const initialConfigState: ConfigState = {
             name: "Internal Knowledge Base",
             type: "MCP Agent",
             details: "mcp-server-memory",
-            status: "Connected",
-            lastSync: "Running",
+            status: "Disconnected",
+            lastSync: "Unknown",
             icon: "smart_toy"
         }
     ],
-    selectedDataSourceId: "ds_mcp",
+    selectedDataSourceId: null,
     discoveredTables: [],
     canonicalPlan: null,
     projectContext: "",
@@ -594,6 +599,9 @@ export const useConfigStore = create<ConfigStore>()(
 
                 setPostgresUrl: (url) => set((state) => {
                     state.postgresUrl = url;
+                }),
+                setMssqlUrl: (url) => set((state) => {
+                    state.mssqlUrl = url;
                 }),
 
                 setConnectionStatus: (status) => set((state) => {
@@ -633,6 +641,15 @@ export const useConfigStore = create<ConfigStore>()(
                 }),
                 setDisabledWidgetTypes: (types) => set((state) => {
                     state.disabledWidgetTypes = types;
+                }),
+                updateDataSource: (id, updates) => set((state) => {
+                    const index = state.dataSources.findIndex((d: DataSource) => d.id === id);
+                    if (index >= 0) {
+                        const target = state.dataSources[index];
+                        for (const key in updates) {
+                            (target as any)[key] = (updates as any)[key];
+                        }
+                    }
                 }),
             })),
             {
@@ -683,6 +700,16 @@ export interface WorkflowState {
     // Step 2: Plan
     aiPlan: any | null;
     userPlan: any | null;
+    plannerLiveDebug: {
+        plannerAgents?: string | null;
+        plannerAgentStatus?: Record<string, "start" | "done" | "error">;
+        agentInputs?: Record<string, string>;
+        agentStreams?: Record<string, string>;
+        agentDrafts?: Record<string, string>;
+        agentOrder?: string[];
+        intentLabels?: string[];
+        selectedAgent?: string | null;
+    } | null;
 
     // Step 3: SQL
     aiQueries: any[] | null;
@@ -705,7 +732,40 @@ export interface WorkflowState {
     isProcessing: boolean;
     error: string | null;
     staleStep: number | null;
+    
+    // Progress tracking
+    progressStages: ProgressStage[];
+    
+    // SQL Generation progress
+    sqlGenerationProgress: SqlGenerationProgress;
+    todoListState: TodoListState | null;
 }
+
+export type ProgressStage = {
+    id: string;
+    label: string;
+    status: "pending" | "in_progress" | "completed" | "error";
+    message?: string;
+};
+
+export type SqlWidgetProgress = {
+    widgetId: string;
+    widgetTitle: string;
+    status: "pending" | "generating" | "validating" | "completed" | "error";
+    message?: string;
+    sql?: string;
+    error?: string;
+};
+
+export type SqlGenerationProgress = {
+    overallStatus: "idle" | "generating" | "validating" | "completed" | "error";
+    totalWidgets: number;
+    completedWidgets: number;
+    currentWidget?: string;
+    widgetProgress: SqlWidgetProgress[];
+    startTime?: number;
+    errors: string[];
+};
 
 interface WorkflowStore extends WorkflowState {
     setStep: (step: WorkflowStep) => void;
@@ -714,6 +774,8 @@ interface WorkflowStore extends WorkflowState {
     setUserSchemaNotes: (notes: string) => void;
     setAiPlan: (plan: any) => void;
     setUserPlan: (plan: any) => void;
+    setPlannerLiveDebug: (debug: WorkflowState["plannerLiveDebug"]) => void;
+    resetPlannerLiveDebug: () => void;
     setAiQueries: (queries: any[]) => void;
     setUserQueries: (queries: any[]) => void;
     setExecutionResults: (results: any) => void;
@@ -722,6 +784,16 @@ interface WorkflowStore extends WorkflowState {
     setProcessing: (processing: boolean) => void;
     setError: (error: string | null) => void;
     setStaleStep: (step: number | null) => void;
+    setProgressStages: (stages: ProgressStage[]) => void;
+    updateProgressStage: (id: string, updates: Partial<ProgressStage>) => void;
+    setSqlGenerationProgress: (progress: Partial<SqlGenerationProgress>) => void;
+    updateWidgetProgress: (widgetId: string, updates: Partial<SqlWidgetProgress>) => void;
+    resetSqlGenerationProgress: () => void;
+    setTodoListState: (state: TodoListState | null) => void;
+    initTodoList: (state: TodoListState) => void;
+    applyTodoItemUpdate: (item: TodoItem) => void;
+    setTodoSummary: (summary: TodoSummary) => void;
+    resetTodoList: () => void;
     reset: () => void;
 }
 
@@ -733,6 +805,7 @@ const initialWorkflowState: WorkflowState = {
     schemaTimestamp: null,
     aiPlan: null,
     userPlan: null,
+    plannerLiveDebug: null,
     aiQueries: null,
     userQueries: null,
     executionResults: null,
@@ -741,6 +814,15 @@ const initialWorkflowState: WorkflowState = {
     isProcessing: false,
     error: null,
     staleStep: null,
+    progressStages: [],
+    sqlGenerationProgress: {
+        overallStatus: "idle",
+        totalWidgets: 0,
+        completedWidgets: 0,
+        widgetProgress: [],
+        errors: []
+    },
+    todoListState: null,
 };
 
 export const useWorkflowStore = create<WorkflowStore>()(
@@ -771,11 +853,13 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     // Cascade clear: New schema invalidates everything downstream
                     state.aiPlan = null;
                     state.userPlan = null;
+                    state.plannerLiveDebug = null;
                     state.aiQueries = null;
                     state.userQueries = null;
                     state.executionResults = null;
                     state.dashboardConfig = null;
                     state.staleStep = null;
+                    state.todoListState = null;
                 }),
 
                 setUserSchemaNotes: (notes) => set((state) => {
@@ -795,6 +879,8 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     state.userQueries = null;
                     state.executionResults = null;
                     state.dashboardConfig = null;
+                    // Keep todo list from planner stream if present on plan object; otherwise clear.
+                    state.todoListState = plan?.todoListState || null;
                 }),
 
                 setUserPlan: (plan) => set((state) => {
@@ -804,6 +890,15 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     state.executionResults = null;
                     state.dashboardConfig = null;
                     state.staleStep = 3;
+                    state.todoListState = plan?.todoListState || state.todoListState;
+                }),
+
+                setPlannerLiveDebug: (debug) => set((state) => {
+                    state.plannerLiveDebug = debug || null;
+                }),
+
+                resetPlannerLiveDebug: () => set((state) => {
+                    state.plannerLiveDebug = null;
                 }),
 
                 setAiQueries: (queries) => set((state) => {
@@ -856,6 +951,79 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     state.staleStep = step;
                 }),
 
+                setProgressStages: (stages) => set((state) => {
+                    state.progressStages = stages;
+                }),
+
+                updateProgressStage: (id, updates) => set((state) => {
+                    const index = state.progressStages.findIndex(s => s.id === id);
+                    if (index !== -1) {
+                        state.progressStages[index] = { ...state.progressStages[index], ...updates };
+                    }
+                }),
+
+                setSqlGenerationProgress: (progress) => set((state) => {
+                    state.sqlGenerationProgress = { ...state.sqlGenerationProgress, ...progress };
+                }),
+
+                updateWidgetProgress: (widgetId, updates) => set((state) => {
+                    const index = state.sqlGenerationProgress.widgetProgress.findIndex(w => w.widgetId === widgetId);
+                    if (index !== -1) {
+                        state.sqlGenerationProgress.widgetProgress[index] = { 
+                            ...state.sqlGenerationProgress.widgetProgress[index], 
+                            ...updates 
+                        };
+                    } else {
+                        state.sqlGenerationProgress.widgetProgress.push({
+                            widgetId,
+                            widgetTitle: widgetId,
+                            status: "pending",
+                            ...updates
+                        });
+                    }
+                    
+                    // Update completed count
+                    state.sqlGenerationProgress.completedWidgets = 
+                        state.sqlGenerationProgress.widgetProgress.filter(w => w.status === "completed").length;
+                }),
+
+                resetSqlGenerationProgress: () => set((state) => {
+                    state.sqlGenerationProgress = {
+                        overallStatus: "idle",
+                        totalWidgets: 0,
+                        completedWidgets: 0,
+                        widgetProgress: [],
+                        errors: []
+                    };
+                }),
+
+                setTodoListState: (todoState) => set((state) => {
+                    state.todoListState = todoState;
+                }),
+
+                initTodoList: (todoState) => set((state) => {
+                    state.todoListState = todoState;
+                }),
+
+                applyTodoItemUpdate: (item) => set((state) => {
+                    if (!state.todoListState) return;
+                    const idx = state.todoListState.items.findIndex((x) => x.id === item.id);
+                    if (idx >= 0) {
+                        state.todoListState.items[idx] = item;
+                    } else {
+                        state.todoListState.items.push(item);
+                    }
+                }),
+
+                setTodoSummary: (summary) => set((state) => {
+                    if (!state.todoListState) return;
+                    state.todoListState.summary = summary;
+                }),
+
+                resetTodoList: () => set((state) => {
+                    state.todoListState = null;
+                }),
+
                 reset: () => set(() => initialWorkflowState),
             })),
             {
@@ -864,10 +1032,17 @@ export const useWorkflowStore = create<WorkflowStore>()(
                 migrate: (persisted: any) => {
                     if (!persisted || typeof persisted !== 'object') return persisted;
                     return {
-                        currentStep: persisted.currentStep,
-                        userSchemaNotes: persisted.userSchemaNotes,
-                        schemaTimestamp: persisted.schemaTimestamp,
-                        sqlErrorLog: persisted.sqlErrorLog
+                        ...initialWorkflowState,
+                        currentStep: persisted.currentStep ?? initialWorkflowState.currentStep,
+                        userSchemaNotes: persisted.userSchemaNotes ?? initialWorkflowState.userSchemaNotes,
+                        schemaTimestamp: persisted.schemaTimestamp ?? initialWorkflowState.schemaTimestamp,
+                        sqlErrorLog: persisted.sqlErrorLog ?? initialWorkflowState.sqlErrorLog,
+                        aiPlan: persisted.aiPlan ?? initialWorkflowState.aiPlan,
+                        userPlan: persisted.userPlan ?? initialWorkflowState.userPlan,
+                        plannerLiveDebug: initialWorkflowState.plannerLiveDebug,
+                        aiQueries: persisted.aiQueries ?? initialWorkflowState.aiQueries,
+                        userQueries: persisted.userQueries ?? initialWorkflowState.userQueries,
+                        todoListState: persisted.todoListState ?? initialWorkflowState.todoListState,
                     };
                 },
                 partialize: (state) => ({
@@ -880,6 +1055,7 @@ export const useWorkflowStore = create<WorkflowStore>()(
                     userPlan: state.userPlan,
                     aiQueries: state.aiQueries,
                     userQueries: state.userQueries,
+                    todoListState: state.todoListState,
                     // EXCLUDE: schemaData (too big), executionResults (too big), query (want fresh start)
                 })
             }

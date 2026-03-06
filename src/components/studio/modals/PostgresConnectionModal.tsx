@@ -9,8 +9,19 @@ interface PostgresConnectionModalProps {
 }
 
 const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpen, onClose, dbType = 'PostgreSQL' }) => {
-    const { postgresUrl, setPostgresUrl, setConnectionStatus, addDataSource } = useConfigStore();
-    const [url, setUrl] = useState(postgresUrl);
+    const {
+        postgresUrl,
+        mssqlUrl,
+        setPostgresUrl,
+        setMssqlUrl,
+        setConnectionStatus,
+        addDataSource,
+        updateDataSource,
+        removeDataSource,
+        setSelectedDataSourceId,
+        dataSources
+    } = useConfigStore();
+    const [url, setUrl] = useState(dbType === 'MSSQL' ? mssqlUrl : postgresUrl);
     const [isConnecting, setIsConnecting] = useState(false);
     const [error, setError] = useState<string | null>(null);
 
@@ -29,6 +40,7 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
 
     useEffect(() => {
         if (isOpen) {
+            setUrl(dbType === 'MSSQL' ? mssqlUrl : postgresUrl);
             setStep('connect');
             setError(null);
             setTableSearch('');
@@ -42,7 +54,7 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
                 setColumnToggles({});
             }
         }
-    }, [isOpen]);
+    }, [isOpen, dbType, postgresUrl, mssqlUrl]);
 
     if (!isOpen) return null;
 
@@ -54,7 +66,11 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
         try {
             const success = await dbGateway.connect(url);
             if (success) {
-                setPostgresUrl(url);
+                if (dbType === 'MSSQL') {
+                    setMssqlUrl(url);
+                } else {
+                    setPostgresUrl(url);
+                }
                 setConnectionStatus("Connected");
 
                 // Fetch tables for next step
@@ -119,20 +135,37 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
             localStorage.setItem(SELECTED_TABLES_KEY, JSON.stringify(selectedTables));
             localStorage.setItem(COLUMN_TOGGLES_KEY, JSON.stringify(columnToggles));
 
-            addDataSource({
-                id: 'ds_postgres',
-                name: `${dbType} Database`,
-                type: dbType,
-                details: `${selectedTables.length} tables selected`,
-                status: 'Connected',
-                lastSync: new Date().toLocaleTimeString(),
-                icon: 'database',
-                connectionString: url
-            });
+            const lastSync = new Date().toLocaleTimeString();
+            const sameTypeSources = dataSources.filter((ds) => ds.type === dbType);
+            const existingSource = sameTypeSources[0] || null;
 
+            if (existingSource) {
+                updateDataSource(existingSource.id, {
+                    connectionString: url,
+                    details: url,
+                    status: 'Connected',
+                    lastSync,
+                });
+                // Remove stale duplicate entries of the same type (from old addDataSource calls)
+                sameTypeSources.slice(1).forEach((ds) => removeDataSource(ds.id));
+                setSelectedDataSourceId(existingSource.id);
+            } else {
+                const newSource = {
+                    id: `ds_${dbType.toLowerCase()}_${Date.now()}`,
+                    name: `${dbType}`,
+                    type: dbType,
+                    details: url,
+                    status: 'Connected' as const,
+                    lastSync,
+                    icon: 'database',
+                    connectionString: url
+                };
+                addDataSource(newSource);
+                setSelectedDataSourceId(newSource.id);
+            }
             onClose();
         } catch (err: any) {
-            setError("Failed to save table metadata: " + err.message);
+            setError(err.message);
         } finally {
             setIsConnecting(false);
         }
@@ -143,7 +176,7 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
             prev.includes(table) ? prev.filter(t => t !== table) : [...prev, table]
         );
         if (!tableSchemas[table]) {
-            dbGateway.getTableSchema(table).then((schema) => {
+            dbGateway.getTableSchema(table, url).then((schema) => {
                 setTableSchemas((prev) => ({ ...prev, [table]: schema }));
                 if (!columnToggles[table]) {
                     const columns = Array.isArray(schema?.columns) ? schema.columns : [];
@@ -243,33 +276,33 @@ const PostgresConnectionModal: React.FC<PostgresConnectionModalProps> = ({ isOpe
                                 />
                             </div>
                             <div className="grid grid-cols-2 gap-3">
-                            {isFetchingTables ? (
-                                <div className="col-span-2 py-10 flex flex-col items-center justify-center gap-3">
-                                    <div className="w-8 h-8 border-2 border-[#135bec]/30 border-t-[#135bec] rounded-full animate-spin" />
-                                    <p className="text-sm text-slate-400">Fetching tables...</p>
-                                </div>
-                            ) : tables.length > 0 ? (
-                                tables
-                                    .filter((table) => table.toLowerCase().includes(tableSearch.toLowerCase()))
-                                    .map(table => (
-                                    <button
-                                        key={table}
-                                        onClick={() => toggleTable(table)}
-                                        className={`flex items-center gap-3 p-3 rounded-xl border transition-all text-left ${selectedTables.includes(table)
-                                            ? 'bg-[#135bec]/10 border-[#135bec] text-white'
-                                            : 'bg-[#1a202c] border-[#2d3748] text-slate-400 hover:border-slate-500'
-                                            }`}
-                                    >
-                                        <span className={`material-symbols-outlined text-[20px] ${selectedTables.includes(table) ? 'text-[#135bec]' : 'text-slate-600'
-                                            }`}>
-                                            {selectedTables.includes(table) ? 'check_box' : 'check_box_outline_blank'}
-                                        </span>
-                                        <span className="text-xs font-semibold truncate">{table}</span>
-                                    </button>
-                                ))
-                            ) : (
-                                <p className="col-span-2 text-center py-5 text-slate-500 text-sm">No tables found in public schema.</p>
-                            )}
+                                {isFetchingTables ? (
+                                    <div className="col-span-2 py-10 flex flex-col items-center justify-center gap-3">
+                                        <div className="w-8 h-8 border-2 border-[#135bec]/30 border-t-[#135bec] rounded-full animate-spin" />
+                                        <p className="text-sm text-slate-400">Fetching tables...</p>
+                                    </div>
+                                ) : tables.length > 0 ? (
+                                    tables
+                                        .filter((table) => table.toLowerCase().includes(tableSearch.toLowerCase()))
+                                        .map(table => (
+                                            <button
+                                                key={table}
+                                                onClick={() => toggleTable(table)}
+                                                className={`flex items-center gap-3 p-3 rounded-xl border transition-all text-left ${selectedTables.includes(table)
+                                                    ? 'bg-[#135bec]/10 border-[#135bec] text-white'
+                                                    : 'bg-[#1a202c] border-[#2d3748] text-slate-400 hover:border-slate-500'
+                                                    }`}
+                                            >
+                                                <span className={`material-symbols-outlined text-[20px] ${selectedTables.includes(table) ? 'text-[#135bec]' : 'text-slate-600'
+                                                    }`}>
+                                                    {selectedTables.includes(table) ? 'check_box' : 'check_box_outline_blank'}
+                                                </span>
+                                                <span className="text-xs font-semibold truncate">{table}</span>
+                                            </button>
+                                        ))
+                                ) : (
+                                    <p className="col-span-2 text-center py-5 text-slate-500 text-sm">No tables found in public schema.</p>
+                                )}
                             </div>
 
                             {activeTable && tableSchemas[activeTable]?.columns && (

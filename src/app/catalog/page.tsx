@@ -10,11 +10,7 @@ import {
     Filter,
     ExternalLink,
     ChevronRight,
-    Info,
-    ChevronDown,
-    Clock,
-    User,
-    Tag
+    Info
 } from "lucide-react";
 import styles from "./Catalog.module.css";
 
@@ -32,10 +28,13 @@ const DIMENSIONS = [
     { slug: "plan", name: "Plan Name", type: "string", table: "subscriptions", description: "Subscription tier level" },
 ];
 
+type CatalogMetric = (typeof METRICS)[number];
+type CatalogDimension = (typeof DIMENSIONS)[number];
+
 export default function Catalog() {
     const [searchQuery, setSearchQuery] = useState("");
     const [activeType, setActiveType] = useState<"metrics" | "dimensions">("metrics");
-    const [selectedItem, setSelectedItem] = useState<any>(null);
+    const [selectedItem, setSelectedItem] = useState<CatalogMetric | CatalogDimension | null>(null);
 
     const filteredMetrics = METRICS.filter(m =>
         m.name.toLowerCase().includes(searchQuery.toLowerCase()) ||

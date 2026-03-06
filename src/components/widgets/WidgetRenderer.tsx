@@ -41,11 +41,8 @@ interface WidgetRendererProps {
 export function WidgetRenderer({
     widget,
     isEditing = false,
-    isSelected = false,
-    filters = {},
     data,
     meta,
-    onDrilldown,
     onRegenerate,
 }: WidgetRendererProps) {
     const isLoading = widget.ui?.loading;

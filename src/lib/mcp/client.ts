@@ -4,7 +4,16 @@
  * Client-side Proxy for MCP Gateway.
  * This file no longer contains Node.js imports. It calls Server Actions to perform the actual work.
  */
-import { connectToPostgres, executeQuery, discoverSchema, getTableData, listTables, getTableSchema, getEnvConfig } from '@/app/actions/mcp';
+import {
+    connectToPostgres,
+    executeQuery,
+    discoverSchema,
+    getTableData,
+    listTables,
+    getTableSchema,
+    getEnvConfig,
+    testMcpConnection
+} from '@/app/actions/mcp';
 
 class DatabaseClientProxy {
     async connect(connectionString: string) {
@@ -33,6 +42,10 @@ class DatabaseClientProxy {
 
     async getEnvConfig() {
         return await getEnvConfig();
+    }
+
+    async testMcpConnection(endpoint: string, auth?: { authType?: string; token?: string }) {
+        return await testMcpConnection(endpoint, auth);
     }
 }
 

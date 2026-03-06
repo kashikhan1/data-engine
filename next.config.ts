@@ -9,7 +9,7 @@ const nextConfig: NextConfig = {
     return config;
   },
   // In Next.js 16, turbopack is a top-level property
-  // @ts-ignore - Turbopack types might not be updated in the environment's NextConfig type yet
+  // @ts-expect-error - Turbopack types may lag NextConfig in some environments.
   turbopack: {
     resolveAlias: {
       "zod/v4": "zod",

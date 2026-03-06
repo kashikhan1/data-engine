@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server";
 import { v4 as uuidv4 } from "uuid";
-import { runRegistry } from "@/lib/agents/registry";
+import { runRegistry } from "@/modules/runtime/agent";
 
 export async function POST(request: Request) {
     try {

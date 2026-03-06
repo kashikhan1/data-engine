@@ -38,8 +38,18 @@ export function TableWidget({ data, columns, pageSize = 10, widgetId, respectCol
     const searchColumnKey = widgetId ? "__searchColumn" : null;
     const widgetSearchColumnKey = widgetId ? `__searchColumn:${widgetId}` : null;
     const columnPrefsStorageKey = widgetId ? `table_widget_columns:${widgetId}` : null;
-    const [sortField, setSortField] = useState<string | null>(null);
-    const [sortDirection, setSortDirection] = useState<"asc" | "desc">("asc");
+    const sortColKey = widgetId ? `__sort_col:${widgetId}` : null;
+    const sortDirKey = widgetId ? `__sort_dir:${widgetId}` : null;
+    const [sortField, setSortField] = useState<string | null>(() => {
+        if (!sortColKey) return null;
+        const v = activeFilters.get(sortColKey);
+        return typeof v === "string" && v.trim() ? v.trim() : null;
+    });
+    const [sortDirection, setSortDirection] = useState<"asc" | "desc">(() => {
+        if (!sortDirKey) return "asc";
+        const v = activeFilters.get(sortDirKey);
+        return String(v || "").toLowerCase() === "desc" ? "desc" : "asc";
+    });
     const [currentPage, setCurrentPage] = useState(() => {
         if (!pageKey) return 0;
         const raw = Number(activeFilters.get(pageKey) ?? 0);
@@ -255,13 +265,21 @@ export function TableWidget({ data, columns, pageSize = 10, widgetId, respectCol
     }, [paginatedData, searchDraft, serverSearchKey, effectiveSearchColumn, displayColumns]);
     const debugRowsOnPage = Array.isArray(searchedData) ? searchedData.length : 0;
 
-    // Handle sort
+    // Handle sort — persist to activeFilters so server re-executes with new ORDER BY
     const handleSort = (field: string) => {
-        if (effectiveSortField === field) {
-            setSortDirection(sortDirection === "asc" ? "desc" : "asc");
-        } else {
-            setSortField(field);
-            setSortDirection("asc");
+        const newDir: "asc" | "desc" = effectiveSortField === field
+            ? (sortDirection === "asc" ? "desc" : "asc")
+            : "asc";
+        setSortField(field);
+        setSortDirection(newDir);
+        if (widgetId && isServerPaginated) {
+            if (sortColKey) setFilter(sortColKey, field);
+            if (sortDirKey) setFilter(sortDirKey, newDir);
+            // Reset to page 0 on sort change
+            setCurrentPage(0);
+            persistPaging(0, pageSizeState);
+            markFiltersActivated();
+            setStaleStep(4);
         }
     };
 

@@ -1,0 +1,191 @@
+.container {
+  padding: 24px;
+  height: 100%;
+  overflow-y: auto;
+}
+
+.header {
+  display: flex;
+  justify-content: space-between;
+  align-items: flex-start;
+  gap: 16px;
+  margin-bottom: 16px;
+  padding: 16px 20px;
+  border-radius: 16px;
+  border: 1px solid #242a36;
+  background: linear-gradient(135deg, #10151e 0%, #0d1117 100%);
+  position: sticky;
+  top: 0;
+  z-index: 2;
+}
+
+.headerMain {
+  flex: 1;
+  min-width: 0;
+}
+
+.pageTitle {
+  margin: 0 !important;
+}
+
+.titleIcon {
+  margin-right: 12px;
+}
+
+.metaRow {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 8px;
+  margin-bottom: 12px;
+  flex-wrap: wrap;
+}
+
+.progress {
+  max-width: 420px;
+}
+
+.actions {
+  flex-wrap: wrap;
+}
+
+.kpiGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+.kpiCard {
+  border-radius: 12px;
+  border: 1px solid #1f2630;
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.kpiLabel {
+  font-size: 12px;
+}
+
+.kpiValue {
+  font-size: 24px;
+  font-weight: 700;
+  color: #e6edf3;
+  line-height: 1.2;
+}
+
+.errorBanner {
+  margin-bottom: 16px;
+  background: rgba(245, 34, 45, 0.1) !important;
+  border: 1px solid rgba(245, 34, 45, 0.3) !important;
+}
+
+.emptyState {
+  margin-bottom: 16px;
+  border: 1px dashed #2d3644;
+  background: rgba(255, 255, 255, 0.01);
+}
+
+.resultsGrid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(370px, 1fr));
+  gap: 16px;
+  align-items: start;
+}
+
+.resultCard {
+  border: 1px solid #242a36;
+  border-radius: 12px;
+  background: #0e131a;
+  transition: border-color 0.2s ease, transform 0.2s ease;
+}
+
+.resultCard:hover {
+  border-color: #2f3a4a;
+  transform: translateY(-1px);
+}
+
+.cardTitleWrap {
+  max-width: 100%;
+}
+
+.cardTitle {
+  max-width: 210px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.successBody {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+}
+
+.resultMeta {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  gap: 10px;
+}
+
+.metaText {
+  font-size: 12px;
+}
+
+.repairNote {
+  color: #91caff;
+  font-size: 12px;
+  max-width: 220px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.previewTable :global(.ant-table) {
+  background: transparent;
+}
+
+.previewTable :global(.ant-table-thead > tr > th) {
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+.previewTable :global(.ant-table-tbody > tr > td) {
+  background: transparent;
+}
+
+.cellValue {
+  max-width: 120px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 11px;
+}
+
+.repairingState {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 8px;
+  padding: 16px;
+}
+
+.queryError {
+  background: rgba(245, 34, 45, 0.1) !important;
+  border: 1px solid rgba(245, 34, 45, 0.3) !important;
+}
+
+@media (max-width: 900px) {
+  .header {
+    position: static;
+    flex-direction: column;
+  }
+
+  .progress {
+    max-width: 100%;
+  }
+
+  .resultsGrid {
+    grid-template-columns: 1fr;
+  }
+}

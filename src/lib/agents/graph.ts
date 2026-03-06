@@ -3,9 +3,6 @@ import { AgentState, MAX_RETRIES, MAX_QUALITY_RETRIES } from "./state";
 import {
     intentAgent,
     queryEnhancerAgent,
-    multiQueryOrchestratorAgent,
-    securityCheckAgent,
-    mcpCallingAgent,
     analyticsAgent,
     chartDesignAgent,
     smartLayoutBuilderAgent,
@@ -13,7 +10,9 @@ import {
     insightGenerationAgent,
     qualityCheckAgent,
     sqlRepairAgent
-} from "./nodes";
+} from "./pipeline-support-agents";
+import { multiQueryOrchestratorAgent } from "./sql-generator-core";
+import { securityCheckAgent, mcpCallingAgent } from "./executor-core";
 import { schemaAgent } from "./schema-discovery";
 import { dashboardPlannerAgent } from "./dashboard-planner";
 import { errorRecoveryAgent } from "./extended-nodes";

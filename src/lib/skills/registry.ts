@@ -5,6 +5,7 @@ const log = createLogger("skills.registry");
 export interface SkillContext {
   traceId?: string;
   metadata?: Record<string, unknown>;
+  onToken?: (token: string, meta?: { skillId?: string }) => void;
 }
 
 export interface SkillDefinition<I = unknown, O = unknown> {
@@ -13,13 +14,13 @@ export interface SkillDefinition<I = unknown, O = unknown> {
   run: (input: I, context?: SkillContext) => Promise<O>;
 }
 
-type AnySkillDefinition = SkillDefinition<any, any>;
+type AnySkillDefinition = SkillDefinition<unknown, unknown>;
 
 const registry = new Map<string, AnySkillDefinition>();
 
 export function registerSkill<I = unknown, O = unknown>(skill: SkillDefinition<I, O>): void {
-    registry.set(skill.id, skill);
-    log.debug("skill_registered", { id: skill.id });
+  registry.set(skill.id, skill as AnySkillDefinition);
+  log.debug("skill_registered", { id: skill.id });
 }
 
 export function getSkill<TIn = unknown, TOut = unknown>(id: string): SkillDefinition<TIn, TOut> | null {

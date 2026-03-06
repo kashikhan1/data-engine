@@ -32,44 +32,81 @@ const StudioApp: React.FC = () => {
     const { dashboard, isLoading: isDashboardLoading } = useDashboardStore();
     const { selectedWidgetId, selectWidget, localLayout, localWidgets } = useEditorStore();
     const { partialResults } = useRunStore();
-    const { postgresUrl, setConnectionStatus, dataSources, selectedDataSourceId, connectionStatus } = useConfigStore();
+    const { postgresUrl, setConnectionStatus, dataSources, selectedDataSourceId, setSelectedDataSourceId, connectionStatus } = useConfigStore();
 
     // Auto-connect to Database on mount
-    const { setPostgresUrl, addDataSource } = useConfigStore();
+    const { setPostgresUrl, setMssqlUrl, addDataSource } = useConfigStore();
     useEffect(() => {
         const initDb = async () => {
-            // First, sync with environment variables from the server
             try {
                 const env = await dbGateway.getEnvConfig();
-                const envUrl = env.postgresUrl || env.mssqlUrl;
-                if (envUrl) {
-                    console.log("[INIT] Found server-side DB URL, syncing...");
-                    setPostgresUrl(envUrl);
 
-                    // Also ensure we have a Postgres data source
+                // Track IDs we've added to avoid duplicates if same URL is in both env vars
+                const addedUrls = new Set<string>();
+
+                const processEnvUrl = async (url: string | undefined, defaultType: 'PostgreSQL' | 'MSSQL') => {
+                    if (!url || addedUrls.has(url)) return;
+                    addedUrls.add(url);
+
+                    const lowerUrl = url.toLowerCase();
+                    const isMssql = !lowerUrl.startsWith('postgres://') &&
+                        !lowerUrl.startsWith('postgresql://') &&
+                        (lowerUrl.startsWith('mssql://') ||
+                            lowerUrl.startsWith('sqlserver://') ||
+                            lowerUrl.includes('server=') ||
+                            lowerUrl.includes('data source='));
+
+                    const detectedType = isMssql ? 'MSSQL' : 'PostgreSQL';
+                    const id = isMssql ? 'ds_mssql_auto' : 'ds_postgres_auto';
+
+                    if (isMssql) setMssqlUrl(url);
+                    else setPostgresUrl(url);
+
                     addDataSource({
-                        id: 'ds_postgres',
-                        name: env.postgresUrl ? 'PostgreSQL (Auto)' : 'MSSQL (Auto)',
-                        type: env.postgresUrl ? 'Postgres' : 'MSSQL',
-                        details: envUrl,
-                        status: 'Connected',
+                        id,
+                        name: `${detectedType} (Auto)`,
+                        type: detectedType,
+                        details: url,
+                        status: 'Connecting',
                         lastSync: new Date().toLocaleTimeString(),
                         icon: 'database',
-                        connectionString: envUrl
+                        connectionString: url
                     });
 
-                    setConnectionStatus("Connecting");
-                    const connected = await dbGateway.connect(envUrl);
+                    const connected = await dbGateway.connect(url);
                     if (connected) {
-                        setConnectionStatus("Connected");
-                        // Refresh table list
-                        const tables = await dbGateway.listTables(envUrl);
+                        const tables = await dbGateway.listTables(url);
                         if (Array.isArray(tables)) {
+                            useConfigStore.getState().updateDataSource(id, { status: 'Connected' });
                             useConfigStore.getState().setDiscoveredTables(tables);
+                        } else {
+                            useConfigStore.getState().updateDataSource(id, { status: 'Error' });
                         }
                     } else {
-                        setConnectionStatus("Error");
+                        useConfigStore.getState().updateDataSource(id, { status: 'Error' });
                     }
+                };
+
+                await processEnvUrl(env.postgresUrl, 'PostgreSQL');
+                await processEnvUrl(env.mssqlUrl, 'MSSQL');
+
+                // Auto-select the first connected node if none selected
+                const currentStore = useConfigStore.getState();
+                if (!currentStore.selectedDataSourceId) {
+                    const firstConnected = currentStore.dataSources.find(ds => ds.status === 'Connected');
+                    if (firstConnected) {
+                        setSelectedDataSourceId(firstConnected.id);
+                    } else if (currentStore.dataSources.length > 0) {
+                        setSelectedDataSourceId(currentStore.dataSources[0].id);
+                    }
+                }
+
+                // Update global connection status
+                const connectedCount = useConfigStore.getState().dataSources.filter(ds => ds.status === 'Connected').length;
+                if (connectedCount > 0) {
+                    setConnectionStatus("Connected");
+                } else if (addedUrls.size > 0) {
+                    setConnectionStatus("Error");
                 }
             } catch (err) {
                 console.error("[INIT] Failed to sync env config:", err);
@@ -193,7 +230,7 @@ const StudioApp: React.FC = () => {
         }
 
         if (currentView === 'schema') return <SchemaDiscoveryView />;
-        if (currentView === 'data-sources') return <DataSourcesView selectedId={null} onSelect={() => { }} />;
+        if (currentView === 'data-sources') return <DataSourcesView selectedId={selectedDataSourceId} onSelect={setSelectedDataSourceId} />;
         if (currentView === 'settings') return <SettingsView />;
         if (currentView === 'workbench') return <WorkbenchView widgets={[]} selectedWidget={null as any} />;
 
@@ -253,7 +290,7 @@ const StudioApp: React.FC = () => {
                         <InspectorSidebar
                             currentView={currentView === 'data-sources' ? 'data-sources' : 'build'}
                             selectedWidget={widgets.find(w => w.id === selectedWidgetId) as any}
-                            selectedDataSource={ACTIVE_CONNECTIONS[1]}
+                            selectedDataSource={dataSources.find(ds => ds.id === selectedDataSourceId) || dataSources[0]}
                         />
                         <button
                             onClick={() => setShowInspector(false)}

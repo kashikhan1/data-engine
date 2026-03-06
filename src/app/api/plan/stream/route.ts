@@ -1,12 +1,12 @@
 import { NextRequest } from "next/server";
-import { runDashboardPlannerStream } from "@/lib/agents/dashboard-planner";
+import { runDashboardPlannerStream } from "@/modules/plan/agent";
 
 export const maxDuration = 900; // 15 minutes
 
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
-        const { query, schema } = body;
+        const { query, schema, planningObjective } = body;
 
         if (!query || !schema) {
             return new Response("Missing query or schema", { status: 400 });
@@ -21,14 +21,14 @@ export async function POST(request: NextRequest) {
                 const close = () => {
                     if (closed) return;
                     closed = true;
-                    try { controller.close(); } catch (_) { /* noop */ }
+                    try { controller.close(); } catch { /* noop */ }
                 };
 
                 const enqueue = (data: string) => {
                     if (closed || signal.aborted) return;
                     try {
                         controller.enqueue(encoder.encode(data));
-                    } catch (err) {
+                    } catch {
                         // If controller is already closed/errored, ignore further enqueues
                         closed = true;
                     }
@@ -46,15 +46,17 @@ export async function POST(request: NextRequest) {
                     // Send an immediate "start" event to keep the connection alive
                     enqueue(`data: ${JSON.stringify({ kind: "chunk", chunk: "" })}\n\n`);
 
-                    for await (const item of runDashboardPlannerStream(query, schema)) {
+                    for await (const item of runDashboardPlannerStream(query, schema, planningObjective)) {
                         if (signal?.aborted) break;
                         enqueue(`data: ${JSON.stringify(item)}\n\n`);
                     }
                     close();
-                } catch (err: any) {
+                } catch (err: unknown) {
                     console.error("[API_PLAN_STREAM] Inner error:", err);
+                    const message = err instanceof Error ? err.message : "Planner failed";
                     if (!closed) {
-                        try { controller.error(err); } catch (_) { /* noop */ }
+                        enqueue(`data: ${JSON.stringify({ kind: "event", event: { type: "planner_error", message } })}\n\n`);
+                        close();
                     }
                 } finally {
                     if (signal) {
@@ -71,9 +73,10 @@ export async function POST(request: NextRequest) {
                 "Connection": "keep-alive",
             },
         });
-    } catch (error: any) {
+    } catch (error: unknown) {
         console.error("[API_PLAN_STREAM] Outer error:", error);
-        return new Response(JSON.stringify({ error: error.message }), {
+        const message = error instanceof Error ? error.message : "Unknown error";
+        return new Response(JSON.stringify({ error: message }), {
             status: 500,
             headers: { "Content-Type": "application/json" }
         });

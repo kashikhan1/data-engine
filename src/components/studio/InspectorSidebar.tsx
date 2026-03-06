@@ -30,7 +30,7 @@ const InspectorSidebar: React.FC<InspectorSidebarProps> = ({ currentView, select
             </div>
 
             <div className="flex-1 overflow-y-auto scrollbar-hide bg-[#0b0d11]">
-                {!selectedWidget ? (
+                {currentView === 'build' && !selectedWidget && (
                     <div className="p-12 text-center text-slate-600 flex flex-col items-center gap-6 mt-20 opacity-40">
                         <span className="material-symbols-outlined text-[64px]">ads_click</span>
                         <div className="space-y-2">
@@ -38,7 +38,87 @@ const InspectorSidebar: React.FC<InspectorSidebarProps> = ({ currentView, select
                             <p className="text-xs leading-relaxed">Select a component on the canvas to configure its data and appearance.</p>
                         </div>
                     </div>
-                ) : (
+                )}
+
+                {currentView === 'data-sources' && !selectedDataSource && (
+                    <div className="p-12 text-center text-slate-600 flex flex-col items-center gap-6 mt-20 opacity-40">
+                        <span className="material-symbols-outlined text-[64px]">database</span>
+                        <div className="space-y-2">
+                            <p className="text-sm font-bold uppercase tracking-widest">No Source Selected</p>
+                            <p className="text-xs leading-relaxed">Select a data node from the fleet to view its configuration and health metrics.</p>
+                        </div>
+                    </div>
+                )}
+
+                {currentView === 'data-sources' && selectedDataSource && (
+                    <div className="animate-slide-in-right divide-y divide-[#2d3748]/30 pb-20">
+                        <div className="p-5 bg-[#1a202c]/10">
+                            <div className="flex items-center justify-between mb-4">
+                                <span className="text-[9px] font-extrabold uppercase tracking-[2px] text-slate-600">Active Node</span>
+                                <span className="text-[10px] font-mono text-slate-600">{selectedDataSource.id}</span>
+                            </div>
+                            <div className="flex items-center gap-4">
+                                <div className="w-10 h-10 rounded-xl bg-[#135bec]/20 text-[#135bec] flex items-center justify-center shadow-lg shadow-[#135bec]/5">
+                                    <span className="material-symbols-outlined text-[24px]">{selectedDataSource.icon}</span>
+                                </div>
+                                <div>
+                                    <h3 className="text-md font-bold text-white tracking-tight truncate">{selectedDataSource.name}</h3>
+                                    <div className="text-[10px] text-slate-500 font-bold uppercase tracking-widest">{selectedDataSource.type}</div>
+                                </div>
+                            </div>
+                        </div>
+
+                        <div className="p-5 space-y-6">
+                            <div className="space-y-3">
+                                <label className="text-[9px] font-extrabold text-slate-500 uppercase tracking-widest">Resource URI</label>
+                                <div className="bg-[#1a202c] border border-[#2d3748] rounded-xl px-4 py-3 font-mono text-[10px] text-slate-300 break-all">
+                                    {selectedDataSource.details || 'Internal Storage'}
+                                </div>
+                            </div>
+
+                            <div className="grid grid-cols-2 gap-4">
+                                <div className="space-y-1.5">
+                                    <label className="text-[8px] font-black text-slate-500 uppercase tracking-widest">Status</label>
+                                    <div className={`text-xs font-bold uppercase tracking-widest ${selectedDataSource.status === 'Connected' ? 'text-green-400' : 'text-red-400'}`}>
+                                        {selectedDataSource.status}
+                                    </div>
+                                </div>
+                                <div className="space-y-1.5">
+                                    <label className="text-[8px] font-black text-slate-500 uppercase tracking-widest">Last Pulse</label>
+                                    <div className="text-xs font-bold text-slate-300">
+                                        {selectedDataSource.lastSync}
+                                    </div>
+                                </div>
+                            </div>
+
+                            <div className="space-y-3 pt-4">
+                                <label className="text-[9px] font-extrabold text-slate-500 uppercase tracking-widest">Telemetry</label>
+                                <div className="space-y-4">
+                                    <div className="space-y-1.5">
+                                        <div className="flex justify-between text-[9px] font-bold tracking-widest uppercase">
+                                            <span className="text-slate-500">Node Load</span>
+                                            <span className="text-white">12%</span>
+                                        </div>
+                                        <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+                                            <div className="h-full w-[12%] bg-blue-500"></div>
+                                        </div>
+                                    </div>
+                                    <div className="space-y-1.5">
+                                        <div className="flex justify-between text-[9px] font-bold tracking-widest uppercase">
+                                            <span className="text-slate-500">Memory Usage</span>
+                                            <span className="text-white">45MB</span>
+                                        </div>
+                                        <div className="h-1 bg-white/5 rounded-full overflow-hidden">
+                                            <div className="h-full w-[25%] bg-green-500"></div>
+                                        </div>
+                                    </div>
+                                </div>
+                            </div>
+                        </div>
+                    </div>
+                )}
+
+                {currentView === 'build' && selectedWidget && (
                     <div className="animate-slide-in-right divide-y divide-[#2d3748]/30 pb-20">
                         {/* Widget Context */}
                         <div className="p-5 bg-[#1a202c]/10">

@@ -5,12 +5,8 @@ import Link from "next/link";
 import {
     ArrowLeft,
     Search,
-    Star,
     Play,
-    Clock,
-    User,
     ChevronRight,
-    Filter,
     Layers,
     Sparkles
 } from "lucide-react";

@@ -13,7 +13,7 @@ import {
 import { z } from "zod";
 
 type JsonRow = Record<string, unknown>;
-type SchemaInfo = Record<string, { columns?: JsonRow[]; [key: string]: unknown }>;
+type SchemaInfo = Record<string, { columns?: JsonRow[];[key: string]: unknown }>;
 type SampleData = Record<string, JsonRow[]>;
 type QueryValidationMap = Record<string, string>;
 type Relationship = {
@@ -23,6 +23,11 @@ type Relationship = {
     type?: string;
     targetColumn?: string;
     [key: string]: unknown;
+};
+type TableRank = {
+    table: string;
+    score: number;
+    reasons?: string[];
 };
 type RuntimeContext = {
     connectionString?: string;
@@ -38,10 +43,15 @@ type RuntimeContext = {
     disabledWidgetTypes?: string[];
     connectorInstructions?: string;
     connectorType?: string;
+    connector?: {
+        kind?: string;
+        connectionString?: string;
+        instructions?: string;
+    };
     runtimeParams?: Record<string, unknown>;
     [key: string]: unknown;
 };
-type SecurityClearance = { approved?: boolean; [key: string]: unknown };
+type SecurityClearance = { approved?: boolean;[key: string]: unknown };
 type QueryExecutionResult = {
     widgetId: string | number;
     widgetTitle: string;
@@ -127,7 +137,22 @@ export const AgentState = Annotation.Root({
     schemaRelationships: Annotation<Relationship[]>({
         reducer: (x, y) => y,
     }),
+    tableRanking: Annotation<TableRank[]>({
+        reducer: (x, y) => y,
+    }),
+    deepProfiledTables: Annotation<string[]>({
+        reducer: (x, y) => y,
+    }),
     dataProfile: Annotation<Record<string, unknown> | null>({
+        reducer: (x, y) => y ?? x,
+    }),
+    tableCounts: Annotation<Record<string, number>>({
+        reducer: (x, y) => ({ ...x, ...y }),
+    }),
+    filterCandidates: Annotation<Record<string, unknown> | null>({
+        reducer: (x, y) => y ?? x,
+    }),
+    domainSummary: Annotation<string | null>({
         reducer: (x, y) => y ?? x,
     }),
     querySpecification: Annotation<Record<string, unknown> | null>({
@@ -158,6 +183,12 @@ export const AgentState = Annotation.Root({
         reducer: (x, y) => y ?? x,
     }),
     schema: Annotation<RuntimeContext | null>({
+        reducer: (x, y) => y ?? x,
+    }),
+    connectorRouting: Annotation<Record<string, unknown> | null>({
+        reducer: (x, y) => y ?? x,
+    }),
+    selectedConnectorSkills: Annotation<Record<string, unknown> | null>({
         reducer: (x, y) => y ?? x,
     }),
 });

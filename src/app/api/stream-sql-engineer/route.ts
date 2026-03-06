@@ -1,6 +1,7 @@
 import { NextRequest, NextResponse } from 'next/server';
-import { streamingSqlEngineerWorkflow, StreamEvent } from '@/lib/agents/streaming-workflow';
-import { AgentState } from '@/lib/agents/state';
+import { streamingSqlEngineerWorkflow, StreamEvent } from '@/modules/runtime/agent';
+import { AgentState } from '@/modules/runtime/agent';
+import { runQueryGenerator } from '@/modules/sql/agent';
 
 export async function POST(request: NextRequest) {
     try {
@@ -23,13 +24,42 @@ export async function POST(request: NextRequest) {
             connectionString: connectionString || context?.connectionString || context?.postgresUrl || context?.mssqlUrl
         };
 
+        const effectivePlan = queryPlan || body?.plan || null;
+        let effectiveQueryValidation = queryValidation;
+        if ((!effectiveQueryValidation || Object.keys(effectiveQueryValidation).length === 0) && effectivePlan && mergedSchema) {
+            try {
+                effectiveQueryValidation = await runQueryGenerator(
+                    effectivePlan,
+                    mergedSchema,
+                    body?.filters || {},
+                    body?.errorLog || [],
+                    Boolean(body?.applyFilters)
+                );
+            } catch (err) {
+                console.error('[STREAMING_API] Failed to pre-generate SQL map:', err);
+            }
+        }
+
+        if (!effectivePlan || !mergedSchema) {
+            return NextResponse.json(
+                { error: 'Missing queryPlan/schema for streaming workflow' },
+                { status: 400 }
+            );
+        }
+        if (!effectiveQueryValidation || Object.keys(effectiveQueryValidation).length === 0) {
+            return NextResponse.json(
+                { error: 'No SQL queries available for execution. Generate SQL first.' },
+                { status: 400 }
+            );
+        }
+
         const state: Partial<typeof AgentState.State> = {
             intent: query,
             context: mergedContext,
             schema: mergedSchema,
-            queryPlan,
-            queryValidation,
-            securityClearance,
+            queryPlan: effectivePlan,
+            queryValidation: effectiveQueryValidation,
+            securityClearance: securityClearance || { approved: true },
             results: [],
             analytics: null,
             insights: []

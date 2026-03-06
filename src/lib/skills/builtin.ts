@@ -1,4 +1,5 @@
 import { registerSkill, type SkillDefinition } from "./registry";
+import { registerConnectorSkills } from "./connectors";
 
 type SummarizeInput = {
   rows: Array<Record<string, unknown>>;
@@ -51,6 +52,7 @@ let registered = false;
 
 export function registerBuiltinSkills(): void {
   if (registered) return;
+  registerConnectorSkills();
   registerSkill(summarizeRowsSkill);
   registerSkill(topMetricsSkill);
   registered = true;

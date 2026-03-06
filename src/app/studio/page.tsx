@@ -6,26 +6,16 @@ import {
     PanelLeft,
     PanelRightClose,
     PanelRight,
-    Edit3,
-    Eye,
-    Save,
-    Undo2,
-    Redo2,
     Terminal,
     Share,
     ChevronDown
 } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
-import { ChatPanel } from "@/components/chat/ChatPanel";
 import { DashboardCanvas, DashboardCanvasSkeleton } from "@/components/canvas/DashboardCanvas";
 import { FilterBar } from "@/components/canvas/FilterBar";
-import { InspectorPanel } from "@/components/inspector/InspectorPanel";
 import { DebugDrawer } from "@/components/debug/DebugDrawer";
 import { useRunStore, useEditorStore, useDashboardStore } from "@/state/stores";
-import type { WidgetSpec, LayoutItem } from "@/types/dashboard";
 import styles from "./DashboardStudio.module.css";
-
-type StudioTab = "build" | "data" | "quality" | "semantic" | "history";
 
 export default function DashboardStudio() {
     // Panel visibility
@@ -34,18 +24,12 @@ export default function DashboardStudio() {
     const [isEditing, setIsEditing] = useState(true);
 
     // Stores
-    const { isStreaming, partialDashboard, partialResults } = useRunStore();
+    const { partialDashboard, partialResults } = useRunStore();
     const {
         selectedWidgetId,
         selectWidget,
-        undoStack,
-        redoStack,
-        undo,
-        redo,
         localLayout,
         localWidgets,
-        isDirty,
-        markClean,
     } = useEditorStore();
     const { dashboard, setDashboard, isLoading } = useDashboardStore();
 
@@ -78,11 +62,6 @@ export default function DashboardStudio() {
     const layout = useMemo(() => {
         return localLayout || dashboard?.layout || [];
     }, [localLayout, dashboard?.layout]);
-
-    const handleSave = useCallback(async () => {
-        console.log("Saving dashboard...");
-        markClean();
-    }, [markClean]);
 
     const getWidgetData = useCallback((widgetId: string) => {
         const streamResults = partialResults.get(`q_${widgetId}`) || partialResults.get(widgetId);

@@ -1,9 +1,9 @@
-import { HumanMessage, SystemMessage } from "@langchain/core/messages";
-
+/* eslint-disable @typescript-eslint/no-explicit-any */
+// query-runtime.ts — SQL execution & dashboard assembly runtime.
+// Handles dynamic DB row shapes, runtime SQL templates, and filter candidates
+// from multiple DB systems. `any` is intentional for these runtime data flows.
 import { dbGateway } from "../mcp/server";
-import { createDefaultChatModel } from "../llm/model";
 import { normalizeFilterSet } from "../filter-contract";
-import { extractJSON, invokeModelWithRetry as invokeModelWithRetryUtil } from "./llm-utils";
 
 type RuntimePagination = {
   page: number;
@@ -11,11 +11,6 @@ type RuntimePagination = {
   offset?: number;
   includeTotal?: boolean;
 };
-
-const getModel = () => createDefaultChatModel({ logPrefix: "[LLM]", timeoutMs: 900000 });
-
-const invokeModelWithRetry = (messages: any[], maxRetries = 3, delay = 2000) =>
-  invokeModelWithRetryUtil(getModel, messages, maxRetries, delay);
 
 export function normalizeSqlForValidation(sql: string) {
   let text = String(sql || "");
@@ -78,6 +73,104 @@ export const detectIsMssql = (connectionString?: string, connectorType?: string)
   return typeLower.includes("mssql") || typeLower.includes("sql server");
 };
 
+const extractTablesFromSql = (sql: string) => {
+  const tables = new Set<string>();
+  const regex = /\b(from|join)\s+["`[]?([A-Za-z0-9_.]+)["`\]]?/gi;
+  let match: RegExpExecArray | null;
+  while ((match = regex.exec(sql)) !== null) {
+    const raw = String(match[2] || "").trim();
+    if (!raw) continue;
+    const base = raw.split(".").pop();
+    if (base) tables.add(base);
+  }
+  return Array.from(tables);
+};
+
+function levenshtein(a: string, b: string): number {
+  const left = String(a || "");
+  const right = String(b || "");
+  if (!left) return right.length;
+  if (!right) return left.length;
+  const dp = Array.from({ length: right.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= left.length; i++) {
+    let prev = dp[0];
+    dp[0] = i;
+    for (let j = 1; j <= right.length; j++) {
+      const temp = dp[j];
+      const cost = left[i - 1] === right[j - 1] ? 0 : 1;
+      dp[j] = Math.min(
+        dp[j] + 1,
+        dp[j - 1] + 1,
+        prev + cost
+      );
+      prev = temp;
+    }
+  }
+  return dp[right.length];
+}
+
+function chooseClosestName(target: string, candidates: string[]): string | null {
+  const t = String(target || "").trim().toLowerCase();
+  const list = Array.from(new Set((candidates || []).map((c) => String(c || "").trim()).filter(Boolean)));
+  if (!t || list.length === 0) return null;
+  if (list.includes(target)) return target;
+
+  let best: { value: string; score: number } | null = null;
+  for (const candidate of list) {
+    const c = candidate.toLowerCase();
+    const dist = levenshtein(t, c);
+    const maxLen = Math.max(t.length, c.length) || 1;
+    let score = 1 - dist / maxLen;
+    if (c.includes(t) || t.includes(c)) score += 0.12;
+    if (c.replace(/_/g, "") === t.replace(/_/g, "")) score += 0.15;
+    if (!best || score > best.score) best = { value: candidate, score };
+  }
+  return best && best.score >= 0.55 ? best.value : null;
+}
+
+function parseMissingIdentifier(errorMessage: string): { kind: "column" | "table"; name: string } | null {
+  const msg = String(errorMessage || "");
+  const patterns: Array<{ kind: "column" | "table"; regex: RegExp }> = [
+    { kind: "column", regex: /column ["`[]?([a-zA-Z0-9_]+)["`\]]? does not exist/i },
+    { kind: "column", regex: /invalid column name ['"`[]?([a-zA-Z0-9_]+)['"`\]]?/i },
+    { kind: "table", regex: /relation ["`[]?([a-zA-Z0-9_.]+)["`\]]? does not exist/i },
+    { kind: "table", regex: /invalid object name ['"`[]?([a-zA-Z0-9_.]+)['"`\]]?/i },
+  ];
+  for (const p of patterns) {
+    const match = msg.match(p.regex);
+    if (match?.[1]) {
+      return { kind: p.kind, name: String(match[1]).split(".").pop() || String(match[1]) };
+    }
+  }
+  return null;
+}
+
+function replaceIdentifier(sql: string, from: string, to: string): string {
+  if (!from || !to || from === to) return sql;
+  const escaped = from.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+  const exactWord = new RegExp(`\\b${escaped}\\b`, "gi");
+  let next = String(sql || "").replace(exactWord, to);
+  next = next.replace(new RegExp(`"${escaped}"`, "gi"), `"${to}"`);
+  next = next.replace(new RegExp(`\\[${escaped}\\]`, "gi"), `[${to}]`);
+  next = next.replace(new RegExp(`\`${escaped}\``, "gi"), `\`${to}\``);
+  return next;
+}
+
+export const resolveConnectorDialect = (input?: {
+  connectionString?: string;
+  connectorType?: string;
+}) => {
+  const connectionString = String(input?.connectionString || "").trim();
+  const connectorTypeRaw = String(input?.connectorType || "").trim().toLowerCase();
+  const isMssql = detectIsMssql(connectionString, connectorTypeRaw);
+  return {
+    connectionString,
+    connectorType: connectorTypeRaw || (isMssql ? "mssql" : "postgres"),
+    isMssql,
+    dialect: isMssql ? "mssql" as const : "postgres" as const,
+  };
+};
+
 export const validateSqlWithInstructions = (
   sql: string,
   connectionString?: string,
@@ -95,11 +188,29 @@ export const validateSqlWithInstructions = (
     return { ok: false, error: "Validation failed: unsafe SQL detected." };
   }
   const isMssql = detectIsMssql(connectionString, connectorType);
-  if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
+  if (isMssql && /\blimit\b/i.test(trimmed)) {
     return { ok: false, error: "Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH." };
   }
-  if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
+  if (!isMssql && /\btop\s+[^\s]+/i.test(trimmed)) {
     return { ok: false, error: "Validation failed: PostgreSQL does not support TOP. Use LIMIT." };
+  }
+  if (isMssql) {
+    if (/\bilike\b/i.test(trimmed)) {
+      return { ok: false, error: "Validation failed: MSSQL does not support ILIKE. Use LIKE." };
+    }
+    if (/\bdate_trunc\s*\(/i.test(trimmed)) {
+      return { ok: false, error: "Validation failed: MSSQL does not support DATE_TRUNC." };
+    }
+    if (/\bcurrent_date\b/i.test(trimmed)) {
+      return { ok: false, error: "Validation failed: MSSQL does not support CURRENT_DATE. Use GETDATE()." };
+    }
+  } else {
+    if (/\bgetdate\s*\(/i.test(trimmed) || /\bdateadd\s*\(/i.test(trimmed) || /\bdatediff\s*\(/i.test(trimmed)) {
+      return { ok: false, error: "Validation failed: PostgreSQL does not support GETDATE/DATEADD/DATEDIFF." };
+    }
+    if (/\bisnull\s*\(/i.test(trimmed)) {
+      return { ok: false, error: "Validation failed: PostgreSQL does not support ISNULL. Use COALESCE." };
+    }
   }
   const bans = extractInstructionBans(connectorInstructions || "");
   for (const banned of bans) {
@@ -218,6 +329,14 @@ const defaultRuntimeValueForKey = (key: string) => {
   return null;
 };
 
+/** Sanitize a raw value to a safe SQL identifier (column name or sort direction). */
+const sanitizeSqlIdentifier = (value: unknown, fallback: string): string => {
+  const raw = String(value ?? "").trim();
+  // Allow alphanumeric, underscore, dot, and quoting chars — strip everything else
+  const safe = raw.replace(/[^a-zA-Z0-9_."'`[\] ]/g, "");
+  return safe || fallback;
+};
+
 export const renderDynamicSqlTemplate = (sql: string, params: Record<string, any>, isMssql: boolean) => {
   const source = String(sql || "");
   if (!source.includes("{{")) return source;
@@ -225,12 +344,36 @@ export const renderDynamicSqlTemplate = (sql: string, params: Record<string, any
   let rendered = source.replace(/\{\{\s*([^}]+?)\s*\}\}/g, (_match, rawKey) => {
     const key = String(rawKey || "").trim();
     if (!key) return "NULL";
+
+    // ── __has.key — presence check ────────────────────────────────────────────
     if (key.startsWith("__has.")) {
       const targetKey = key.slice("__has.".length);
       const present = isRuntimeValuePresent(flat[targetKey]);
       return present ? "1" : "0";
     }
-    const value = Object.prototype.hasOwnProperty.call(flat, key) ? flat[key] : defaultRuntimeValueForKey(key);
+
+    // ── key:default — parse optional colon-separated default value ─────────────
+    const colonIdx = key.indexOf(":");
+    const paramKey = colonIdx >= 0 ? key.slice(0, colonIdx) : key;
+    const defaultRaw = colonIdx >= 0 ? key.slice(colonIdx + 1) : null;
+
+    // ── sort_col — safe SQL column identifier (not a quoted string literal) ────
+    if (paramKey === "sort_col") {
+      const val = Object.prototype.hasOwnProperty.call(flat, "sort_col") ? flat["sort_col"] : null;
+      return sanitizeSqlIdentifier(val, defaultRaw ?? "1");
+    }
+
+    // ── sort_dir — only ASC or DESC ───────────────────────────────────────────
+    if (paramKey === "sort_dir") {
+      const val = Object.prototype.hasOwnProperty.call(flat, "sort_dir") ? flat["sort_dir"] : null;
+      const dir = String(val ?? defaultRaw ?? "ASC").toUpperCase();
+      return dir === "DESC" ? "DESC" : "ASC";
+    }
+
+    // ── Normal value — look up by paramKey, fall back to :default then heuristic
+    const value = Object.prototype.hasOwnProperty.call(flat, paramKey)
+      ? flat[paramKey]
+      : (defaultRaw !== null ? defaultRaw : defaultRuntimeValueForKey(paramKey));
     return sqlLiteralFromValue(value, isMssql);
   });
   rendered = rendered.replace(/\(\s*0\s*=\s*0\s+OR\s+\(([\s\S]*?)\)\s*\)/gi, "1=1");
@@ -372,6 +515,8 @@ export async function runQueryExecutor(
     connectorType?: string;
     tablePagination?: Record<string, RuntimePagination>;
     runtimeParams?: Record<string, any>;
+    /** Map of widgetId -> widgetType. Used to skip count queries for non-table widgets. */
+    widgetTypes?: Record<string, string>;
   }
 ) {
   console.log("[AGENT] Executing optimized query set...");
@@ -509,7 +654,9 @@ export async function runQueryExecutor(
         const resolvedColumns =
           Array.isArray(data) && data.length > 0 ? Object.keys(data[0] || {}).filter((key) => key !== "__rowKey") : [];
         let totalRows: number | undefined;
-        if (runtimeDerivedPage?.includeTotal !== false) {
+        const widgetType = String(options?.widgetTypes?.[id] || "").toLowerCase();
+        const isTableWidget = widgetType === "table" || (!widgetType && runtimeDerivedPage?.includeTotal !== false);
+        if (isTableWidget && runtimeDerivedPage?.includeTotal !== false) {
           const countSql = buildCountSql(runtimeSql, isMssql);
           if (countSql) {
             try {
@@ -579,11 +726,135 @@ export async function runQueryExecutor(
   return results;
 }
 
+/**
+ * AI-powered SQL repair using the LLM with full MCP-fetched schema context.
+ * Called as a fallback when heuristic repair doesn't produce valid SQL.
+ */
+async function aiRepairSql(params: {
+  widgetTitle: string;
+  widgetType: string;
+  widgetGoal?: string;
+  widgetUses?: string;
+  widgetNotes?: string;
+  primaryTable?: string;
+  allowedFilterColumns: Set<string>;
+  originalSql: string;
+  errorMessage: string;
+  columnsByTable: Map<string, string[]>;
+  allKnownTables: string[];
+  isMssql: boolean;
+  connectorInstructions?: string;
+  connectionString?: string;
+}): Promise<{ sql: string; explanation: string } | null> {
+  try {
+    const { streamModelWithRetry } = await import("@/lib/agents/llm-utils");
+    const { createDefaultChatModel } = await import("@/lib/llm/model");
+    const { SystemMessage, HumanMessage } = await import("@langchain/core/messages");
+
+    const dialect = params.isMssql ? "MSSQL (SQL Server)" : "PostgreSQL";
+    const dialectRules = params.isMssql
+      ? "Use TOP N (not LIMIT). Pagination: OFFSET N ROWS FETCH NEXT N ROWS ONLY. GETDATE() not CURRENT_DATE. LIKE not ILIKE. No DATE_TRUNC. Use ISNULL(). Identifiers with [brackets]. Boolean/bit columns in COALESCE: use CAST(col AS INT) e.g. COALESCE(CAST(active AS INT), 0)."
+      : "Use LIMIT N OFFSET N. CURRENT_DATE not GETDATE(). ILIKE for case-insensitive. DATE_TRUNC() for date bucketing. No TOP. COALESCE() not ISNULL(). Identifiers with \"quotes\". Boolean columns in COALESCE with numbers: cast with ::int e.g. COALESCE(active::int, 0).";
+
+    // Build schema lines from MCP-enriched columnsByTable
+    const schemaLines: string[] = [];
+    params.columnsByTable.forEach((cols, table) => {
+      if (cols.length > 0) schemaLines.push(`  ${table}: ${cols.join(", ")}`);
+    });
+    if (schemaLines.length === 0) {
+      params.allKnownTables.forEach((t) => schemaLines.push(`  ${t}: (columns unknown — use SELECT *)`));
+    }
+
+    const filterSection = params.allowedFilterColumns.size > 0
+      ? `\n\nALLOWED FILTER COLUMNS (only these may appear in WHERE / HAVING / JOIN ON):\n  ${Array.from(params.allowedFilterColumns).join(", ")}`
+      : "";
+
+    const instructionSection = params.connectorInstructions?.trim()
+      ? `\n\nCONNECTOR INSTRUCTIONS:\n${params.connectorInstructions.slice(0, 400)}`
+      : "";
+
+    const widgetLines = [
+      `Widget: ${params.widgetTitle} (type: ${params.widgetType})`,
+      params.widgetGoal ? `Goal: ${params.widgetGoal}` : null,
+      params.widgetUses ? `Column refs: ${params.widgetUses}` : null,
+      params.widgetNotes ? `Hints: ${params.widgetNotes.slice(0, 250)}` : null,
+      params.primaryTable ? `Primary table: ${params.primaryTable}` : null,
+    ].filter(Boolean).join("\n");
+
+    const system = `You are a SQL repair expert. Fix the broken ${dialect} query so it executes without errors.
+
+DIALECT: ${dialect}
+RULES: ${dialectRules}${filterSection}${instructionSection}
+
+Respond with ONLY a valid JSON object — no markdown, no extra text:
+{"sql": "<corrected single SELECT statement>", "explanation": "<brief description of what was wrong and what you fixed>"}`;
+
+    const human = `WIDGET CONTEXT:
+${widgetLines}
+
+AVAILABLE TABLES AND COLUMNS (from live DB schema via MCP):
+${schemaLines.join("\n")}
+
+BROKEN SQL:
+\`\`\`sql
+${params.originalSql}
+\`\`\`
+
+EXECUTION ERROR:
+${params.errorMessage}
+
+Fix the SQL. Return only the JSON object.`;
+
+    const response = await streamModelWithRetry(
+      () => createDefaultChatModel({ logPrefix: "[SQL_REPAIR_AI]", timeoutMs: 60000 }),
+      [new SystemMessage(system), new HumanMessage(human)],
+      undefined,
+      2,
+      1000
+    );
+
+    const content = String((response as any)?.content || "");
+    if (!content) return null;
+
+    // Try JSON parse first
+    let repairedSql: string | null = null;
+    let explanation = "AI-repaired SQL.";
+    try {
+      const jsonMatch = content.match(/\{[\s\S]*?\}/);
+      if (jsonMatch) {
+        const cleaned = jsonMatch[0].replace(/"([^"]*)"/g, (_m: string, g: string) =>
+          `"${g.replace(/\n/g, "\\n").replace(/\r/g, "\\r")}"`
+        );
+        const parsed = JSON.parse(cleaned) as { sql?: string; explanation?: string };
+        if (parsed?.sql) {
+          repairedSql = String(parsed.sql).trim();
+          explanation = String(parsed.explanation || explanation);
+        }
+      }
+    } catch {
+      // fallback: extract SQL from code block
+      const sqlBlock = content.match(/```sql\s*([\s\S]*?)```/i) || content.match(/```\s*(SELECT[\s\S]*?)```/i);
+      if (sqlBlock?.[1]) repairedSql = sqlBlock[1].trim();
+    }
+
+    if (!repairedSql) return null;
+    console.log(`[SQL_REPAIR_AI] AI produced repaired SQL for "${params.widgetTitle}": ${repairedSql.slice(0, 120)}...`);
+    return { sql: repairedSql, explanation };
+  } catch (err: any) {
+    console.warn("[SQL_REPAIR_AI] AI repair call failed:", err?.message || err);
+    return null;
+  }
+}
+
 export async function repairFailedQuery(context: {
   widgetId: string;
   widgetTitle: string;
   widgetType: string;
   widgetGoal?: string;
+  widgetUses?: string;
+  widgetNotes?: string;
+  primaryTable?: string;
+  filterableColumns?: Record<string, string[]>;
   originalSql: string;
   errorMessage: string;
   schema: any;
@@ -592,195 +863,237 @@ export async function repairFailedQuery(context: {
 }): Promise<{ sql: string; explanation: string }> {
   console.log(`[SQL_REPAIR] Attempting to fix query for widget: ${context.widgetTitle}`);
 
-  const schemaInfo = context.schema?.schemaInfo || {};
-  const recentErrors = JSON.stringify((context.errorLog || []).slice(0, 15));
   const truncate = (text: string, max = 3000) => (text.length > max ? `${text.slice(0, max)}...` : text);
-  const compactErrors = truncate(recentErrors || "[]", 600);
   const compactSql = truncate(context.originalSql || "", 1500);
   const compactError = truncate(context.errorMessage || "", 800);
 
-  const extractTablesFromSql = (sql: string) => {
-    const tables = new Set<string>();
-    const regex = /\b(from|join)\s+["`[]?([A-Za-z0-9_.]+)["`\]]?/gi;
-    let match: RegExpExecArray | null;
-    while ((match = regex.exec(sql)) !== null) {
-      const name = match[2]?.split(".").pop();
-      if (name) tables.add(name);
-    }
-    return Array.from(tables);
+  const normalizedOriginal = normalizeSqlForValidation(compactSql);
+  const schemaInfoMap = context.schema?.schemaInfo || {};
+  const isMssql = detectIsMssql(context.connectionString, String(context.schema?.connectorType || context.schema?.connector?.type || ""));
+
+  const referencedTables = extractTablesFromSql(normalizedOriginal || context.originalSql || "");
+  const selectedTables = referencedTables.length > 0 ? referencedTables : Object.keys(schemaInfoMap).slice(0, 3);
+
+  const columnsByTable = new Map<string, string[]>();
+  const putColumns = (tableName: string, rawColumns: any[]) => {
+    const key = String(tableName || "").split(".").pop()?.toLowerCase() || "";
+    if (!key) return;
+    const cols = Array.isArray(rawColumns)
+      ? rawColumns.map((c: any) => String(c?.name || c?.column_name || "").trim()).filter(Boolean)
+      : [];
+    if (cols.length === 0) return;
+    columnsByTable.set(key, Array.from(new Set(cols)));
   };
 
-  const buildCompactSchema = () => {
-    const tableNames = extractTablesFromSql(context.originalSql || "");
-    const fallbackTables = Object.keys(schemaInfo || {}).slice(0, 2);
-    const selected = tableNames.length > 0 ? tableNames : fallbackTables;
-    return selected
-      .map((table) => {
-        const info = schemaInfo[table] || schemaInfo[table.toLowerCase()] || schemaInfo[table.toUpperCase()];
-        const cols = info?.columns
-          ?.slice(0, 4)
-          .map((c: any) => `${c.name || c.column_name} (${c.type || c.data_type})`)
-          .join(", ");
-        return `TABLE "${table}" HAS COLUMNS: [${cols || "unknown"}]`;
-      })
-      .join("\n");
-  };
+  Object.entries(schemaInfoMap || {}).forEach(([table, info]: [string, any]) => {
+    putColumns(table, info?.columns || []);
+  });
 
-  const compactSchema = truncate(buildCompactSchema(), 1200);
-
-  const connectorType = String(context.schema?.connectorType || context.schema?.connector?.type || "").toLowerCase();
-  const isMssql = (() => {
-    const lower = (context.connectionString || "").toLowerCase();
-    if (
-      lower.startsWith("mssql://") ||
-      lower.startsWith("sqlserver://") ||
-      lower.includes("server=") ||
-      lower.includes("data source=")
-    ) {
-      return true;
-    }
-    return connectorType.includes("mssql") || connectorType.includes("sql server");
-  })();
-  const connectorInstructions = String(context.schema?.connectorInstructions || "").trim();
-
-  const systemPrompt = isMssql
-    ? `You are **SQL Repair Agent**, a Senior SQL Server (MSSQL) debugger.
-Connector instructions are mandatory and override any conflicting guidance.
-
-### CRITICAL: SQL SERVER SYNTAX RULES (MANDATORY)
-1. **NO LIMIT** - Use \`TOP\` or \`OFFSET ... FETCH\`.
-2. **DATE FUNCTIONS** - Use \`GETDATE()\`, \`DATEADD\`, \`DATEDIFF\`.
-3. **DATE TRUNCATION** - Use \`DATEADD(day, DATEDIFF(day, 0, col), 0)\` for day, \`DATEADD(month, DATEDIFF(month, 0, col), 0)\` for month.
-4. **TEXT TYPE** - If comparing text/ntext, CAST to NVARCHAR(MAX) before equality.
-5. **IDENTIFIERS** - Use brackets \`[Table]\` and \`[Column]\` when needed.
-
-${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ""}
-
-### FAILED QUERY CONTEXT
-- **Widget Goal:** ${context.widgetGoal || "Display relevant data"}
- - **Original SQL:** \`${compactSql}\`
- - **Error Message:** \`${compactError}\`
- - **Recent SQL Errors (Avoid repeats):** ${compactErrors}
-
-### DATABASE SCHEMA
-${compactSchema}
-
-### YOUR MISSION
-1. Analyze the error and generate a FIXED SQL Server query.
-2. Use ONLY columns that exist in the schema.
-3. Fix any syntax errors and handle type mismatches.
-4. Do NOT repeat any patterns from recent SQL errors.
-5. **Never** claim the error is "misleading" or "already valid" - you must change the SQL to address the error.
-6. If the error mentions LIMIT, DATE_TRUNC, CURRENT_DATE, or GROUP BY aliasing, you MUST replace with SQL Server equivalents.
-
-### OUTPUT FORMAT (MANDATORY)
-Return ONLY a valid JSON object. No conversation.
-{
-  "sql": "SELECT ... fixed query ...",
-  "explanation": "Brief fix summary"
-}`
-    : `You are **SQL Repair Agent**, a Senior PostgreSQL debugger.
-Connector instructions are mandatory and override any conflicting guidance.
-
-### CRITICAL: POSTGRESQL SYNTAX RULES (MANDATORY)
-1. **NO DATEDIFF()** - This function DOES NOT EXIST in PostgreSQL.
-   - USE: \`(end_date - start_date)\` for days difference.
-   - Example: \`(CURRENT_DATE - first_used_at)\`
-2. **NO window functions inside aggregates** - You cannot do \`SUM(count(*) OVER (...))\`.
-3. **DATE_TRUNC** - Always cast to timestamp: \`DATE_TRUNC('day', col::timestamp)\`.
-
-${connectorInstructions ? `### CONNECTOR INSTRUCTIONS\n${truncate(connectorInstructions, 1200)}\n` : ""}
-
-### FAILED QUERY CONTEXT
-- **Widget Goal:** ${context.widgetGoal || "Display relevant data"}
- - **Original SQL:** \`${compactSql}\`
- - **Error Message:** \`${compactError}\`
- - **Recent SQL Errors (Avoid repeats):** ${compactErrors}
-
-### DATABASE SCHEMA
-${compactSchema}
-
-### YOUR MISSION
-1. Analyze the error and generate a FIXED PostgreSQL query.
-2. Use ONLY columns that exist in the schema.
-3. Fix any syntax errors and handle type mismatches.
-4. Do NOT repeat any patterns from recent SQL errors.
-5. **Never** claim the error is "misleading" or "already valid" - you must change the SQL to address the error.
-
-### OUTPUT FORMAT (MANDATORY)
-Return ONLY a valid JSON object. No conversation.
-{
-  "sql": "SELECT ... fixed query ...",
-  "explanation": "Brief fix summary"
-}`;
-
-  const maxPromptChars = 9000;
-  try {
-    if (systemPrompt.length > maxPromptChars) {
-      const compactPrompt = [
-        "You are SQL Repair Agent. Fix the SQL based on schema + error.",
-        `Original SQL: ${compactSql}`,
-        `Error: ${compactError}`,
-        `Schema: ${compactSchema}`,
-        `Recent errors: ${compactErrors}`,
-        'Return JSON: {"sql":"...","explanation":"..."}',
-      ].join("\n");
-      const response = await invokeModelWithRetry([
-        new SystemMessage(compactPrompt),
-        new HumanMessage("Fix the failed SQL query in strict JSON."),
-      ]);
-      const content = response.content as string;
-      const parsed = extractJSON(content);
-      if (parsed && parsed.sql) {
-        return {
-          sql: parsed.sql,
-          explanation: parsed.explanation || "Repaired query",
-        };
+  if (context.connectionString) {
+    await Promise.all(selectedTables.map(async (table) => {
+      try {
+        const snapshot = await dbGateway.getTableSchema(table, context.connectionString);
+        putColumns(table, (snapshot as any)?.columns || []);
+      } catch {
+        // best effort MCP pull
       }
-      throw new Error("Repair response missing SQL.");
-    }
-    const response = await invokeModelWithRetry([
-      new SystemMessage(systemPrompt),
-      new HumanMessage("Fix the failed SQL query based on the error and schema provided."),
-    ]);
-
-    const content = response.content as string;
-    console.log("[SQL_REPAIR] LLM Response:", content.substring(0, 200));
-
-    const parsed = extractJSON(content);
-
-    if (parsed && parsed.sql) {
-      console.log(`[SQL_REPAIR] Successfully generated fix: ${parsed.explanation}`);
-      return {
-        sql: parsed.sql,
-        explanation: parsed.explanation || "Query repaired by AI",
-      };
-    }
-
-    const markdownSqlMatch = content.match(/```(?:sql)?\s*([\s\S]+?)```/i);
-    if (markdownSqlMatch) {
-      const sql = markdownSqlMatch[1].trim();
-      if (sql.toLowerCase().includes("select")) {
-        return {
-          sql,
-          explanation: "Query extracted from markdown block",
-        };
+      try {
+        const preview = await dbGateway.getTablePreview(table, context.connectionString);
+        const first = Array.isArray(preview) ? preview[0] : Array.isArray((preview as any)?.data) ? (preview as any).data[0] : null;
+        if (first && typeof first === "object") {
+          const inferred = Object.keys(first).map((k) => String(k).trim()).filter(Boolean);
+          if (inferred.length > 0) {
+            const key = table.toLowerCase();
+            const existing = columnsByTable.get(key) || [];
+            columnsByTable.set(key, Array.from(new Set([...existing, ...inferred])));
+          }
+        }
+      } catch {
+        // best effort MCP pull
       }
-    }
-
-    const directSqlMatch = content.match(/(?:SELECT|WITH)[\s\S]+?(?:;|$)/i);
-    if (directSqlMatch) {
-      return {
-        sql: directSqlMatch[0].trim(),
-        explanation: "Query extracted via text matching",
-      };
-    }
-
-    throw new Error("Could not extract repaired SQL from LLM response");
-  } catch (err: any) {
-    console.error("[SQL_REPAIR] Failed to repair query:", err.message);
-    throw new Error(`SQL repair failed: ${err.message}`);
+    }));
   }
+
+  const allKnownTables = Array.from(new Set([
+    ...Object.keys(schemaInfoMap || {}),
+    ...Array.from(columnsByTable.keys()),
+  ].map((t) => String(t).split(".").pop() || "").filter(Boolean)));
+  const allKnownColumns = Array.from(new Set(Array.from(columnsByTable.values()).flat()));
+
+  // Build allowed filter column set from filterableColumns (user-enabled via schema configuration)
+  const filterableColumns: Record<string, string[]> = context.filterableColumns || {};
+  const allowedFilterColumns = new Set<string>();
+  Object.entries(filterableColumns).forEach(([, cols]) => {
+    (cols || []).forEach((col) => allowedFilterColumns.add(col.toLowerCase()));
+  });
+
+  let repairedSql = normalizedOriginal || "";
+  const appliedRepairs: string[] = [];
+  const missing = parseMissingIdentifier(compactError);
+
+  if (repairedSql && missing) {
+    if (missing.kind === "column") {
+      const tableScopedColumns = referencedTables
+        .map((table) => columnsByTable.get(String(table).toLowerCase()) || [])
+        .flat();
+      const searchPool = tableScopedColumns.length > 0 ? tableScopedColumns : allKnownColumns;
+      const replacement = chooseClosestName(missing.name, searchPool);
+      if (replacement && replacement !== missing.name) {
+        repairedSql = replaceIdentifier(repairedSql, missing.name, replacement);
+        appliedRepairs.push(`column ${missing.name} -> ${replacement}`);
+      }
+    } else if (missing.kind === "table") {
+      const replacement = chooseClosestName(missing.name, allKnownTables);
+      if (replacement && replacement !== missing.name) {
+        repairedSql = replaceIdentifier(repairedSql, missing.name, replacement);
+        appliedRepairs.push(`table ${missing.name} -> ${replacement}`);
+      }
+    }
+  }
+
+  // Log repair context for debugging (uses, notes, primaryTable from widget metadata)
+  if (context.widgetUses || context.widgetNotes || context.primaryTable) {
+    console.log(`[SQL_REPAIR] Widget context — uses: ${context.widgetUses || "n/a"}, primaryTable: ${context.primaryTable || "n/a"}, notes: ${(context.widgetNotes || "").slice(0, 80)}`);
+  }
+
+  if (repairedSql && !isMssql && /\bTOP\s+\d+\b/i.test(repairedSql)) {
+    repairedSql = repairedSql.replace(/\bSELECT\s+TOP\s+(\d+)/i, "SELECT");
+    appliedRepairs.push("removed TOP for PostgreSQL");
+  }
+  if (repairedSql && isMssql && /\bLIMIT\s+\d+/i.test(repairedSql)) {
+    repairedSql = repairedSql.replace(/\s+LIMIT\s+\d+(\s+OFFSET\s+\d+)?/gi, "");
+    if (!/\bSELECT\s+TOP\s+\d+/i.test(repairedSql)) {
+      repairedSql = repairedSql.replace(/\bSELECT\b/i, "SELECT TOP 100");
+    }
+    appliedRepairs.push("converted LIMIT to TOP for MSSQL");
+  }
+
+  // ── COALESCE type mismatch (boolean vs integer) — cast boolean col to int ─────
+  // PostgreSQL: "COALESCE types boolean and integer cannot be matched"
+  if (repairedSql && !isMssql && /coalesce types.*cannot be matched/i.test(compactError)) {
+    const before = repairedSql;
+    // Replace COALESCE(<identifier>, <number>) → COALESCE(<identifier>::int, <number>)
+    // Handles SUM(COALESCE(...)) and other wrapping expressions
+    repairedSql = repairedSql.replace(
+      /\bCOALESCE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*,\s*(\d+(?:\.\d+)?)\s*\)/gi,
+      (_match, col: string, num: string) => {
+        // Skip if already cast
+        if (/::/.test(col)) return `COALESCE(${col}, ${num})`;
+        return `COALESCE(${col}::int, ${num})`;
+      }
+    );
+    if (repairedSql !== before) {
+      appliedRepairs.push("cast boolean column to int in COALESCE (boolean/integer type mismatch)");
+    }
+  }
+
+  // ── General COALESCE/aggregate type mismatch — replace COALESCE(bool_col, N) ─
+  // For MSSQL: COALESCE(bool_col, 0) → COALESCE(CAST(bool_col AS INT), 0)
+  if (repairedSql && isMssql && /coalesce.*type.*mismatch|operand type clash/i.test(compactError)) {
+    const before = repairedSql;
+    repairedSql = repairedSql.replace(
+      /\bCOALESCE\s*\(\s*([a-zA-Z_][a-zA-Z0-9_.]*)\s*,\s*(\d+(?:\.\d+)?)\s*\)/gi,
+      (_match, col: string, num: string) => {
+        if (/CAST\s*\(/i.test(col)) return `COALESCE(${col}, ${num})`;
+        return `COALESCE(CAST(${col} AS INT), ${num})`;
+      }
+    );
+    if (repairedSql !== before) {
+      appliedRepairs.push("cast boolean column to int in COALESCE for MSSQL (type mismatch)");
+    }
+  }
+
+  if (repairedSql) {
+    const validation = validateSqlWithInstructions(
+      repairedSql,
+      context.connectionString,
+      String(context.schema?.connectorInstructions || context.schema?.connector?.instructions || ""),
+      String(context.schema?.connectorType || context.schema?.connector?.type || "")
+    );
+    if (validation.ok && context.connectionString) {
+      try {
+        if (isMssql) {
+          await dbGateway.runQuery(`SELECT TOP 1 * FROM (${stripTrailingSemicolon(repairedSql)}) AS __probe`, context.connectionString);
+        } else {
+          await dbGateway.runQuery(`EXPLAIN ${stripTrailingSemicolon(repairedSql)}`, context.connectionString);
+        }
+      } catch {
+        // keep repaired SQL as best effort; executor will perform final run.
+      }
+    }
+    const filterNote = allowedFilterColumns.size > 0
+      ? ` Allowed filter columns: ${Array.from(allowedFilterColumns).join(", ")}.`
+      : "";
+    if (validation.ok || appliedRepairs.length > 0) {
+      return {
+        sql: repairedSql,
+        explanation: appliedRepairs.length > 0
+          ? `Repaired using MCP schema context (${selectedTables.join(", ") || "schema"}): ${appliedRepairs.join("; ")}.${filterNote}`
+          : `Validated and normalized SQL using MCP-aware repair path. Error summary: ${compactError.slice(0, 140)}${filterNote}`,
+      };
+    }
+  }
+
+  // ── AI-powered repair fallback ───────────────────────────────────────────────
+  // Heuristic repair couldn't fix the SQL — ask the LLM with full MCP schema context.
+  console.log(`[SQL_REPAIR] Heuristic repair insufficient — escalating to AI repair for "${context.widgetTitle}"`);
+  const aiResult = await aiRepairSql({
+    widgetTitle: context.widgetTitle,
+    widgetType: context.widgetType,
+    widgetGoal: context.widgetGoal,
+    widgetUses: context.widgetUses,
+    widgetNotes: context.widgetNotes,
+    primaryTable: context.primaryTable,
+    allowedFilterColumns,
+    originalSql: compactSql,
+    errorMessage: compactError,
+    columnsByTable,
+    allKnownTables,
+    isMssql,
+    connectorInstructions: String(context.schema?.connectorInstructions || context.schema?.connector?.instructions || ""),
+    connectionString: context.connectionString,
+  });
+
+  if (aiResult) {
+    // Validate and optionally probe the AI-produced SQL
+    const aiValidation = validateSqlWithInstructions(
+      aiResult.sql,
+      context.connectionString,
+      String(context.schema?.connectorInstructions || context.schema?.connector?.instructions || ""),
+      String(context.schema?.connectorType || context.schema?.connector?.type || "")
+    );
+    if (aiValidation.ok) {
+      if (context.connectionString) {
+        try {
+          if (isMssql) {
+            await dbGateway.runQuery(`SELECT TOP 1 * FROM (${stripTrailingSemicolon(aiResult.sql)}) AS __ai_probe`, context.connectionString);
+          } else {
+            await dbGateway.runQuery(`EXPLAIN ${stripTrailingSemicolon(aiResult.sql)}`, context.connectionString);
+          }
+          console.log(`[SQL_REPAIR_AI] AI-repaired SQL probed successfully for "${context.widgetTitle}"`);
+        } catch (probeErr: any) {
+          console.warn(`[SQL_REPAIR_AI] AI-repaired SQL probe failed for "${context.widgetTitle}":`, probeErr?.message || probeErr);
+          // Keep the AI SQL anyway — executor will make the final call
+        }
+      }
+      return { sql: aiResult.sql, explanation: `AI repair: ${aiResult.explanation}` };
+    }
+    // AI produced SQL but it failed our validator — return it with a warning note
+    console.warn(`[SQL_REPAIR_AI] AI-produced SQL failed validation for "${context.widgetTitle}": ${aiValidation.error}`);
+    return { sql: aiResult.sql, explanation: `AI repair (validation warning: ${aiValidation.error}): ${aiResult.explanation}` };
+  }
+
+  // Prefer widget's primaryTable as the fallback table when heuristics fail
+  const firstTable = context.primaryTable || selectedTables[0] || Object.keys(schemaInfoMap)[0] || "unknown_table";
+  const escapedTable = firstTable.replace(/]/g, "]]");
+  const fallbackSql = isMssql
+    ? `SELECT TOP 10 * FROM [${escapedTable}];`
+    : `SELECT * FROM "${firstTable.replace(/"/g, '""')}" LIMIT 10;`;
+
+  return {
+    sql: fallbackSql,
+    explanation: `MCP repair fallback: generated safe probe SQL on "${firstTable}". Error summary: ${compactError.slice(0, 140)}.`
+  };
 }
 
 function buildFiltersFromCandidates(filterCandidates: any): any[] {
@@ -842,10 +1155,105 @@ export async function assembleFinalDashboard(
   plan: any,
   queries: any[],
   results: any[],
-  insights: string[] = [],
-  filterCandidates?: any
+  _insights: string[] = [],
+  filterCandidates?: any,
+  schemaContext?: {
+    visibleColumns?: Record<string, string[]>;
+    filterableColumns?: Record<string, string[]>;
+  }
 ) {
   console.log("[AGENT] Assembling Final Dashboard with Smart Layout...");
+  void _insights;
+
+  const humanizeField = (field: string) =>
+    field.charAt(0).toUpperCase() + field.slice(1).replace(/_/g, " ");
+
+  /** Collect the schema-visible column names for a widget across all its tables.
+   *  Parses widget.uses ("orders.id, customers.name") + widget.primaryTable to find tables,
+   *  then returns the union of visibleColumns for those tables filtered to what the query returned. */
+  const getSchemaVisibleColumnsForWidget = (w: any, resultFields: string[]): string[] | null => {
+    const visibleColumnsMap = schemaContext?.visibleColumns;
+    if (!visibleColumnsMap || Object.keys(visibleColumnsMap).length === 0) return null;
+
+    // Collect all tables referenced by this widget
+    const tables = new Set<string>();
+    if (w.primaryTable) tables.add(String(w.primaryTable).trim().toLowerCase());
+    const usesStr = String(w.uses || "");
+    usesStr.split(",").forEach((ref) => {
+      const parts = ref.trim().split(".");
+      if (parts.length >= 2) tables.add(parts[0].trim().toLowerCase());
+    });
+
+    // If no table hints, check all tables whose visible columns overlap with result fields
+    if (tables.size === 0) {
+      const resultSet = new Set(resultFields.map((f) => f.toLowerCase()));
+      Object.entries(visibleColumnsMap).forEach(([table, cols]) => {
+        const overlap = (cols || []).filter((c) => resultSet.has(c.toLowerCase())).length;
+        if (overlap >= 2) tables.add(table.toLowerCase());
+      });
+    }
+
+    // Build the union of visible columns from matched tables, preserving order and filtering to result fields
+    const resultFieldSet = new Set(resultFields.map((f) => f.toLowerCase()));
+    const resultFieldByLower = new Map(resultFields.map((f) => [f.toLowerCase(), f]));
+    const seen = new Set<string>();
+    const ordered: string[] = [];
+
+    // First: columns from matched tables in their schema order
+    Object.entries(visibleColumnsMap).forEach(([table, cols]) => {
+      if (!tables.has(table.toLowerCase())) return;
+      (cols || []).forEach((col) => {
+        const lower = col.toLowerCase();
+        if (!seen.has(lower) && resultFieldSet.has(lower)) {
+          seen.add(lower);
+          ordered.push(resultFieldByLower.get(lower) || col);
+        }
+      });
+    });
+
+    // If nothing matched (alias mismatch), fall through to null so all columns show
+    return ordered.length > 0 ? ordered : null;
+  };
+
+  /** Build filters for the dashboard from filterableColumns (schema discovery toggles).
+   *  Only used when filterCandidates is empty and schema filterableColumns is available. */
+  const buildFiltersFromFilterableColumns = (
+    filterableColumns: Record<string, string[]>,
+    schemaInfo: Record<string, any>
+  ): any[] => {
+    const humanize = (s: string) => s.replace(/[_.]+/g, " ").replace(/\b\w/g, (m) => m.toUpperCase());
+    const filters: any[] = [];
+    const usedIds = new Set<string>();
+    Object.entries(filterableColumns).forEach(([table, cols]) => {
+      (cols || []).forEach((col) => {
+        const id = `${table}.${col}`;
+        if (usedIds.has(id)) return;
+        usedIds.add(id);
+        const columnMeta = (schemaInfo?.[table]?.columns || []).find(
+          (c: any) => (c?.name || c?.column_name) === col
+        );
+        const dataType = String(columnMeta?.data_type || columnMeta?.type || "").toLowerCase();
+        const isDate = /date|time|timestamp/.test(dataType) || /date|_at$|_date$/.test(col.toLowerCase());
+        filters.push({
+          id,
+          dimension: id,
+          label: humanize(col),
+          type: isDate ? "date-range" : "select",
+          value: isDate ? "this_month" : null,
+          ...(isDate ? {
+            options: [
+              { label: "Today", value: "today" },
+              { label: "This Week", value: "this_week" },
+              { label: "This Month", value: "this_month" },
+              { label: "This Year", value: "this_year" },
+              { label: "Custom", value: "custom" },
+            ]
+          } : {})
+        });
+      });
+    });
+    return filters;
+  };
 
   const widgetsWithResults = plan.widgets.map((w: any) => {
     const q = queries.find(
@@ -870,25 +1278,42 @@ export async function assembleFinalDashboard(
       (field: any) => typeof field === "string" && field !== "__rowKey"
     );
 
-    const existingTableColumns = Array.isArray(w?.tableConfig?.columns) ? w.tableConfig.columns : [];
-    const existingByField = new Map<string, any>();
-    existingTableColumns.forEach((col: any) => {
-      const field = String(col?.field || "").trim();
-      if (!field) return;
-      existingByField.set(field, col);
-    });
-    const mergedFields = [
-      ...existingTableColumns.map((col: any) => String(col?.field || "").trim()).filter(Boolean),
-      ...resolvedColumnFields.filter((field: string) => !existingByField.has(field)),
-    ];
-    const mergedTableColumns = mergedFields.map((field: string) => {
-      const existing = existingByField.get(field);
-      if (existing) return existing;
-      return {
-        field,
-        header: field.charAt(0).toUpperCase() + field.slice(1).replace(/_/g, " "),
-      };
-    });
+    // For table widgets: prefer schema-visible column order; fall back to merged planner + result columns
+    let mergedTableColumns: any[] = [];
+    if (w?.type === "table") {
+      const schemaVisibleFields = getSchemaVisibleColumnsForWidget(w, resolvedColumnFields);
+
+      if (schemaVisibleFields && schemaVisibleFields.length > 0) {
+        // Use schema-discovery visible columns as authoritative order and filter
+        const existingByField = new Map<string, any>();
+        (Array.isArray(w?.tableConfig?.columns) ? w.tableConfig.columns : []).forEach((col: any) => {
+          const field = String(col?.field || "").trim();
+          if (field) existingByField.set(field, col);
+        });
+        mergedTableColumns = schemaVisibleFields.map((field) => {
+          const existing = existingByField.get(field);
+          if (existing) return existing;
+          return { field, header: humanizeField(field), sortable: true };
+        });
+      } else {
+        // Fallback: merge planner tableConfig columns with any extra result columns
+        const existingTableColumns = Array.isArray(w?.tableConfig?.columns) ? w.tableConfig.columns : [];
+        const existingByField = new Map<string, any>();
+        existingTableColumns.forEach((col: any) => {
+          const field = String(col?.field || "").trim();
+          if (field) existingByField.set(field, col);
+        });
+        const mergedFields = [
+          ...existingTableColumns.map((col: any) => String(col?.field || "").trim()).filter(Boolean),
+          ...resolvedColumnFields.filter((field: string) => !existingByField.has(field)),
+        ];
+        mergedTableColumns = mergedFields.map((field) => {
+          const existing = existingByField.get(field);
+          if (existing) return existing;
+          return { field, header: humanizeField(field) };
+        });
+      }
+    }
 
     return {
       ...w,
@@ -906,9 +1331,26 @@ export async function assembleFinalDashboard(
     };
   });
 
+  // Resolve dashboard-level filters: prefer filterableColumns from schema discovery,
+  // then plan.filters, then filterCandidates
+  const resolveFilters = () => {
+    if (plan.filters?.length > 0) return normalizeFilterSet(plan.filters);
+    const filterableColumns = schemaContext?.filterableColumns;
+    if (filterableColumns && Object.keys(filterableColumns).length > 0) {
+      const schemaFilters = buildFiltersFromFilterableColumns(
+        filterableColumns,
+        plan?.schemaInfo || {}
+      );
+      if (schemaFilters.length > 0) return normalizeFilterSet(schemaFilters);
+    }
+    return normalizeFilterSet(buildFiltersFromCandidates(filterCandidates));
+  };
+
   const widgets = widgetsWithResults.map((w: any) => {
-    const { __resultStatus: _status, __hasData: _hasData, ...rest } = w;
-    return { ...rest };
+    const rest = { ...w };
+    delete rest.__resultStatus;
+    delete rest.__hasData;
+    return rest;
   });
 
   const kpis = widgets.filter((w: any) => w.type === "kpi");
@@ -979,20 +1421,17 @@ export async function assembleFinalDashboard(
     name: plan.title || "AI Insights Dashboard",
     widgets,
     layout: widgets.map((w: any) => ({ i: w.id, ...w.position })),
-    filters: normalizeFilterSet(plan.filters || buildFiltersFromCandidates(filterCandidates)),
+    filters: resolveFilters(),
     updatedAt: new Date().toISOString(),
   };
 }
 
 export async function runNarrativeGenerator(resultsList: any[]) {
   console.log("[AGENT] Analyzing data trends...");
-  const prompt = `Role: Senior Strategic Executive Analyst.
-    RESULTS: ${JSON.stringify(resultsList.map((r) => ({ title: r.title, sample: r.data?.slice(0, 3) })))}
+  const { runSkill } = await import("@/lib/skills/registry");
+  const { registerNarrativeGeneratorSkill } = await import("@/lib/skills/narrative-generator");
+  registerNarrativeGeneratorSkill();
 
-    TASK: Provide 3-4 professional, one-sentence bulleted insights based on this data.
-    Return JSON: { "insights": ["..."] }`;
-
-  const response = await invokeModelWithRetry([new SystemMessage(prompt)]);
-  const data = extractJSON(response.content as string);
-  return data?.insights || ["Data retrieval successful. Full analysis ready."];
+  const { narrative } = await runSkill<any, any>("narrative-generator", { resultsList });
+  return narrative;
 }

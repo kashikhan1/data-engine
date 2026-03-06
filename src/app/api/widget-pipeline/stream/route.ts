@@ -1,123 +1,37 @@
 import { NextRequest, NextResponse } from "next/server";
-import { runQueryGenerator, runQueryExecutor, repairFailedQuery } from "@/lib/agents/nodes";
-
-const extractInstructionRules = (instructions: string) => {
-    const bans = new Set<string>();
-    const requires = new Set<string>();
-    if (!instructions) return { bans, requires };
-    const normalized = instructions
-        .replace(/```[\s\S]*?```/g, " ")
-        .replace(/[^\w\s().\[\]]+/g, " ")
-        .toLowerCase();
-    const banPatterns = [/(:?do not use|don't use|avoid|never use|no)\s+([a-z0-9_().\[\]]+)/gi];
-    const requirePatterns = [/(:?must use|always use|required)\s+([a-z0-9_().\[\]]+)/gi];
-    let match: RegExpExecArray | null;
-    for (const pattern of banPatterns) {
-        while ((match = pattern.exec(normalized)) !== null) {
-            if (match?.[2]) bans.add(match[2].toLowerCase());
-        }
-    }
-    for (const pattern of requirePatterns) {
-        while ((match = pattern.exec(normalized)) !== null) {
-            if (match?.[2]) requires.add(match[2].toLowerCase());
-        }
-    }
-    if (normalized.includes("never use limit") || normalized.includes("do not use limit")) {
-        bans.add("limit");
-    }
-    if (normalized.includes("never generate current_date") || normalized.includes("no current_date")) {
-        bans.add("current_date");
-    }
-    if (normalized.includes("never generate date_trunc") || normalized.includes("no date_trunc")) {
-        bans.add("date_trunc");
-    }
-    return { bans, requires };
-};
-
-const normalizeSqlForValidation = (sql: string) => {
-    let text = String(sql || "");
-    if (!text) return "";
-    text = text.replace(/^\uFEFF/, "");
-    text = text.replace(/```/g, "");
-    text = text.replace(/^\s*sql\s*:/i, "");
-    text = text.trimStart();
-    while (text.startsWith("--") || text.startsWith("#") || text.startsWith("/*")) {
-        if (text.startsWith("--") || text.startsWith("#")) {
-            text = text.replace(/^(--|#)[^\n]*\n?/, "").trimStart();
-            continue;
-        }
-        if (text.startsWith("/*")) {
-            text = text.replace(/^\/\*[\s\S]*?\*\//, "").trimStart();
-            continue;
-        }
-        break;
-    }
-    return text.trim();
-};
-
-const stripSqlLiteralsAndComments = (sql: string) => {
-    let text = String(sql || "");
-    if (!text) return "";
-    text = text.replace(/\/\*[\s\S]*?\*\//g, " ");
-    text = text.replace(/--.*$/gm, " ");
-    text = text.replace(/'(?:''|[^'])*'/g, "''");
-    text = text.replace(/"(?:\"\"|[^"])*"/g, "\"\"");
-    return text;
-};
-
-const validateSql = (sql: string, connectionString?: string, connectorInstructions?: string) => {
-    const trimmed = normalizeSqlForValidation(sql);
-    if (!trimmed.toLowerCase().startsWith("select")) {
-        return { ok: false, error: "Validation failed: SQL must start with SELECT." };
-    }
-    const semicolonIndex = trimmed.indexOf(";");
-    if (semicolonIndex >= 0 && trimmed.slice(semicolonIndex).trim() !== ";") {
-        return { ok: false, error: "Validation failed: multiple SQL statements are not allowed." };
-    }
-    const blocked = ["drop", "delete", "truncate", "update", "insert", "alter", "create", "grant", "revoke"];
-    const sanitized = stripSqlLiteralsAndComments(trimmed).toLowerCase();
-    if (blocked.some((kw) => new RegExp(`\\b${kw}\\b`, "i").test(sanitized))) {
-        return { ok: false, error: "Validation failed: unsafe SQL detected." };
-    }
-    const lower = String(connectionString || "").toLowerCase();
-    const isMssql = lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
-    if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
-        return { ok: false, error: "Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH." };
-    }
-    if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
-        return { ok: false, error: "Validation failed: PostgreSQL does not support TOP. Use LIMIT." };
-    }
-    const { bans, requires } = extractInstructionRules(connectorInstructions || "");
-    for (const banned of bans) {
-        const pattern = new RegExp(`\\b${banned.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
-        if (pattern.test(trimmed)) {
-            return { ok: false, error: `Validation failed: SQL violates connector instruction (avoid "${banned}").` };
-        }
-    }
-    for (const required of requires) {
-        const pattern = new RegExp(`\\b${required.replace(/[.*+?^${}()|[\\]\\\\]/g, "\\$&")}\\b`, "i");
-        if (!pattern.test(trimmed)) {
-            return { ok: false, error: `Validation failed: SQL must include "${required}".` };
-        }
-    }
-    return { ok: true };
-};
+import { runQueryGenerator, runQueryExecutor, repairFailedQuery, validateSqlWithInstructions } from "@/modules/sql/agent";
+import { applyAgentTodoUpdates } from "@/lib/agents/todo-list-updater";
+import { buildTodoSummary, normalizeTodoScopeId, type TodoItem, type TodoListState } from "@/lib/agents/todo-types";
 
 const formatResultForWidget = (widget: any, result: any) => {
     const data = Array.isArray(result?.data) ? result.data : [];
-    if (widget?.type === "kpi") {
-        let value = 0;
+    const type = String(widget?.type || "").toLowerCase();
+
+    if (type === "kpi") {
+        let value: number | string = 0;
+        let label: string | undefined;
         if (data.length > 0) {
             const row = data[0] || {};
-            const firstNumeric = Object.values(row).find((v) => typeof v === "number");
-            if (typeof firstNumeric === "number") value = firstNumeric;
+            const entries = Object.entries(row);
+            // prefer first numeric value
+            const numEntry = entries.find(([, v]) => typeof v === "number");
+            if (numEntry) {
+                value = numEntry[1] as number;
+                label = String(numEntry[0]);
+            } else if (entries.length > 0) {
+                const [k, v] = entries[0];
+                value = v as any;
+                label = String(k);
+            }
         }
-        return {
-            ...result,
-            data: [{ value }],
-            columns: ["value"]
-        };
+        return { ...result, data: [{ value, label }], columns: ["value", "label"] };
     }
+
+    // For charts: ensure there's at least an empty array so widgets don't crash
+    if (["line", "bar", "area", "scatter", "pie", "donut", "funnel", "cohort", "map"].includes(type)) {
+        return { ...result, data };
+    }
+
     return result;
 };
 
@@ -164,10 +78,78 @@ const buildPaginationConfig = (filters: Record<string, any>, widgetId: string) =
     };
 };
 
+/** Build runtime filter params from the filters object and schema filterableColumns.
+ *  Accepts an optional widgetId to extract widget-scoped sort/search keys.
+ *  This ensures only enabled columns are injected and merges plan defaults. */
+const buildRuntimeParams = (
+    planFilters: any[],
+    activeFilters: Record<string, any>,
+    filterableColumns: Record<string, string[]>,
+    widgetId?: string
+): Record<string, any> => {
+    // Start with plan-level defaults (dimension -> value)
+    const base: Record<string, any> = {};
+    (planFilters || []).forEach((f: any) => {
+        if (!f?.dimension) return;
+        base[f.dimension] = f.value;
+    });
+
+    // Overlay active runtime filter values
+    const merged: Record<string, any> = { ...base, ...(activeFilters || {}) };
+
+    // If filterableColumns are defined, only keep filter params that match enabled columns
+    const enabledKeys = new Set<string>();
+    Object.entries(filterableColumns || {}).forEach(([table, cols]) => {
+        (cols || []).forEach((col) => {
+            enabledKeys.add(`${table}.${col}`);
+            enabledKeys.add(col);
+            // Also allow dot-suffixed variants for date range filters
+            enabledKeys.add(`${table}.${col}.from`);
+            enabledKeys.add(`${table}.${col}.to`);
+        });
+    });
+
+    // Keep pagination + sort + search params always; filter params only if enabled
+    const filtered: Record<string, any> = {};
+    Object.entries(merged).forEach(([key, val]) => {
+        const isPagination = key.startsWith("__page:") || key.startsWith("__pageSize:") ||
+            key.startsWith("__offset:") || key === "page" || key === "size" ||
+            key === "pageSize" || key === "page_size" || key === "storePage" ||
+            key === "storeSize" || key === "rowsOnPage" || key === "offset" ||
+            key.startsWith("page:") || key.startsWith("size:") || key.startsWith("pageSize:") ||
+            key.startsWith("page_size:") || key.startsWith("storePage:") ||
+            key.startsWith("storeSize:") || key.startsWith("rowsOnPage:") || key.startsWith("offset:");
+        const isSortKey = key.startsWith("__sort_col:") || key.startsWith("__sort_dir:");
+        const isSearchKey = key === "__search" || key.startsWith("__search") || key === "searchDimension";
+        if (isPagination || isSortKey || isSearchKey || enabledKeys.size === 0 || enabledKeys.has(key)) {
+            filtered[key] = val;
+        }
+    });
+
+    // Extract widget-scoped sort keys and normalize to template token names
+    if (widgetId) {
+        const sortCol = merged[`__sort_col:${widgetId}`];
+        const sortDir = merged[`__sort_dir:${widgetId}`];
+        if (sortCol != null && String(sortCol).trim()) filtered["sort_col"] = String(sortCol).trim();
+        if (sortDir != null) filtered["sort_dir"] = String(sortDir).toUpperCase() === "DESC" ? "DESC" : "ASC";
+    }
+
+    return filtered;
+};
+
 export async function POST(request: NextRequest) {
     try {
         const body = await request.json();
-        const { plan, schema, filters, applyFilters, errorLog, connectorType, connectorInstructions, connectionString: bodyConnectionString } = body || {};
+        const {
+            plan, schema, filters, applyFilters, errorLog,
+            connectorType, connectorInstructions,
+            connectionString: bodyConnectionString,
+            todoListState: incomingTodoListState,
+            /** When true: generate + validate SQL only, skip execution. Used for HITL SQL review. */
+            generateOnly = false,
+            /** Pre-built SQL map (widgetId → sql). When provided, skips SQL generation and uses this SQL directly. */
+            prebuiltSqlMap = {} as Record<string, string>,
+        } = body || {};
 
         if (!plan || !schema) {
             return new Response("Missing plan or schema", { status: 400 });
@@ -187,25 +169,126 @@ export async function POST(request: NextRequest) {
             ...schema,
             connectorInstructions: connectorInstructions || schema?.connectorInstructions,
             connectorType: connectorType || schema?.connectorType,
-            connectionString: schema?.connectionString || bodyConnectionString || connectionString || undefined
+            // bodyConnectionString is the live selection from the client; prefer it over
+            // schema.connectionString which may be stale (old URL or wrong DB type).
+            connectionString: bodyConnectionString || schema?.connectionString || connectionString || undefined
         };
 
+        // Extract enabled filter columns from schema (source of truth, not from persisted plan)
+        const filterableColumns: Record<string, string[]> = (schema?.filterableColumns && typeof schema.filterableColumns === "object")
+            ? schema.filterableColumns
+            : {};
+
         const encoder = new TextEncoder();
+        const cloneTodoList = (state: TodoListState): TodoListState => ({
+            runId: String(state?.runId || `sql_${Date.now()}`),
+            items: Array.isArray(state?.items) ? state.items.map((item) => ({ ...item })) : [],
+            summary: state?.summary || buildTodoSummary([]),
+            agentUpdateLedger: Object.fromEntries(
+                Object.entries(state?.agentUpdateLedger || {}).map(([k, v]) => [k, Array.isArray(v) ? [...v] : []])
+            )
+        });
+        const makeTodoItem = (
+            id: string,
+            domain: TodoItem["domain"],
+            scopeId: string,
+            title: string,
+            priority: TodoItem["priority"] = "medium",
+            status: TodoItem["status"] = "pending",
+            ownerAgent?: string
+        ): TodoItem => {
+            const ts = new Date().toISOString();
+            return {
+                id,
+                domain,
+                scopeId: normalizeTodoScopeId(scopeId),
+                title,
+                status,
+                priority,
+                ownerAgent,
+                source: "rule",
+                createdAt: ts,
+                updatedAt: ts,
+            };
+        };
+        const ensureTodoItem = (state: TodoListState, item: TodoItem) => {
+            const idx = state.items.findIndex((x) => x.id === item.id);
+            if (idx === -1) state.items.push(item);
+        };
         const stream = new ReadableStream({
             async start(controller) {
                 try {
-                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "started" })}\n\n`));
+                    let todoListState: TodoListState = incomingTodoListState
+                        ? cloneTodoList(incomingTodoListState)
+                        : {
+                            runId: `sql_${Date.now()}`,
+                            items: [],
+                            summary: buildTodoSummary([]),
+                            agentUpdateLedger: {},
+                        };
+                    ensureTodoItem(
+                        todoListState,
+                        makeTodoItem("todo:agent:sql engineer", "agent", "SQL Engineer", "Run SQL Engineer", "medium", "pending", "SQL Engineer")
+                    );
+                    for (let i = 0; i < widgets.length; i += 1) {
+                        const widget = widgets[i];
+                        const widgetId = String(widget?.id || `w${i + 1}`);
+                        const title = String(widget?.title || widgetId);
+                        ensureTodoItem(
+                            todoListState,
+                            makeTodoItem(`todo:sql:${normalizeTodoScopeId(widgetId)}`, "sql", widgetId, `Build SQL for ${title}`, "medium", "pending", "SQL Engineer")
+                        );
+                    }
+                    todoListState.summary = buildTodoSummary(todoListState.items);
 
-                    const tasks = widgets.map(async (widget: any) => {
-                        const widgetId = widget.id;
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "started" })}\n\n`));
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "todo_sql_started", todoList: todoListState })}\n\n`));
+
+                    const tasks = widgets.map(async (widget: any, index: number) => {
+                        const widgetId = String(widget?.id || `w${index + 1}`);
+                        const widgetType = String(widget?.type || "unknown").toLowerCase();
+                        const widgetWithId = { ...widget, id: widgetId };
+                        const isTableWidget = widgetType === "table";
                         const send = (payload: any) =>
                             controller.enqueue(encoder.encode(`data: ${JSON.stringify({ widgetId, ...payload })}\n\n`));
 
-                        send({ status: "sql_builder_running", widgetTitle: widget.title });
-                        const singlePlan = { ...plan, widgets: [widget] };
-                        const sqlMap = await runQueryGenerator(singlePlan, schemaForPrompt, filters || {}, errorLog || [], Boolean(applyFilters));
-                        let sql = sqlMap[widgetId];
+                        send({ status: "sql_builder_running", widgetTitle: widgetWithId.title, widgetType });
+
+                        // HITL: If caller provided pre-built SQL for this widget, skip generation
+                        let sql: string;
+                        if (prebuiltSqlMap && Object.prototype.hasOwnProperty.call(prebuiltSqlMap, widgetId)) {
+                            sql = String(prebuiltSqlMap[widgetId] || "SELECT 1 AS value;");
+                            send({ status: "sql_generation_path", path: "prebuilt" });
+                        } else {
+                            const singlePlan = { ...plan, widgets: [widgetWithId] };
+                            const generationPathByWidget: Record<string, string> = {};
+                            const sqlMap = await runQueryGenerator(
+                                singlePlan,
+                                schemaForPrompt,
+                                filters || {},
+                                errorLog || [],
+                                Boolean(applyFilters),
+                                (id, _sql, _index, _total, path) => {
+                                    if (!id) return;
+                                    generationPathByWidget[id] = String(path || "full");
+                                }
+                            );
+                            sql = sqlMap[widgetId] || "SELECT 1 AS value;";
+                            send({ status: "sql_generation_path", path: generationPathByWidget[widgetId] || "full" });
+                        }
                         send({ status: "sql_builder_done", sql });
+
+                        // Build runtime params using schema filterableColumns as the source of truth
+                        // Pass widgetId so widget-scoped sort_col/sort_dir keys are normalized
+                        const runtimeParams = buildRuntimeParams(
+                            plan?.filters || [],
+                            filters || {},
+                            filterableColumns,
+                            widgetId
+                        );
+
+                        // Pagination only for table widgets; charts/KPIs use full SQL
+                        const pagination = isTableWidget ? buildPaginationConfig(filters || {}, widgetId) : undefined;
 
                         let attempt = 0;
                         let lastError = "";
@@ -214,14 +297,19 @@ export async function POST(request: NextRequest) {
                         while (attempt < 3) {
                             attempt += 1;
                             send({ status: "sql_validator_running", attempt });
-                            const validation = validateSql(sql, connectionString, connectorInstructions);
+                            const validation = validateSqlWithInstructions(sql, connectionString, connectorInstructions, connectorType);
                             if (!validation.ok) {
                                 lastError = validation.error || "Validation failed";
+                                send({ status: "sql_validator_error", error: lastError, attempt });
                                 const repair = await repairFailedQuery({
                                     widgetId,
-                                    widgetTitle: widget.title || widgetId,
-                                    widgetType: widget.type || "unknown",
-                                    widgetGoal: widget.goal,
+                                    widgetTitle: widgetWithId.title || widgetId,
+                                    widgetType: widgetWithId.type || "unknown",
+                                    widgetGoal: widgetWithId.goal,
+                                    widgetUses: widgetWithId.uses,
+                                    widgetNotes: widgetWithId.notes,
+                                    primaryTable: widgetWithId.primaryTable,
+                                    filterableColumns,
                                     originalSql: sql,
                                     errorMessage: lastError,
                                     schema: schemaForPrompt,
@@ -234,32 +322,37 @@ export async function POST(request: NextRequest) {
                                 send({ status: "sql_validator_done", attempt });
                             }
 
+                            // HITL: generateOnly — stop here, let user review SQL before execution
+                            if (generateOnly) {
+                                send({ status: "sql_review_ready", sql });
+                                return; // skip execution for this widget
+                            }
+
                             send({ status: "execution_running", sql, attempt });
-                            const pagination = buildPaginationConfig(filters || {}, widgetId);
-                            const runtimeParams = {
-                                ...((plan?.filters || []).reduce((acc: Record<string, any>, f: any) => {
-                                    if (!f?.dimension) return acc;
-                                    acc[f.dimension] = f.value;
-                                    return acc;
-                                }, {})),
-                                ...(filters || {})
-                            };
-                            const exec = await runQueryExecutor({ [widgetId]: sql }, connectionString || undefined, {
-                                connectorInstructions: connectorInstructions || "",
-                                connectorType: connectorType || "",
-                                tablePagination: {
-                                    [widgetId]: pagination
-                                },
-                                runtimeParams
-                            });
+                            const exec = await runQueryExecutor(
+                                { [widgetId]: sql },
+                                connectionString || undefined,
+                                {
+                                    connectorInstructions: connectorInstructions || "",
+                                    connectorType: connectorType || "",
+                                    widgetTypes: { [widgetId]: widgetType },
+                                    ...(pagination ? { tablePagination: { [widgetId]: pagination } } : {}),
+                                    runtimeParams
+                                }
+                            );
                             const result = exec[widgetId];
                             if (result?.status === "error") {
                                 lastError = result.error || "Execution failed";
+                                send({ status: "execution_error", error: lastError, sql, attempt });
                                 const repair = await repairFailedQuery({
                                     widgetId,
-                                    widgetTitle: widget.title || widgetId,
-                                    widgetType: widget.type || "unknown",
-                                    widgetGoal: widget.goal,
+                                    widgetTitle: widgetWithId.title || widgetId,
+                                    widgetType: widgetWithId.type || "unknown",
+                                    widgetGoal: widgetWithId.goal,
+                                    widgetUses: widgetWithId.uses,
+                                    widgetNotes: widgetWithId.notes,
+                                    primaryTable: widgetWithId.primaryTable,
+                                    filterableColumns,
                                     originalSql: sql,
                                     errorMessage: lastError,
                                     schema: schemaForPrompt,
@@ -276,6 +369,19 @@ export async function POST(request: NextRequest) {
                         }
 
                         if (!finalResult) {
+                            todoListState = applyAgentTodoUpdates(todoListState, `SQL Engineer:${widgetId}:final`, [
+                                {
+                                    todoId: `todo:sql:${normalizeTodoScopeId(widgetId)}`,
+                                    status: "failed",
+                                    ownerAgent: "SQL Engineer",
+                                    reason: lastError || "SQL generation and auto-repair failed.",
+                                    suggestedFix: "Inspect generated SQL and repair join/filter logic for this widget."
+                                }
+                            ]);
+                            const failedItem = todoListState.items.find((x) => x.id === `todo:sql:${normalizeTodoScopeId(widgetId)}`);
+                            if (failedItem) {
+                                send({ status: "todo_sql_widget_update", item: failedItem });
+                            }
                             send({
                                 status: "manual_required",
                                 sql,
@@ -285,12 +391,49 @@ export async function POST(request: NextRequest) {
                             return;
                         }
 
-                        send({ status: "execution_done", result: finalResult, sql });
-                        const formatted = formatResultForWidget(widget, finalResult);
-                        send({ status: "formatter_done", result: formatted, sql });
+                        todoListState = applyAgentTodoUpdates(todoListState, `SQL Engineer:${widgetId}:final`, [
+                            {
+                                todoId: `todo:sql:${normalizeTodoScopeId(widgetId)}`,
+                                status: "done",
+                                ownerAgent: "SQL Engineer",
+                                reason: "SQL generated, validated, and executed successfully."
+                            }
+                        ]);
+                        const doneItem = todoListState.items.find((x) => x.id === `todo:sql:${normalizeTodoScopeId(widgetId)}`);
+                        if (doneItem) {
+                            send({ status: "todo_sql_widget_update", item: doneItem });
+                        }
+
+                        const rowCount = Array.isArray(finalResult?.data) ? finalResult.data.length : 0;
+                        send({
+                            status: "execution_done",
+                            result: finalResult,
+                            sql,
+                            rowCount,
+                            totalRows: finalResult?.totalRows ?? null,
+                            executionTime: finalResult?.executionTime || null,
+                            page: finalResult?.page ?? null,
+                            pageSize: finalResult?.pageSize ?? null
+                        });
+                        const formatted = formatResultForWidget(widgetWithId, finalResult);
+                        send({ status: "formatter_done", result: formatted, sql, rowCount });
                     });
 
                     await Promise.all(tasks);
+                    const hasSqlFailures = todoListState.items.some((item) =>
+                        item.domain === "sql" && (item.status === "failed" || item.status === "blocked")
+                    );
+                    todoListState = applyAgentTodoUpdates(todoListState, "SQL Engineer", [
+                        {
+                            todoId: "todo:agent:sql engineer",
+                            status: hasSqlFailures ? "blocked" : "done",
+                            ownerAgent: "SQL Engineer",
+                            reason: hasSqlFailures
+                                ? "One or more widget SQL tasks failed and need manual repair."
+                                : "Processed SQL generation for all widgets."
+                        }
+                    ]);
+                    controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "todo_sql_summary", summary: todoListState.summary })}\n\n`));
                     controller.enqueue(encoder.encode(`data: ${JSON.stringify({ status: "completed" })}\n\n`));
                     controller.close();
                 } catch (err: any) {

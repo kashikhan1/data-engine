@@ -2,6 +2,7 @@ import { NextRequest } from "next/server";
 import { createDefaultChatModel } from "@/lib/llm/model";
 import { HumanMessage, SystemMessage } from "@langchain/core/messages";
 import { executeQuery } from "@/app/actions/mcp";
+import { getCurrentDateTimeContext } from "@/lib/agents/planner/current-datetime-tool";
 
 export const maxDuration = 600; // 10 minutes
 
@@ -24,7 +25,6 @@ export async function POST(request: NextRequest) {
                 try {
                     send({ status: "started", message: "Preparing report..." });
 
-                    // Build COMPACT schema context (budget-aware for small context models)
                     const MAX_COLS_PER_TABLE = 20;
                     const SCHEMA_CHAR_BUDGET = 6000;
 
@@ -35,9 +35,32 @@ export async function POST(request: NextRequest) {
                     for (const table of tables) {
                         const info = schema.schemaInfo?.[table];
                         if (!info) continue;
-                        const allCols = info.columns || [];
+
+                        // Respect visibleColumns set by SchemaDiscovery column toggles
+                        const visibleSet: Set<string> | null = Array.isArray(schema.visibleColumns?.[table])
+                            ? new Set((schema.visibleColumns[table] as string[]).map((c: string) => c.toLowerCase()))
+                            : null;
+
+                        const allCols = (info.columns || []).filter((c: any) => {
+                            if (!visibleSet) return true;
+                            const name = (c?.name || c?.column_name || "").toLowerCase();
+                            return name && visibleSet.has(name);
+                        });
+
+                        // Skip table entirely if all columns were hidden
+                        if (visibleSet && allCols.length === 0) continue;
+
+                        const disabledSet: Set<string> | null = Array.isArray(schema.disabledFilterColumns?.[table])
+                            ? new Set((schema.disabledFilterColumns[table] as string[]).map((c: string) => c.toLowerCase()))
+                            : null;
+
                         const shown = allCols.slice(0, MAX_COLS_PER_TABLE);
-                        const colStr = shown.map((c: any) => `${c.name}(${c.type})`).join(", ");
+                        const colStr = shown.map((c: any) => {
+                            const name = c?.name || c?.column_name || "";
+                            const type = c?.type || c?.data_type || "";
+                            const noFilter = disabledSet !== null && disabledSet.has(name.toLowerCase());
+                            return noFilter ? `${name}(${type})[no-filter]` : `${name}(${type})`;
+                        }).join(", ");
                         const overflow = allCols.length > MAX_COLS_PER_TABLE ? ` +${allCols.length - MAX_COLS_PER_TABLE} more` : "";
 
                         let line = `${table}: ${colStr}${overflow}`;
@@ -57,23 +80,60 @@ export async function POST(request: NextRequest) {
                         totalChars += line.length;
                     }
 
-                    const isMssql = (connectorType || "").toLowerCase().includes("mssql") ||
+                    const connLower = (connectionString || "").toLowerCase();
+                    const typeLower = (connectorType || "").toLowerCase();
+                    const isMssql = typeLower.includes("mssql") ||
+                        typeLower.includes("sqlserver") ||
+                        typeLower.includes("sql server") ||
                         (connectorInstructions || "").toLowerCase().includes("mssql") ||
-                        (connectionString || "").toLowerCase().includes("mssql");
+                        connLower.startsWith("mssql://") ||
+                        connLower.startsWith("sqlserver://") ||
+                        connLower.includes("server=") ||
+                        connLower.includes("data source=");
 
                     const dialect = isMssql ? "T-SQL (MS SQL Server)" : "PostgreSQL";
+                    const dateCtx = getCurrentDateTimeContext();
+                    const dateNote = `TODAY: ${dateCtx.todayDate} (${dateCtx.currentTimeZone})`;
 
-                    // Step 1: Generate multiple queries for the report
+                    // Build ENABLED filter columns (whitelist) from filterableColumns
+                    const enabledFilterCols: Record<string, string[]> = schema.filterableColumns || {};
+                    const enabledLines = Object.entries(enabledFilterCols)
+                        .filter(([, cols]) => Array.isArray(cols) && cols.length > 0)
+                        .map(([table, cols]) => `  ${table}: ${cols.join(", ")}`);
+                    const filterWhitelistBlock = enabledLines.length > 0
+                        ? `\nALLOWED FILTER COLUMNS — ONLY these columns may appear in WHERE, HAVING, or JOIN ON across ALL sections:\n${enabledLines.join("\n")}\nAll other columns are SELECT-only. Never filter on any column not listed here.`
+                        : "";
+
+                    // Step 1: Plan report sections
                     send({ status: "planning", message: "Planning report structure..." });
 
-                    const planPrompt = `You are a data analyst. Plan 2-5 ${dialect} SQL queries for a report answering: "${question}"
+                    const planPrompt = `You are a senior data analyst. Plan 3-5 ${dialect} SQL queries for a comprehensive report answering: "${question}"
 
-SCHEMA:
+${dateNote} — use this for all relative date references (today, this week, last month, this year, etc.)
+
+SCHEMA (all visible columns for SELECT):
 ${schemaLines.join("\n")}
-${connectorInstructions ? `\nNOTES: ${connectorInstructions}` : ""}
+${connectorInstructions ? `\nNOTES: ${connectorInstructions}` : ""}${filterWhitelistBlock}
 
-Return a JSON array: [{"id":"section_1","title":"...","description":"...","sql":"SELECT ..."}]
-Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY valid JSON.`;
+Design sections that together tell a complete story:
+- Start with a high-level KPI/summary section (totals, counts, key metrics)
+- Include trend or time-series sections when date columns exist using ALLOWED FILTER COLUMNS date fields
+- Add breakdown/segmentation sections (by category, region, status, etc.) using ALLOWED FILTER COLUMNS
+- End with a detail/top-N section for drill-down
+
+CRITICAL — FILTER VALUES:
+- If the question mentions ANY specific value (name, status, country, category, ID, amount, date range, etc.), EVERY section's SQL MUST include it as a hardcoded WHERE clause literal.
+- NEVER use placeholders like ?, :param, $1, or {{value}}. Embed values directly: WHERE country = 'Germany', WHERE status = 'active', WHERE amount > 1000.
+- Use ILIKE or LOWER() for case-insensitive text matching.
+- Do NOT drop filter conditions — all sections must respect the same filters from the question.
+- WHERE COLUMNS: You may ONLY use ALLOWED FILTER COLUMNS in WHERE/HAVING. If a date filter is needed, use the closest enabled date column (e.g. created_at, updated_at).
+
+Return a JSON array:
+[
+  {"id":"section_1","title":"Executive KPIs","description":"Key headline metrics","sql":"SELECT ..."},
+  {"id":"section_2","title":"Trend Over Time","description":"Month-by-month breakdown","sql":"SELECT ..."}
+]
+Limit each query to 50 rows. Return ONLY valid JSON. No markdown.`;
 
                     const model = await createDefaultChatModel();
                     const planResponse = await model.invoke([
@@ -85,7 +145,6 @@ Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY
                         ? planResponse.content
                         : String(planResponse.content);
 
-                    // Clean up
                     planText = planText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
 
                     let sections: Array<{ id: string; title: string; description: string; sql: string }> = [];
@@ -93,42 +152,27 @@ Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY
                         sections = JSON.parse(planText);
                         if (!Array.isArray(sections)) throw new Error("Not an array");
                     } catch {
-                        // Try to extract JSON array from the response
                         const match = planText.match(/\[[\s\S]*\]/);
                         if (match) {
                             try {
                                 sections = JSON.parse(match[0]);
                             } catch {
-                                // Fallback: single query
-                                sections = [{
-                                    id: "section_1",
-                                    title: "Query Results",
-                                    description: question,
-                                    sql: planText
-                                }];
+                                sections = [{ id: "section_1", title: "Query Results", description: question, sql: planText }];
                             }
                         } else {
-                            sections = [{
-                                id: "section_1",
-                                title: "Query Results",
-                                description: question,
-                                sql: planText
-                            }];
+                            sections = [{ id: "section_1", title: "Query Results", description: question, sql: planText }];
                         }
                     }
 
                     send({
                         status: "plan_ready",
                         sections: sections.map(s => ({ id: s.id, title: s.title, description: s.description })),
-                        message: `Report plan: ${sections.length} sections`
+                        message: `Report plan ready: ${sections.length} sections`
                     });
 
-                    // Step 2: Execute each query
+                    // Step 2: Execute each section query — prefer body-level connectionString (live selection) over schema.connectionString (may be stale)
                     const connStr = connectionString || schema?.connectionString;
-
-                    if (!connStr) {
-                        throw new Error("No connection string available to execute queries.");
-                    }
+                    if (!connStr) throw new Error("No connection string available to execute queries.");
 
                     const reportSections: Array<{
                         id: string;
@@ -139,6 +183,7 @@ Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY
                         columns: string[];
                         rowCount: number;
                         error?: string;
+                        narrative?: string;
                     }> = [];
 
                     for (let i = 0; i < sections.length; i++) {
@@ -148,141 +193,155 @@ Include summary/aggregate AND detail queries. Limit each to 50 rows. Return ONLY
                             sectionId: section.id,
                             sectionIndex: i,
                             total: sections.length,
-                            message: `Executing: ${section.title}`
+                            message: `Running: ${section.title} (${i + 1}/${sections.length})`
                         });
 
                         try {
                             let sql = section.sql?.replace(/```sql\s*/gi, "").replace(/```\s*/g, "").trim();
                             if (!sql) {
-                                reportSections.push({
-                                    ...section,
-                                    data: [],
-                                    columns: [],
-                                    rowCount: 0,
-                                    error: "No SQL generated for this section"
-                                });
+                                reportSections.push({ ...section, data: [], columns: [], rowCount: 0, error: "No SQL generated" });
                                 continue;
                             }
 
                             const result = await executeQuery(sql, connStr) as any;
 
                             if (result.error) {
-                                // Try repair
+                                // Auto-repair
                                 const repairResponse = await model.invoke([
-                                    new SystemMessage(`Fix this ${dialect} SQL query. Return ONLY the corrected SQL.`),
-                                    new HumanMessage(`SQL: ${sql}\nError: ${result.error}\nSchema: ${schemaLines.slice(0, 15).join("\n")}`)
+                                    new SystemMessage(`Fix this ${dialect} SQL query. Preserve all hardcoded filter values (names, statuses, countries, IDs, etc.) — do not replace them with placeholders. Return ONLY the corrected SQL. No markdown.`),
+                                    new HumanMessage(`SQL: ${sql}\nError: ${result.error}\nSchema: ${schemaLines.slice(0, 15).join("\n")}\n${dateNote}\nOriginal question: ${question}`)
                                 ]);
                                 let repairedSql = typeof repairResponse.content === "string"
-                                    ? repairResponse.content
-                                    : String(repairResponse.content);
+                                    ? repairResponse.content : String(repairResponse.content);
                                 repairedSql = repairedSql.replace(/```sql\s*/gi, "").replace(/```\s*/g, "").trim();
 
                                 const retryResult = await executeQuery(repairedSql, connStr) as any;
                                 if (retryResult.error) {
-                                    reportSections.push({
-                                        ...section,
-                                        sql: repairedSql,
-                                        data: [],
-                                        columns: [],
-                                        rowCount: 0,
-                                        error: retryResult.error
-                                    });
+                                    reportSections.push({ ...section, sql: repairedSql, data: [], columns: [], rowCount: 0, error: retryResult.error });
                                 } else {
                                     const rows = retryResult.rows || retryResult.data || retryResult;
                                     const dataArr = Array.isArray(rows) ? rows : [];
-                                    reportSections.push({
-                                        ...section,
-                                        sql: repairedSql,
-                                        data: dataArr,
-                                        columns: retryResult.columns || (dataArr[0] ? Object.keys(dataArr[0]) : []),
-                                        rowCount: dataArr.length
-                                    });
+                                    const cols = (retryResult.columns || (dataArr[0] ? Object.keys(dataArr[0]) : []))
+                                        .filter((c: string) => c !== "__rowKey");
+                                    reportSections.push({ ...section, sql: repairedSql, data: dataArr, columns: cols, rowCount: dataArr.length });
                                 }
                             } else {
                                 const rows = result.rows || result.data || result;
                                 const dataArr = Array.isArray(rows) ? rows : [];
-                                reportSections.push({
-                                    ...section,
-                                    data: dataArr,
-                                    columns: result.columns || (dataArr[0] ? Object.keys(dataArr[0]) : []),
-                                    rowCount: dataArr.length
-                                });
+                                const cols = (result.columns || (dataArr[0] ? Object.keys(dataArr[0]) : []))
+                                    .filter((c: string) => c !== "__rowKey");
+                                reportSections.push({ ...section, data: dataArr, columns: cols, rowCount: dataArr.length });
                             }
 
+                            const last = reportSections[reportSections.length - 1];
                             send({
                                 status: "section_complete",
                                 sectionId: section.id,
                                 sectionIndex: i,
-                                rowCount: reportSections[reportSections.length - 1].rowCount,
-                                hasError: !!reportSections[reportSections.length - 1].error,
-                                message: `${section.title}: ${reportSections[reportSections.length - 1].rowCount} rows`
+                                rowCount: last.rowCount,
+                                hasError: !!last.error,
+                                message: last.error
+                                    ? `${section.title}: failed`
+                                    : `${section.title}: ${last.rowCount.toLocaleString()} rows`
                             });
                         } catch (err: any) {
-                            reportSections.push({
-                                ...section,
-                                data: [],
-                                columns: [],
-                                rowCount: 0,
-                                error: err.message || "Execution failed"
-                            });
+                            reportSections.push({ ...section, data: [], columns: [], rowCount: 0, error: err.message || "Execution failed" });
                         }
                     }
 
-                    // Step 3: Generate narrative/insights
-                    send({ status: "generating_narrative", message: "Generating report narrative..." });
+                    // Step 3: Generate smart narrative + per-section insights
+                    send({ status: "generating_narrative", message: "Analyzing data and writing report..." });
 
                     const dataContext = reportSections
                         .filter(s => s.data.length > 0)
                         .map(s => {
-                            const sampleJson = JSON.stringify(s.data.slice(0, 2));
-                            const truncated = sampleJson.length > 500 ? sampleJson.slice(0, 500) + "..." : sampleJson;
-                            return `${s.title} (${s.rowCount} rows): ${truncated}`;
+                            const preview = s.data.slice(0, 5).map(row =>
+                                s.columns.map(c => `${c}=${row[c] != null ? row[c] : "null"}`).join(", ")
+                            ).join(" | ");
+                            return `[${s.id}] ${s.title} (${s.rowCount} rows): ${preview}`;
                         }).join("\n");
 
-                    const narrativePrompt = `Analyze these query results and write a report for: "${question}"
+                    const narrativePrompt = `You are a senior business analyst. Analyze the following report data and write an intelligent, data-driven analysis for: "${question}"
 
-DATA:
+${dateNote}
+
+SECTION DATA:
 ${dataContext}
 
-Return JSON: {"title":"...","summary":"2-3 sentence executive summary","insights":["insight1","insight2",...],"recommendation":"next steps"}
-Return ONLY valid JSON.`;
+Write a sharp, insightful analysis. Reference specific numbers, percentages, names, and dates from the data.
 
-                    let narrative = { title: question, summary: "", insights: [] as string[], recommendation: "" };
+Return ONLY this JSON (no markdown):
+{
+  "title": "A specific, descriptive report title",
+  "summary": "2-3 sentence executive summary that mentions the most important findings with actual numbers",
+  "insights": [
+    "Specific insight with a number or percentage from the data",
+    "Trend or comparison insight",
+    "Anomaly, opportunity, or risk observation",
+    "Actionable finding"
+  ],
+  "recommendation": "1-2 concrete, specific next steps based on the data",
+  "sectionInsights": {
+    "section_id": "1-2 sentence interpretation of this section's data with specific numbers"
+  }
+}`;
+
+                    let narrative = {
+                        title: question,
+                        summary: "",
+                        insights: [] as string[],
+                        recommendation: "",
+                        sectionInsights: {} as Record<string, string>
+                    };
+
                     try {
                         const narrativeResponse = await model.invoke([
-                            new SystemMessage("You are a business analyst. Return ONLY valid JSON."),
+                            new SystemMessage("You are a senior business analyst. Return ONLY valid JSON. No markdown, no extra text."),
                             new HumanMessage(narrativePrompt)
                         ]);
                         let narrativeText = typeof narrativeResponse.content === "string"
-                            ? narrativeResponse.content
-                            : String(narrativeResponse.content);
+                            ? narrativeResponse.content : String(narrativeResponse.content);
                         narrativeText = narrativeText.replace(/```json\s*/gi, "").replace(/```\s*/g, "").trim();
-                        narrative = JSON.parse(narrativeText);
+                        const parsed = JSON.parse(narrativeText);
+                        narrative = {
+                            title: parsed.title || question,
+                            summary: parsed.summary || "",
+                            insights: Array.isArray(parsed.insights) ? parsed.insights : [],
+                            recommendation: parsed.recommendation || "",
+                            sectionInsights: parsed.sectionInsights || {}
+                        };
                     } catch {
                         narrative = {
                             title: question,
-                            summary: "Report generated from data analysis.",
-                            insights: reportSections.map(s => `${s.title}: ${s.rowCount} records found`),
-                            recommendation: "Review the detailed data sections below for more information."
+                            summary: `Report covers ${reportSections.filter(s => !s.error).length} data sections with ${reportSections.reduce((a, s) => a + s.rowCount, 0).toLocaleString()} total records.`,
+                            insights: reportSections.filter(s => !s.error).map(s => `${s.title}: ${s.rowCount.toLocaleString()} records`),
+                            recommendation: "Review each section below for detailed findings.",
+                            sectionInsights: {}
                         };
                     }
+
+                    // Attach per-section narratives
+                    const sectionsWithNarrative = reportSections.map(s => ({
+                        ...s,
+                        narrative: narrative.sectionInsights[s.id] || ""
+                    }));
 
                     send({
                         status: "completed",
                         report: {
-                            ...narrative,
-                            sections: reportSections,
+                            title: narrative.title,
+                            summary: narrative.summary,
+                            insights: narrative.insights,
+                            recommendation: narrative.recommendation,
+                            sections: sectionsWithNarrative,
                             generatedAt: new Date().toISOString(),
                             question
                         },
-                        message: "Report generated successfully"
+                        message: "Report ready"
                     });
                 } catch (err: any) {
                     console.error("[REPORT_API] Error:", err);
-                    send({
-                        status: "error",
-                        message: err.message || "Report generation failed"
-                    });
+                    send({ status: "error", message: err.message || "Report generation failed" });
                 } finally {
                     controller.close();
                 }

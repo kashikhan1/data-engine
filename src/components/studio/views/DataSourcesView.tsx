@@ -16,7 +16,17 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
     const [isMcpModalOpen, setIsMcpModalOpen] = useState(false);
     const [isPgModalOpen, setIsPgModalOpen] = useState(false);
     const [dbType, setDbType] = useState<'PostgreSQL' | 'MSSQL'>('PostgreSQL');
-    const { dataSources, connectionStatus, discoveredTables, postgresUrl, setDiscoveredTables, addDataSource } = useConfigStore();
+    const {
+        dataSources,
+        connectionStatus,
+        discoveredTables,
+        postgresUrl,
+        mssqlUrl,
+        setPostgresUrl,
+        setMssqlUrl,
+        setDiscoveredTables,
+        updateDataSource
+    } = useConfigStore();
     const [selectedTables, setSelectedTables] = useState<string[]>([]);
     const [activeTable, setActiveTable] = useState<string | null>(null);
     const [tableSchemas, setTableSchemas] = useState<Record<string, any>>({});
@@ -27,7 +37,7 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
     const [schemaSearch, setSchemaSearch] = useState('');
     const [showSchemaPanel, setShowSchemaPanel] = useState(true);
     const [connectorInstructions, setConnectorInstructions] = useState('');
-
+    const [tableLoading, setTableLoading] = useState<Record<string, { schema: boolean; preview: boolean }>>({});
     const COLUMN_TOGGLES_KEY = 'schema_column_toggles';
     const SELECTED_TABLES_KEY = 'schema_selected_tables';
     const SELECTED_SCHEMA_KEY = 'selected_schema';
@@ -49,19 +59,208 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
         } catch {
             setSelectedTables([]);
         }
-    }, [isPgModalOpen, isMcpModalOpen]);
+    }, []);
+
+    const resolveDisplayStatus = (ds: any) => {
+        if (!ds) return "Disconnected";
+        return ds.status || "Disconnected";
+    };
+
+    const isSqlSource = (ds: any) => Boolean(ds?.connectionString);
+    const isMcpSource = (ds: any) => String(ds?.type || '').toLowerCase().includes('mcp');
+    const hasHttpEndpoint = (value?: string) => /^https?:\/\//i.test(String(value || '').trim());
+    const isMssqlConnectionString = (value?: string) => {
+        const lower = String(value || '').toLowerCase();
+        return (
+            lower.startsWith('mssql://') ||
+            lower.startsWith('sqlserver://') ||
+            lower.includes('server=') ||
+            lower.includes('data source=')
+        );
+    };
+    const isPostgresConnectionString = (value?: string) => {
+        const lower = String(value || '').toLowerCase();
+        return lower.startsWith('postgres://') || lower.startsWith('postgresql://');
+    };
+
+    const checkDataSourceHealth = async (ds: any) => {
+        if (isSqlSource(ds)) {
+            const conn = String(ds.connectionString || '');
+            const type = String(ds?.type || '').toLowerCase();
+            const expectsMssql = type.includes('mssql') || type.includes('sql server');
+            const expectsPostgres = type.includes('postgres');
+
+            if (expectsMssql && !isMssqlConnectionString(conn)) {
+                return { status: 'Error' as const, lastSync: new Date().toLocaleTimeString() };
+            }
+            if (expectsPostgres && !isPostgresConnectionString(conn)) {
+                return { status: 'Error' as const, lastSync: new Date().toLocaleTimeString() };
+            }
+
+            try {
+                const ok = await dbGateway.connect(conn);
+                if (!ok) {
+                    return { status: 'Error' as const, lastSync: new Date().toLocaleTimeString() };
+                }
+
+                const tables = await dbGateway.listTables(conn);
+                const listHealthy = Array.isArray(tables);
+                return { 
+                    status: (listHealthy ? 'Connected' : 'Error') as "Connected" | "Error", 
+                    lastSync: new Date().toLocaleTimeString() 
+                };
+            } catch {
+                return { status: 'Error' as const, lastSync: new Date().toLocaleTimeString() };
+            }
+        }
+
+        if (isMcpSource(ds) && hasHttpEndpoint(ds.details)) {
+            try {
+                const result = await dbGateway.testMcpConnection(ds.details);
+                return { status: result.status, lastSync: new Date().toLocaleTimeString() };
+            } catch {
+                return { status: 'Error' as const, lastSync: new Date().toLocaleTimeString() };
+            }
+        }
+
+        return { status: 'Disconnected' as const, lastSync: ds?.lastSync || 'Not checked' };
+    };
+
+    const selectedDataSource = useMemo(() => {
+        return dataSources.find((ds) => ds.id === selectedId) || dataSources[0] || null;
+    }, [dataSources, selectedId]);
+
+    const selectedConnectionString = useMemo(() => {
+        const dsType = String(selectedDataSource?.type || '').toLowerCase();
+        if (selectedDataSource?.connectionString) return selectedDataSource.connectionString;
+        const details = String(selectedDataSource?.details || '');
+        const detailsLooksSql = /^((postgres|postgresql|mssql|sqlserver):\/\/|server=|data source=)/i.test(details);
+        if (detailsLooksSql) return details;
+        if (dsType.includes('mssql') || dsType.includes('sql server')) return mssqlUrl || '';
+        if (dsType.includes('postgres')) return postgresUrl || '';
+        return '';
+    }, [selectedDataSource, mssqlUrl, postgresUrl]);
+
+    const selectedStatus = useMemo(() => {
+        return selectedDataSource ? resolveDisplayStatus(selectedDataSource) : connectionStatus;
+    }, [selectedDataSource, connectionStatus]);
+
+    const normalizeTableName = (name: string) => {
+        return String(name || '')
+            .trim()
+            .replace(/^\[|\]$/g, '')
+            .replace(/^"|"$/g, '')
+            .toLowerCase();
+    };
+
+    const normalizeSchemaPayload = (payload: any) => {
+        if (!payload || typeof payload !== 'object') return { columns: [] };
+        if ((payload as any).error) return { columns: [] };
+        if (Array.isArray((payload as any).columns)) return payload;
+        if (Array.isArray((payload as any).data?.columns)) return (payload as any).data;
+        return { columns: [] };
+    };
+
+    const normalizePreviewPayload = (payload: any) => {
+        if (Array.isArray(payload)) return payload;
+        if (Array.isArray(payload?.rows)) return payload.rows;
+        if (Array.isArray(payload?.data)) return payload.data;
+        return [];
+    };
+
+    // If nothing selected (or selected source vanished), default to first connected SQL source.
+    useEffect(() => {
+        const selectedExists = selectedId && dataSources.some((ds) => ds.id === selectedId);
+        if (selectedExists) return;
+        const preferred = dataSources.find((ds) =>
+            resolveDisplayStatus(ds) === 'Connected' &&
+            /(postgres|mssql|sql server)/i.test(String(ds?.type || ''))
+        );
+        if (preferred?.id) onSelect(preferred.id);
+    }, [selectedId, dataSources, onSelect]);
+
+    const [isRefreshing, setIsRefreshing] = useState(false);
+    const handleRefresh = async () => {
+        setIsRefreshing(true);
+        await Promise.all(dataSources.map(async (ds) => {
+            const next = await checkDataSourceHealth(ds);
+            useConfigStore.getState().updateDataSource(ds.id, next);
+        }));
+        setIsRefreshing(false);
+    };
 
     useEffect(() => {
-        if (connectionStatus !== 'Connected' || !postgresUrl) return;
-        if ((discoveredTables || []).length > 0) return;
-        dbGateway.listTables(postgresUrl)
+        let cancelled = false;
+        const refresh = async () => {
+            const currentSources = useConfigStore.getState().dataSources;
+            for (const ds of currentSources) {
+                if (cancelled) return;
+                const next = await checkDataSourceHealth(ds);
+                useConfigStore.getState().updateDataSource(ds.id, next);
+            }
+        };
+        // Always refresh on mount to ping the database
+        setIsRefreshing(true);
+        refresh().finally(() => {
+            if (!cancelled) {
+                setIsRefreshing(false);
+            }
+        });
+
+        const interval = setInterval(refresh, 15000);
+        return () => {
+            cancelled = true;
+            clearInterval(interval);
+        };
+    }, []);
+
+    const healthyCount = dataSources.filter(ds => resolveDisplayStatus(ds) === 'Connected').length;
+    const errorCount = dataSources.filter(ds => {
+        const status = resolveDisplayStatus(ds);
+        return status === 'Error' || status === 'Auth Error';
+    }).length;
+
+    useEffect(() => {
+        // Clear tables when connection changes so they don't leak across DBs
+        setDiscoveredTables([]);
+        setTablePreviews({});
+        setTableSchemas({});
+
+        if (selectedStatus !== 'Connected' || !selectedConnectionString) return;
+
+        dbGateway.listTables(selectedConnectionString)
             .then((tables) => {
-                if (Array.isArray(tables)) setDiscoveredTables(tables);
+                if (Array.isArray(tables)) {
+                    setDiscoveredTables(tables);
+                    setSelectedTables((prev) => {
+                        // If React state is stale (e.g. modal just saved to localStorage),
+                        // fall back to localStorage so we don't overwrite a valid selection with [].
+                        let effective = prev;
+                        if (prev.length === 0) {
+                            try {
+                                const stored = localStorage.getItem(SELECTED_TABLES_KEY);
+                                if (stored) {
+                                    const parsed = JSON.parse(stored);
+                                    if (Array.isArray(parsed) && parsed.length > 0) effective = parsed;
+                                }
+                            } catch { /* use empty prev */ }
+                        }
+                        const available = new Set(tables.map((t) => normalizeTableName(t)));
+                        const next = effective.filter((t) => available.has(normalizeTableName(t)));
+                        localStorage.setItem(SELECTED_TABLES_KEY, JSON.stringify(next));
+                        return Array.from(new Set(next));
+                    });
+                    setActiveTable((prevActive) =>
+                        (prevActive && !new Set(tables.map((t) => normalizeTableName(t))).has(normalizeTableName(prevActive)))
+                            ? null
+                            : prevActive
+                    );
+                }
             })
             .catch(() => {
                 // ignore
             });
-    }, [connectionStatus, postgresUrl, discoveredTables, setDiscoveredTables]);
+    }, [selectedStatus, selectedConnectionString, setDiscoveredTables]);
 
     const otherTables = useMemo(() => {
         const selectedSet = new Set(selectedTables);
@@ -93,34 +292,75 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
     };
 
     const selectTable = (table: string) => {
+        if (!selectedConnectionString || selectedStatus !== 'Connected') {
+            setSchemaError('Connect a data source first, then select a table.');
+            return;
+        }
         if (!selectedTables.includes(table)) {
             persistSelection([...selectedTables, table]);
         }
+        setSchemaError(null);
         setActiveTable(table);
-        if (!tableSchemas[table]) {
-            dbGateway.getTableSchema(table, postgresUrl)
-                .then((schema) => {
-                    setTableSchemas((prev) => ({ ...prev, [table]: schema }));
-                    if (!columnToggles[table]) {
-                        const columns = Array.isArray(schema?.columns) ? schema.columns : [];
-                        const nextMap: Record<string, { show?: boolean }> = {};
-                        columns.forEach((col: any) => {
-                            const name = col?.column_name || col?.name;
-                            if (!name) return;
-                            nextMap[name] = { show: true };
-                        });
-                        setColumnToggles((prev) => ({ ...prev, [table]: nextMap }));
-                    }
-                })
-                .catch(() => setSchemaError(`Failed to load schema for ${table}`));
+        // Clear stale per-table cache before loading to avoid stuck empty states.
+        setTableSchemas((prev) => ({ ...prev, [table]: { columns: [] } }));
+        setTablePreviews((prev) => ({ ...prev, [table]: [] }));
+        setTableLoading((prev) => ({
+            ...prev,
+            [table]: { ...(prev[table] || { schema: false, preview: false }), schema: true, preview: true }
+        }));
+        Promise.all([
+            dbGateway.getTableSchema(table, selectedConnectionString),
+            dbGateway.getTablePreview(table, selectedConnectionString)
+        ])
+            .then(([schema, rows]) => {
+                const safeSchema = normalizeSchemaPayload(schema);
+                const safeRows = normalizePreviewPayload(rows);
+                setTableSchemas((prev) => ({ ...prev, [table]: safeSchema }));
+                setTablePreviews((prev) => ({ ...prev, [table]: safeRows }));
+
+                const existingToggles = columnToggles[table] || {};
+                const schemaColumns = Array.isArray((safeSchema as any)?.columns) ? (safeSchema as any).columns : [];
+                const inferredColumnNames = schemaColumns.length > 0
+                    ? schemaColumns.map((col: any) => col?.column_name || col?.name).filter(Boolean)
+                    : Object.keys(safeRows[0] || {}).filter((k) => k !== '__rowKey');
+                const nextMap: Record<string, { show?: boolean }> = { ...existingToggles };
+                inferredColumnNames.forEach((name: string) => {
+                    if (!nextMap[name]) nextMap[name] = { show: true };
+                });
+                setColumnToggles((prev) => ({ ...prev, [table]: nextMap }));
+
+                if (schemaColumns.length === 0 && safeRows.length === 0) {
+                    setSchemaError(`No schema/preview returned for ${table}. Check table permissions or schema name.`);
+                }
+            })
+            .catch((err: any) => setSchemaError(err?.message || `Failed to load table data for ${table}`))
+            .finally(() => {
+                setTableLoading((prev) => ({
+                    ...prev,
+                    [table]: { ...(prev[table] || { schema: false, preview: false }), schema: false, preview: false }
+                }));
+            });
+    };
+
+    const disconnectDataSource = (ds: any) => {
+        const type = String(ds?.type || '').toLowerCase();
+        if (type.includes('postgres')) {
+            setPostgresUrl('');
         }
-        if (!tablePreviews[table]) {
-            dbGateway.getTablePreview(table, postgresUrl)
-                .then((rows) => {
-                    setTablePreviews((prev) => ({ ...prev, [table]: Array.isArray(rows) ? rows : [] }));
-                })
-                .catch(() => setSchemaError(`Failed to load preview for ${table}`));
+        if (type.includes('mssql') || type.includes('sql server')) {
+            setMssqlUrl('');
         }
+        updateDataSource(ds.id, {
+            status: 'Disconnected',
+            lastSync: 'Disconnected',
+            connectionString: '',
+            details: String(ds?.details || '').startsWith('mcp') ? ds.details : 'Not connected'
+        });
+        setDiscoveredTables([]);
+        setActiveTable(null);
+        setTableSchemas({});
+        setTablePreviews({});
+        setSchemaError(null);
     };
 
     const updateColumnToggle = (table: string, column: string, value: boolean) => {
@@ -136,8 +376,27 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
         }));
     };
 
+    const renderableColumns = useMemo(() => {
+        if (!activeTable) return [];
+        const schemaCols = Array.isArray(tableSchemas[activeTable]?.columns) ? tableSchemas[activeTable].columns : [];
+        if (schemaCols.length > 0) return schemaCols;
+        const previewRows = Array.isArray(tablePreviews[activeTable]) ? tablePreviews[activeTable] : [];
+        const first = previewRows[0] || {};
+        return Object.keys(first)
+            .filter((k) => k !== '__rowKey')
+            .map((name) => ({ name, column_name: name, data_type: 'unknown' }));
+    }, [activeTable, tableSchemas, tablePreviews]);
+
+    const visibleRenderableColumns = useMemo(() => {
+        if (!activeTable) return [];
+        return renderableColumns.filter((c: any) => {
+            const name = c?.column_name || c?.name;
+            return name && columnToggles[activeTable]?.[name]?.show !== false;
+        });
+    }, [activeTable, renderableColumns, columnToggles]);
+
     const saveSelection = async () => {
-        if (!postgresUrl) return;
+        if (!selectedConnectionString) return;
         setIsSchemaSyncing(true);
         setSchemaError(null);
         try {
@@ -145,18 +404,20 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
             const tableCounts: Record<string, number> = {};
             for (const table of selectedTables) {
                 const [preview, tableSchema] = await Promise.all([
-                    tablePreviews[table] ? Promise.resolve(tablePreviews[table]) : dbGateway.getTablePreview(table, postgresUrl),
-                    tableSchemas[table] ? Promise.resolve(tableSchemas[table]) : dbGateway.getTableSchema(table, postgresUrl)
+                    tablePreviews[table] ? Promise.resolve(tablePreviews[table]) : dbGateway.getTablePreview(table, selectedConnectionString),
+                    tableSchemas[table] ? Promise.resolve(tableSchemas[table]) : dbGateway.getTableSchema(table, selectedConnectionString)
                 ]);
 
                 const toggles = columnToggles[table] || {};
-                const columns = Array.isArray(tableSchema?.columns) ? tableSchema.columns : [];
+                const normalizedSchema = normalizeSchemaPayload(tableSchema);
+                const normalizedPreview = normalizePreviewPayload(preview);
+                const columns = Array.isArray(normalizedSchema?.columns) ? normalizedSchema.columns : [];
                 const allowedColumns = columns.filter((col: any) => {
                     const name = col?.column_name || col?.name;
                     if (!name) return false;
                     return toggles[name]?.show !== false;
                 });
-                const sampleRows = Array.isArray(preview) ? preview : [];
+                const sampleRows = Array.isArray(normalizedPreview) ? normalizedPreview : [];
                 tableCounts[table] = sampleRows.length;
                 const filteredRows = sampleRows.map((row: any) => {
                     const next: Record<string, any> = {};
@@ -169,7 +430,7 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                 });
 
                 schemaData[table] = {
-                    columns: { ...tableSchema, columns: allowedColumns },
+                    columns: { ...normalizedSchema, columns: allowedColumns },
                     sampleRows: filteredRows
                 };
             }
@@ -182,10 +443,6 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
             setIsSchemaSyncing(false);
         }
     };
-
-    const healthyCount = dataSources.filter(ds => ds.status === 'Connected').length;
-    const errorCount = dataSources.filter(ds => ds.status === 'Error' || ds.status === 'Auth Error').length;
-    const selectedDataSource = dataSources.find((ds) => ds.id === selectedId) || dataSources[0] || null;
 
     useEffect(() => {
         setConnectorInstructions(selectedDataSource?.instructions || '');
@@ -210,12 +467,16 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                 </div>
                                 <div className="flex items-center gap-6">
                                     <div className="flex flex-col items-end">
-                                        <div className="text-3xl font-black text-white leading-none">{dataSources.length}</div>
-                                        <div className="text-[9px] text-slate-500 font-bold uppercase tracking-widest mt-1">Systems</div>
+                                        <div className="text-3xl font-black text-white leading-none">{healthyCount}/{dataSources.length}</div>
+                                        <div className="text-[10px] font-bold text-[#22c55e] uppercase tracking-wider mt-1">Healthy Nodes</div>
                                     </div>
                                     <div className="w-px h-8 bg-white/10"></div>
-                                    <button className="p-3 bg-white/5 border border-white/10 rounded-2xl text-slate-400 hover:text-white hover:bg-white/10 hover:border-white/20 transition-all group">
-                                        <span className="material-symbols-outlined text-[20px] group-hover:rotate-180 transition-transform duration-500">sync</span>
+                                    <button
+                                        onClick={handleRefresh}
+                                        disabled={isRefreshing}
+                                        className="p-3 bg-white/5 border border-white/10 rounded-2xl text-slate-400 hover:text-white hover:bg-white/10 hover:border-white/20 transition-all group disabled:opacity-50"
+                                    >
+                                        <span className={`material-symbols-outlined text-[20px] ${isRefreshing ? 'animate-spin' : 'group-hover:rotate-180 transition-transform duration-500'}`}>sync</span>
                                     </button>
                                 </div>
                             </div>
@@ -283,56 +544,73 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                     </div>
 
                     <div className="grid grid-cols-2 gap-8">
-                        {dataSources.map((ds) => (
-                            <div
-                                key={ds.id}
-                                onClick={() => onSelect(ds.id)}
-                                className={`relative group cursor-pointer transition-all duration-500 ${selectedId === ds.id ? 'scale-[1.02]' : 'hover:scale-[1.01]'}`}
-                            >
-                                <div className={`absolute -inset-0.5 rounded-[2.5rem] blur opacity-20 group-hover:opacity-40 transition duration-500 ${ds.status === 'Connected' ? 'bg-green-500' : 'bg-red-500'}`}></div>
-                                <div className={`relative bg-[#0f1218]/90 backdrop-blur-2xl border border-white/5 rounded-[2.5rem] p-8 flex flex-col gap-6 overflow-hidden ${selectedId === ds.id ? 'border-blue-500/30' : ''}`}>
-                                    <div className="flex items-start justify-between relative z-10">
-                                        <div className="flex items-center gap-5">
-                                            <div className={`w-16 h-16 rounded-[1.5rem] flex items-center justify-center shadow-2xl transition-all duration-500 ${selectedId === ds.id ? 'bg-blue-500 text-white scale-110 rotate-3' : 'bg-[#1a202c] text-slate-500'}`}>
-                                                <span className="material-symbols-outlined text-[32px]">{ds.icon}</span>
+                        {dataSources.map((ds) => {
+                            const displayStatus = resolveDisplayStatus(ds);
+                            return (
+                                <div
+                                    key={ds.id}
+                                    onClick={() => onSelect(ds.id)}
+                                    className={`relative group cursor-pointer transition-all duration-500 ${selectedId === ds.id ? 'scale-[1.02]' : 'hover:scale-[1.01]'}`}
+                                >
+                                    <div className={`absolute -inset-0.5 rounded-[2.5rem] blur opacity-20 group-hover:opacity-40 transition duration-500 ${displayStatus === 'Connected' ? 'bg-green-500' : 'bg-red-500'}`}></div>
+                                    <div className={`relative bg-[#0f1218]/90 backdrop-blur-2xl border border-white/5 rounded-[2.5rem] p-8 flex flex-col gap-6 overflow-hidden ${selectedId === ds.id ? 'border-blue-500/30' : ''}`}>
+                                        <div className="flex items-start justify-between relative z-10">
+                                            <div className="flex items-center gap-5">
+                                                <div className={`w-16 h-16 rounded-[1.5rem] flex items-center justify-center shadow-2xl transition-all duration-500 ${selectedId === ds.id ? 'bg-blue-500 text-white scale-110 rotate-3' : 'bg-[#1a202c] text-slate-500'}`}>
+                                                    <span className="material-symbols-outlined text-[32px]">{ds.icon}</span>
+                                                </div>
+                                                <div>
+                                                    <div className="text-xl font-black text-white tracking-tight">{ds.name}</div>
+                                                    <div className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1 opacity-60">{ds.type}</div>
+                                                </div>
                                             </div>
-                                            <div>
-                                                <div className="text-xl font-black text-white tracking-tight">{ds.name}</div>
-                                                <div className="text-[10px] text-slate-500 font-bold uppercase tracking-widest mt-1 opacity-60">{ds.type}</div>
+                                            <div className={`px-4 py-1.5 rounded-full border text-[9px] font-black uppercase tracking-[2px] backdrop-blur-md ${displayStatus === 'Connected' ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
+                                                {displayStatus}
                                             </div>
                                         </div>
-                                        <div className={`px-4 py-1.5 rounded-full border text-[9px] font-black uppercase tracking-[2px] backdrop-blur-md ${ds.status === 'Connected' ? 'bg-green-500/10 text-green-400 border-green-500/20' : 'bg-red-500/10 text-red-400 border-red-500/20'}`}>
-                                            {ds.status}
-                                        </div>
-                                    </div>
 
-                                    <div className="grid grid-cols-3 gap-4 border-t border-white/5 pt-6 relative z-10">
-                                        <div className="space-y-1">
-                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Latency</div>
-                                            <div className="text-xs font-bold text-slate-200">24ms</div>
+                                        <div className="grid grid-cols-3 gap-4 border-t border-white/5 pt-6 relative z-10">
+                                            <div className="space-y-1">
+                                                <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Latency</div>
+                                                <div className="text-xs font-bold text-slate-200">24ms</div>
+                                            </div>
+                                            <div className="space-y-1">
+                                                <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Uptime</div>
+                                                <div className="text-xs font-bold text-slate-200">99.9%</div>
+                                            </div>
+                                            <div className="space-y-1 text-right">
+                                                <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Last Pulse</div>
+                                                <div className="text-xs font-bold text-slate-200">{ds.lastSync}</div>
+                                            </div>
                                         </div>
-                                        <div className="space-y-1">
-                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Uptime</div>
-                                            <div className="text-xs font-bold text-slate-200">99.9%</div>
-                                        </div>
-                                        <div className="space-y-1 text-right">
-                                            <div className="text-[8px] text-slate-500 font-black uppercase tracking-widest">Last Pulse</div>
-                                            <div className="text-xs font-bold text-slate-200">{ds.lastSync}</div>
-                                        </div>
-                                    </div>
+                                        {displayStatus === 'Connected' && (
+                                            <div className="relative z-10 pt-2 border-t border-white/5 flex justify-end">
+                                                <button
+                                                    onClick={(e) => {
+                                                        e.stopPropagation();
+                                                        disconnectDataSource(ds);
+                                                    }}
+                                                    className="px-3 py-1.5 rounded-xl bg-black/40 border border-white/10 text-[9px] font-black uppercase tracking-[2px] text-slate-300 hover:text-white hover:border-red-500/40 hover:bg-red-500/10 transition-all"
+                                                    title="Disconnect"
+                                                >
+                                                    Disconnect
+                                                </button>
+                                            </div>
+                                        )}
 
-                                    {/* Abstract Data Visualizer (Mock) */}
-                                    <div className="h-1 lg:h-2 w-full bg-white/5 rounded-full overflow-hidden mt-2 relative">
-                                        <div className={`absolute top-0 left-0 h-full w-2/3 transition-all duration-1000 ${ds.status === 'Connected' ? 'bg-gradient-to-r from-green-500 to-emerald-400' : 'bg-red-500'}`}></div>
-                                        <div className="absolute top-0 left-0 h-full w-full opacity-10 blur-sm bg-blue-500"></div>
-                                    </div>
+                                        {/* Abstract Data Visualizer (Mock) */}
+                                        <div className="h-1 lg:h-2 w-full bg-white/5 rounded-full overflow-hidden mt-2 relative">
+                                            <div className={`absolute top-0 left-0 h-full w-2/3 transition-all duration-1000 ${displayStatus === 'Connected' ? 'bg-gradient-to-r from-green-500 to-emerald-400' : 'bg-red-500'}`}></div>
+                                            <div className="absolute top-0 left-0 h-full w-full opacity-10 blur-sm bg-blue-500"></div>
+                                        </div>
 
-                                    {selectedId === ds.id && (
-                                        <div className="absolute -right-8 -bottom-8 w-32 h-32 bg-blue-500/10 rounded-full blur-[40px] animate-pulse"></div>
-                                    )}
+                                        {selectedId === ds.id && (
+                                            <div className="absolute -right-8 -bottom-8 w-32 h-32 bg-blue-500/10 rounded-full blur-[40px] animate-pulse"></div>
+                                        )}
+                                    </div>
                                 </div>
-                            </div>
-                        ))}
+                            )
+                        })}
                         {dataSources.length === 0 && (
                             <div className="col-span-2 px-10 py-24 text-center space-y-4 bg-white/[0.01] border border-dashed border-white/10 rounded-[3rem]">
                                 <span className="material-symbols-outlined text-6xl text-slate-800 font-light">terminal</span>
@@ -371,10 +649,10 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                         <div className="relative group/panel">
                             <div className="absolute -inset-0.5 bg-gradient-to-b from-blue-500/10 to-transparent rounded-[3rem] blur opacity-40"></div>
                             <div className="relative bg-[#0b0d11]/80 backdrop-blur-3xl border border-white/[0.05] rounded-[3rem] overflow-hidden shadow-2xl">
-                                <div className="flex bg-white/[0.02] border-b border-white/[0.05] px-10 py-6 items-center justify-between">
+                                    <div className="flex bg-white/[0.02] border-b border-white/[0.05] px-10 py-6 items-center justify-between">
                                     <div className="flex items-center gap-3">
                                         <div className="flex items-center gap-2 px-3 py-1.5 rounded-xl bg-green-500/10 border border-green-500/20 text-[9px] font-black text-green-400 uppercase tracking-widest">
-                                            {connectionStatus}
+                                            {selectedStatus}
                                         </div>
                                         <div className="text-[10px] text-slate-500 font-bold uppercase tracking-[2px] opacity-60">
                                             Manifest Explorer
@@ -389,17 +667,22 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                             className="w-full pl-11 pr-4 py-2.5 text-[10px] font-black tracking-widest bg-black/40 border border-white/5 rounded-2xl text-slate-300 placeholder-slate-700 focus:outline-none focus:border-blue-500/50 transition-all"
                                         />
                                     </div>
-                                </div>
-                                <div className="grid grid-cols-12 h-[600px]">
+                                    </div>
+                                    {schemaError && (
+                                        <div className="px-10 py-3 text-[11px] text-red-300 bg-red-500/10 border-b border-red-500/20">
+                                            {schemaError}
+                                        </div>
+                                    )}
+                                    <div className="grid grid-cols-12 h-[min(78vh,860px)]">
                                     {/* Sidebar: Table List */}
                                     <div className="col-span-4 border-r border-white/5 flex flex-col">
                                         <div className="flex-1 overflow-y-auto custom-scrollbar p-6 space-y-8">
-                                            <div className="space-y-4">
+                                            <div className="space-y-4 min-h-0">
                                                 <div className="text-[9px] text-slate-500 font-black uppercase tracking-[3px] px-2 flex justify-between items-center">
                                                     <span>Mounted ({selectedTables.length})</span>
                                                     <div className="w-12 h-px bg-white/5"></div>
                                                 </div>
-                                                <div className="space-y-2">
+                                                <div className="space-y-2 max-h-[30vh] overflow-y-auto pr-1 custom-scrollbar">
                                                     {filteredSelected.map(table => (
                                                         <div
                                                             key={table}
@@ -424,16 +707,16 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                 </div>
                                             </div>
 
-                                            <div className="space-y-4">
+                                            <div className="space-y-4 min-h-0">
                                                 <div className="text-[9px] text-slate-500 font-black uppercase tracking-[3px] px-2 flex justify-between items-center">
                                                     <span>Available ({otherTables.length})</span>
                                                     <div className="w-12 h-px bg-white/5"></div>
                                                 </div>
-                                                <div className="grid grid-cols-1 gap-2">
+                                                <div className="grid grid-cols-1 gap-2 max-h-[30vh] overflow-y-auto pr-1 custom-scrollbar">
                                                     {filteredOther.map(table => (
                                                         <button
                                                             key={table}
-                                                            onClick={() => toggleTable(table)}
+                                                            onClick={() => selectTable(table)}
                                                             className="px-5 py-3 rounded-2xl bg-black/20 border border-white/[0.03] text-[11px] text-slate-500 font-bold text-left hover:border-white/10 hover:text-slate-300 transition-all flex items-center gap-3"
                                                         >
                                                             <span className="material-symbols-outlined text-[16px] opacity-40">add_box</span>
@@ -467,9 +750,15 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                             <div className="text-[9px] text-blue-400 font-black uppercase tracking-[3px]">Schema Signature</div>
                                                             <h3 className="text-3xl font-black text-white tracking-tighter">{activeTable}</h3>
                                                         </div>
-                                                        <div className="text-right space-y-1">
-                                                            <div className="text-[9px] text-slate-500 font-black uppercase tracking-widest">Cardinality</div>
-                                                            <div className="text-xs font-bold text-slate-300">~1.2k Records Evaluated</div>
+                                                            <div className="text-right space-y-1">
+                                                                <div className="text-[9px] text-slate-500 font-black uppercase tracking-widest">Cardinality</div>
+                                                            <div className="text-xs font-bold text-slate-300">
+                                                                {tableLoading[activeTable]?.preview
+                                                                    ? 'Loading...'
+                                                                    : Array.isArray(tablePreviews[activeTable])
+                                                                        ? `${tablePreviews[activeTable].length} Records Loaded`
+                                                                        : 'Preview unavailable'}
+                                                            </div>
                                                         </div>
                                                     </div>
 
@@ -478,12 +767,18 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                         <div className="space-y-5">
                                                             <div className="flex items-center justify-between">
                                                                 <h4 className="text-[10px] font-black text-slate-400 uppercase tracking-[2px]">Field Mapping</h4>
-                                                                <span className="text-[9px] text-slate-600 font-bold">{tableSchemas[activeTable]?.columns?.length || 0} Total</span>
+                                                                <span className="text-[9px] text-slate-600 font-bold">{renderableColumns.length} Total</span>
                                                             </div>
-                                                            <div className="space-y-2 max-h-[300px] overflow-y-auto pr-2 custom-scrollbar">
-                                                                {(tableSchemas[activeTable]?.columns || []).map((col: any, idx: number) => {
+                                                            <div className="space-y-2 h-[min(56vh,620px)] overflow-y-auto pr-2 custom-scrollbar">
+                                                                {tableLoading[activeTable]?.schema && (
+                                                                    <div className="text-[11px] text-slate-400 py-2">Loading columns...</div>
+                                                                )}
+                                                                {renderableColumns.map((col: any) => {
                                                                     const name = col?.column_name || col?.name;
                                                                     const toggles = columnToggles[activeTable]?.[name] || { show: true };
+                                                                    const nullable = String(col?.is_nullable || '').toUpperCase() !== 'NO';
+                                                                    const hasDefault = col?.column_default !== undefined && col?.column_default !== null && String(col?.column_default).length > 0;
+                                                                    const isPrimary = Boolean(col?.isPrimary || col?.is_primary || col?.primaryKey);
                                                                     return (
                                                                         <div
                                                                             key={name}
@@ -494,6 +789,21 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                                                 <div className="flex flex-col">
                                                                                     <span className="text-xs font-bold text-slate-300">{name}</span>
                                                                                     <span className="text-[8px] text-slate-600 font-black uppercase tracking-widest mt-0.5">{col?.data_type || 'VARCHAR'}</span>
+                                                                                    <div className="mt-1 flex items-center gap-1.5 flex-wrap">
+                                                                                        <span className={`text-[8px] px-1.5 py-0.5 rounded border ${nullable ? 'text-slate-500 border-white/10' : 'text-amber-300 border-amber-500/30 bg-amber-500/10'}`}>
+                                                                                            {nullable ? 'NULL' : 'NOT NULL'}
+                                                                                        </span>
+                                                                                        {isPrimary && (
+                                                                                            <span className="text-[8px] px-1.5 py-0.5 rounded border text-purple-300 border-purple-500/30 bg-purple-500/10">
+                                                                                                PK
+                                                                                            </span>
+                                                                                        )}
+                                                                                        {hasDefault && (
+                                                                                            <span className="text-[8px] px-1.5 py-0.5 rounded border text-blue-300 border-blue-500/30 bg-blue-500/10">
+                                                                                                DEFAULT
+                                                                                            </span>
+                                                                                        )}
+                                                                                    </div>
                                                                                 </div>
                                                                             </div>
                                                                             <label className="relative inline-flex items-center cursor-pointer">
@@ -519,11 +829,14 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                             </div>
                                                             <div className="bg-black/40 border border-white/5 rounded-[2rem] overflow-hidden">
                                                                 <div className="p-4 overflow-x-auto custom-scrollbar-h">
+                                                                    {tableLoading[activeTable]?.preview && (
+                                                                        <div className="text-[11px] text-slate-400 pb-3">Loading preview rows...</div>
+                                                                    )}
                                                                     <table className="w-full text-left border-collapse">
                                                                         <thead>
                                                                             <tr className="border-b border-white/5">
                                                                                 <th className="px-3 py-2 text-[8px] font-black text-slate-600 uppercase tracking-widest">Index</th>
-                                                                                {(tableSchemas[activeTable]?.columns || []).filter((c: any) => columnToggles[activeTable]?.[c.column_name || c.name]?.show !== false).slice(0, 2).map((col: any) => (
+                                                                                {visibleRenderableColumns.map((col: any) => (
                                                                                     <th key={col.column_name || col.name} className="px-3 py-2 text-[8px] font-black text-slate-600 uppercase tracking-widest truncate max-w-[80px]">
                                                                                         {col.column_name || col.name}
                                                                                     </th>
@@ -531,16 +844,26 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
                                                                             </tr>
                                                                         </thead>
                                                                         <tbody className="divide-y divide-white/[0.02]">
-                                                                            {(tablePreviews[activeTable] || []).slice(0, 4).map((row: any, i: number) => (
+                                                                            {(tablePreviews[activeTable] || []).slice(0, 10).map((row: any, i: number) => (
                                                                                 <tr key={i} className="hover:bg-white/[0.01] transition-colors">
                                                                                     <td className="px-3 py-2 text-[9px] font-mono text-slate-700">{i + 1}</td>
-                                                                                    {(tableSchemas[activeTable]?.columns || []).filter((c: any) => columnToggles[activeTable]?.[c.column_name || c.name]?.show !== false).slice(0, 2).map((col: any) => (
+                                                                                    {visibleRenderableColumns.map((col: any) => (
                                                                                         <td key={col.column_name || col.name} className="px-3 py-2 text-[10px] text-slate-400 font-medium truncate max-w-[80px]">
                                                                                             {String(row[col.column_name || col.name] || '—')}
                                                                                         </td>
                                                                                     ))}
                                                                                 </tr>
                                                                             ))}
+                                                                            {(!tableLoading[activeTable]?.preview && (tablePreviews[activeTable] || []).length === 0) && (
+                                                                                <tr>
+                                                                                    <td
+                                                                                        colSpan={Math.max(2, visibleRenderableColumns.length + 1)}
+                                                                                        className="px-3 py-4 text-[11px] text-slate-500 text-center"
+                                                                                    >
+                                                                                        No records returned for this table.
+                                                                                    </td>
+                                                                                </tr>
+                                                                            )}
                                                                         </tbody>
                                                                     </table>
                                                                 </div>
@@ -563,7 +886,17 @@ const DataSourcesView: React.FC<DataSourcesViewProps> = ({ selectedId, onSelect 
             </div>
 
             <NewMcpAgentModal isOpen={isMcpModalOpen} onClose={() => setIsMcpModalOpen(false)} />
-            <PostgresConnectionModal isOpen={isPgModalOpen} onClose={() => setIsPgModalOpen(false)} dbType={dbType} />
+            <PostgresConnectionModal isOpen={isPgModalOpen} onClose={() => {
+                setIsPgModalOpen(false);
+                // Modal may have saved tables to localStorage — sync our state with it
+                try {
+                    const stored = localStorage.getItem(SELECTED_TABLES_KEY);
+                    if (stored) {
+                        const parsed = JSON.parse(stored);
+                        if (Array.isArray(parsed)) setSelectedTables(parsed);
+                    }
+                } catch { /* ignore */ }
+            }} dbType={dbType} />
         </main>
     );
 };

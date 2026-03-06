@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { graph } from "@/lib/agents/graph";
+import { graph } from "@/modules/runtime/agent";
 import { HumanMessage } from "@langchain/core/messages";
 
 export async function POST(req: NextRequest) {

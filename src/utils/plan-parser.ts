@@ -24,6 +24,49 @@ export function extractDashboardTitle(planText: string): string | null {
     return null;
 }
 
+export function parsePlanFilters(planText: string): any[] {
+    const cleaned = String(planText || "").replace(/\*\*|\*|__|#/g, '');
+    const sectionMatch = cleaned.match(/FILTERS TO INCLUDE\s*:\s*([\s\S]*?)(?:\nSCENARIO COVERAGE:|\nWIDGET\s+\d+:|$)/i);
+    const section = String(sectionMatch?.[1] || "").trim();
+    if (!section) return [];
+
+    const lines = section
+        .split('\n')
+        .map((line) => line.trim())
+        .filter((line) => /^\d+\)/.test(line));
+    if (lines.length === 0) return [];
+
+    return lines
+        .map((line, index) => {
+            const content = line.replace(/^\d+\)\s*/, '').trim();
+            if (!content || /^none\.?$/i.test(content)) return null;
+            const parts = content.split(',').map((p) => p.trim()).filter(Boolean);
+            const label = parts[0] || `Filter ${index + 1}`;
+            const rawType = String(parts[1] || "select").toLowerCase();
+            const type = rawType === "date range" ? "date-range" : rawType;
+            const defaultPart = parts.find((part) => /^default\s*=/i.test(part));
+            const defaultValue = defaultPart ? defaultPart.split("=")[1]?.trim() : undefined;
+            const dimensionPart = parts.find((part) => /[a-zA-Z_][\w$]*\.[a-zA-Z_][\w$]*/.test(part)) || "";
+            const dimensionMatch = dimensionPart.match(/([a-zA-Z_][\w$]*\.[a-zA-Z_][\w$]*)/);
+            const dimension = dimensionMatch?.[1] || label.toLowerCase().replace(/\s+/g, "_");
+
+            let value: any = null;
+            if (type.includes("multi")) value = [];
+            if (type === "date-range") value = defaultValue || "this_month";
+            if (type === "search") value = "";
+            if (value === null && defaultValue !== undefined) value = defaultValue;
+
+            return {
+                id: String(dimension).replace(/[^a-zA-Z0-9_.-]/g, "_"),
+                dimension,
+                label,
+                type,
+                value
+            };
+        })
+        .filter(Boolean) as any[];
+}
+
 export function parseNaturalLanguagePlan(planText: string): any[] {
     const widgets: any[] = [];
     let widgetId = 1;
@@ -36,6 +79,14 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
 
     // Clean markdown formatting that might confuse parsing
     const cleaned = planText.replace(/\*\*|\*|__|#/g, '');
+    const extractWidgetField = (block: string, label: string, nextLabels: string[]) => {
+        const boundary = nextLabels.length > 0
+            ? `(?:\\n\\s*(?:${nextLabels.join("|")})\\s*:)`
+            : "(?:$)";
+        const pattern = new RegExp(`${label}\\s*:\\s*([\\s\\S]*?)(?=${boundary}|$)`, "i");
+        const value = block.match(pattern)?.[1] || "";
+        return value.split('\n').map((line) => line.trim()).filter(Boolean).join(' ').trim();
+    };
 
     // ========== 0. Parse "Widget List" format ==========
     const widgetMatches = Array.from(cleaned.matchAll(/(?:^|\n)\s*WIDGET\s*\d+\s*(?:[:\-\.]|\))?/gi));
@@ -70,7 +121,9 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             const valueMatch = block.match(/Value[:\s]*([^\n]+)/i)
                 || block.match(/Why[:\s]*([^\n]+)/i)
                 || block.match(/Why it is valuable[:\s]*([^\n]+)/i);
-            const usesMatch = block.match(/Uses[:\s]*([^\n]+)/i) || block.match(/Which tables\/columns it uses[:\s]*([^\n]+)/i);
+            const usesText = extractWidgetField(block, "Uses", ["Filters applied", "Notes", "Rationale", "Why", "Shows", "Tables required"])
+                || extractWidgetField(block, "Which tables\\/columns it uses", ["Filters applied", "Notes", "Rationale", "Why", "Shows", "Tables required"]);
+            const tablesRequiredText = extractWidgetField(block, "Tables required", ["Uses", "Filters applied", "Notes", "Rationale", "Why", "Shows"]);
             const notesMatch = block.match(/Notes[:\s]*([^\n]+)/i);
 
             const goal = (showsMatch?.[1] || valueMatch?.[1] || '').trim() || "Visualization";
@@ -91,9 +144,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             else if (/table/.test(typeText)) type = 'table';
 
             let primaryTable: string | undefined;
-            if (usesMatch?.[1]) {
-                const tableColMatch = usesMatch[1].match(/([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+/);
+            const requiredTables = tablesRequiredText
+                ? tablesRequiredText.split(',').map((table) => table.trim()).filter(Boolean)
+                : [];
+            if (usesText) {
+                const tableColMatch = usesText.match(/([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+/);
                 if (tableColMatch) primaryTable = tableColMatch[1];
+            }
+            if (!primaryTable && requiredTables.length > 0) {
+                primaryTable = requiredTables[0];
             }
 
             const finalType = coerceTypeByText(type, title, goal);
@@ -103,6 +162,7 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
                 title,
                 goal,
                 primaryTable,
+                requiredTables,
                 notes: notesMatch?.[1]?.trim(),
                 layoutHint: finalType === 'kpi' ? 'row1' : (finalType === 'table' ? 'row4' : 'row2')
             });
@@ -148,7 +208,8 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
 
             const showsMatch = block.match(/Shows[:\s]*([^\n]+)/i);
             const valueMatch = block.match(/Value[:\s]*([^\n]+)/i) || block.match(/Why[:\s]*([^\n]+)/i);
-            const usesMatch = block.match(/Uses[:\s]*([^\n]+)/i);
+            const usesText = extractWidgetField(block, "Uses", ["Filters applied", "Notes", "Rationale", "Why", "Shows", "Tables required"]);
+            const tablesRequiredText = extractWidgetField(block, "Tables required", ["Uses", "Filters applied", "Notes", "Rationale", "Why", "Shows"]);
             const notesMatch = block.match(/Notes[:\s]*([^\n]+)/i);
 
             const goal = (showsMatch?.[1] || valueMatch?.[1] || '').trim() || "Visualization";
@@ -168,9 +229,15 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
             else if (/table/.test(rawType)) type = 'table';
 
             let primaryTable: string | undefined;
-            if (usesMatch?.[1]) {
-                const tableColMatch = usesMatch[1].match(/([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+/);
+            const requiredTables = tablesRequiredText
+                ? tablesRequiredText.split(',').map((table) => table.trim()).filter(Boolean)
+                : [];
+            if (usesText) {
+                const tableColMatch = usesText.match(/([a-zA-Z0-9_]+)\.[a-zA-Z0-9_]+/);
                 if (tableColMatch) primaryTable = tableColMatch[1];
+            }
+            if (!primaryTable && requiredTables.length > 0) {
+                primaryTable = requiredTables[0];
             }
 
             const finalType = coerceTypeByText(type, title, goal);
@@ -180,6 +247,7 @@ export function parseNaturalLanguagePlan(planText: string): any[] {
                 title,
                 goal,
                 primaryTable,
+                requiredTables,
                 notes: notesMatch?.[1]?.trim(),
                 layoutHint: finalType === 'kpi' ? 'row1' : (finalType === 'table' ? 'row4' : 'row2')
             });

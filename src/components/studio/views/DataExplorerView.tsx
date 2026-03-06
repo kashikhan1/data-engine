@@ -5,7 +5,7 @@ import { dbGateway } from '@/lib/mcp/client';
 import { useConfigStore, useRunStore, useUIStore } from '@/state/stores';
 import { useCreateRun } from '@/hooks/useRunStream';
 import { AgentTimeline } from '@/components/chat/AgentTimeline';
-import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
+import { runSchemaDiscovery } from '@/modules/schema/agent';
 
 const DataExplorerView: React.FC = () => {
     const { setDiscoveredTables, connectionStatus, discoveredTables, postgresUrl, canonicalPlan, setCanonicalPlan, projectContext, disabledWidgetTypes } = useConfigStore();

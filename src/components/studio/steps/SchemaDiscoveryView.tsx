@@ -1,8 +1,9 @@
 'use client';
 
-import React, { useCallback, useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { useWorkflowStore, useConfigStore } from '@/state/stores';
-import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
+import { runSchemaDiscovery } from '@/modules/schema/agent';
+import type { ColumnProfile, TableClassification, DataQualityReport } from '@/modules/schema/agent';
 import {
     Button,
     Card,
@@ -17,32 +18,39 @@ import {
     Alert,
     Tooltip,
     Badge,
-    Switch
+    Switch,
+    Progress,
+    Statistic
 } from 'antd';
 import {
     ReloadOutlined,
     CheckCircleOutlined,
+    CloseCircleOutlined,
+    LoadingOutlined,
     ArrowRightOutlined,
     DatabaseOutlined,
-    EditOutlined,
-    SaveOutlined,
-    InfoCircleOutlined
+    InfoCircleOutlined,
+    SearchOutlined,
+    WarningOutlined,
+    SafetyOutlined,
+    ThunderboltOutlined,
+    LineChartOutlined,
+    TableOutlined
 } from '@ant-design/icons';
 import styles from './StepView.module.css';
 
-const { Title, Text, Paragraph } = Typography;
-const { TextArea } = Input;
+const { Title, Text } = Typography;
 
 const TABLE_INSIGHTS_OVERRIDES_KEY = 'schema_table_insights_overrides';
 const COLUMN_TOGGLES_KEY = 'schema_column_toggles';
+const COLUMN_TOGGLES_MIGRATION_KEY = 'schema_column_toggles_migrated_v2';
 const SELECTED_TABLES_KEY = 'schema_selected_tables';
+const SELECTED_SCHEMA_KEY = 'selected_schema';
 
 export const SchemaDiscoveryView: React.FC = () => {
     const {
         schemaData,
         setSchemaData,
-        userSchemaNotes,
-        setUserSchemaNotes,
         schemaTimestamp,
         isProcessing,
         setProcessing,
@@ -51,13 +59,14 @@ export const SchemaDiscoveryView: React.FC = () => {
         setStep,
         staleStep,
         setStaleStep,
-        query
+        query,
+        setProgressStages,
+        updateProgressStage,
+        progressStages
     } = useWorkflowStore();
-    const { postgresUrl, connectionStatus, projectContext } = useConfigStore();
+    const { postgresUrl, mssqlUrl, connectionStatus, projectContext, dataSources, selectedDataSourceId, discoveredTables } = useConfigStore();
 
     const [localLoading, setLocalLoading] = useState(false);
-    const [isEditingNotes, setIsEditingNotes] = useState(false);
-    const [localNotes, setLocalNotes] = useState(userSchemaNotes || '');
     const [activeTable, setActiveTable] = useState<string | null>(null);
     const [enableSemanticSearch, setEnableSemanticSearch] = useState(false);
     const [enableTableMetrics, setEnableTableMetrics] = useState(true);
@@ -68,7 +77,62 @@ export const SchemaDiscoveryView: React.FC = () => {
     const [numDrafts, setNumDrafts] = useState<Record<string, string>>({});
     const [columnToggles, setColumnToggles] = useState<Record<string, Record<string, { show?: boolean; filterable?: boolean }>>>({});
     const [rawSchemaData, setRawSchemaData] = useState<any | null>(null);
+    const [tableSearch, setTableSearch] = useState('');
     const autoRefreshMissingRef = useRef(false);
+
+    const normalizeTableIdentifier = (value: string) =>
+        String(value || '')
+            .trim()
+            .replace(/^\[|\]$/g, '')
+            .replace(/^"|"$/g, '')
+            .toLowerCase();
+
+    const resolveAllowedTables = useCallback((): string[] => {
+        const result: string[] = [];
+        const seen = new Set<string>();
+        const addMany = (items: unknown[]) => {
+            items.forEach((raw) => {
+                const table = String(raw || '').trim();
+                if (!table) return;
+                const key = normalizeTableIdentifier(table);
+                if (!key || seen.has(key)) return;
+                seen.add(key);
+                result.push(table);
+            });
+        };
+
+        try {
+            const storedTablesRaw = localStorage.getItem(SELECTED_TABLES_KEY);
+            const selectedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+            if (Array.isArray(selectedTables)) addMany(selectedTables);
+        } catch {
+            // ignore malformed localStorage
+        }
+
+        if (result.length === 0) {
+            try {
+                const selectedSchemaRaw = localStorage.getItem(SELECTED_SCHEMA_KEY);
+                const parsed = selectedSchemaRaw ? JSON.parse(selectedSchemaRaw) : null;
+                const schemaDataMap = parsed?.schemaData && typeof parsed.schemaData === 'object'
+                    ? parsed.schemaData
+                    : parsed;
+                if (schemaDataMap && typeof schemaDataMap === 'object') {
+                    addMany(Object.keys(schemaDataMap));
+                }
+            } catch {
+                // ignore malformed localStorage
+            }
+        }
+
+        const discoveredSet = new Set((Array.isArray(discoveredTables) ? discoveredTables : []).map((t) => normalizeTableIdentifier(t)));
+        if (discoveredSet.size > 0) {
+            const filtered = result.filter((t) => discoveredSet.has(normalizeTableIdentifier(t)));
+            return Array.from(new Set(filtered));
+        }
+
+        return result;
+    }, [discoveredTables]);
+
 
     const loadOverrides = () => {
         try {
@@ -87,7 +151,24 @@ export const SchemaDiscoveryView: React.FC = () => {
     const loadColumnToggles = () => {
         try {
             const raw = localStorage.getItem(COLUMN_TOGGLES_KEY);
-            return raw ? JSON.parse(raw) : {};
+            const parsed = raw ? JSON.parse(raw) : {};
+            // One-time migration: clear legacy "filterable=true for all" defaults while preserving Show toggles.
+            if (localStorage.getItem(COLUMN_TOGGLES_MIGRATION_KEY) !== '1') {
+                const migrated: Record<string, Record<string, { show?: boolean; filterable?: boolean }>> = {};
+                Object.entries(parsed || {}).forEach(([table, cols]: [string, any]) => {
+                    const tableMap: Record<string, { show?: boolean; filterable?: boolean }> = {};
+                    Object.entries(cols || {}).forEach(([col, entry]: [string, any]) => {
+                        tableMap[col] = {
+                            ...(typeof entry?.show === 'boolean' ? { show: entry.show } : {})
+                        };
+                    });
+                    migrated[table] = tableMap;
+                });
+                localStorage.setItem(COLUMN_TOGGLES_KEY, JSON.stringify(migrated));
+                localStorage.setItem(COLUMN_TOGGLES_MIGRATION_KEY, '1');
+                return migrated;
+            }
+            return parsed;
         } catch {
             return {};
         }
@@ -101,13 +182,23 @@ export const SchemaDiscoveryView: React.FC = () => {
     const getColumnToggle = (
         tableName: string,
         columnName: string,
-        togglesMap: Record<string, Record<string, { show?: boolean; filterable?: boolean }>> = columnToggles
+        togglesMap: Record<string, Record<string, { show?: boolean; filterable?: boolean }>> = columnToggles,
+        defaults?: { show?: boolean; filterable?: boolean }
     ) => {
         const entry = togglesMap[tableName]?.[columnName] || {};
         return {
-            show: entry.show ?? true,
-            filterable: entry.filterable ?? true
+            show: entry.show ?? (defaults?.show ?? true),
+            filterable: entry.filterable ?? (defaults?.filterable ?? false)
         };
+    };
+
+    const isDefaultFilterableColumn = (tableName: string, columnName: string, tableColumns?: any[]) => {
+        const columns = Array.isArray(tableColumns)
+            ? tableColumns
+            : (rawSchemaData?.schemaInfo?.[tableName]?.columns || []);
+        const match = columns.find((c: any) => (c?.name || c?.column_name) === columnName);
+        const type = String(match?.type || match?.data_type || '').toLowerCase();
+        return /date|time|timestamp/.test(type) || type.includes('enum');
     };
 
     const buildMergedInsights = (baseInsights: any, overrides: Record<string, any>) => {
@@ -177,6 +268,7 @@ export const SchemaDiscoveryView: React.FC = () => {
         if (!baseData) return baseData;
         const visibleColumns: Record<string, string[]> = {};
         const filterableColumns: Record<string, string[]> = {};
+        const disabledFilterColumns: Record<string, string[]> = {};
         const maskedInsights: Record<string, any> = {};
 
         Object.entries(baseData.schemaInfo || {}).forEach(([tableName, info]: [string, any]) => {
@@ -186,16 +278,28 @@ export const SchemaDiscoveryView: React.FC = () => {
                 : columns.map((c: any) => c?.name || c?.column_name).filter(Boolean);
             const baseFilterable = Array.isArray(baseData.filterableColumns?.[tableName])
                 ? baseData.filterableColumns[tableName]
-                : (baseData.tableInsights?.[tableName]?.filters || []).map((f: any) => f.column).filter(Boolean);
+                : columns
+                    .map((c: any) => c?.name || c?.column_name)
+                    .filter((name: string) => Boolean(name) && isDefaultFilterableColumn(tableName, name, columns));
 
             const visibleSet = new Set<string>();
-            const filterableSet = new Set<string>(baseFilterable);
+            const defaultFilterable = new Set<string>(
+                columns
+                    .map((c: any) => c?.name || c?.column_name)
+                    .filter((name: string) => Boolean(name) && isDefaultFilterableColumn(tableName, name, columns))
+            );
+            const filterableSet = new Set<string>(baseFilterable.filter((name: string) => defaultFilterable.has(name)));
             baseVisible.forEach((col: string) => visibleSet.add(col));
+
+            const explicitlyDisabled = new Set<string>();
 
             columns.forEach((col: any) => {
                 const name = col?.name || col?.column_name;
                 if (!name) return;
-                const toggle = getColumnToggle(tableName, name, toggles);
+                const toggle = getColumnToggle(tableName, name, toggles, {
+                    show: true,
+                    filterable: filterableSet.has(name)
+                });
                 if (toggle.show === false) {
                     visibleSet.delete(name);
                 } else if (toggle.show === true) {
@@ -206,10 +310,20 @@ export const SchemaDiscoveryView: React.FC = () => {
                 } else if (toggle.filterable === true) {
                     filterableSet.add(name);
                 }
+                // Only track columns where the user explicitly set filterable=false in the saved toggle map.
+                // We check the raw entry directly — NOT the computed toggle (which has defaults that would
+                // incorrectly flag non-default-filterable columns like identifiers and free-text fields).
+                const rawEntry = toggles[tableName]?.[name];
+                if (rawEntry && 'filterable' in rawEntry && rawEntry.filterable === false) {
+                    explicitlyDisabled.add(name);
+                }
             });
 
             visibleColumns[tableName] = Array.from(visibleSet);
             filterableColumns[tableName] = Array.from(filterableSet);
+            if (explicitlyDisabled.size > 0) {
+                disabledFilterColumns[tableName] = Array.from(explicitlyDisabled);
+            }
 
             const insight = baseData.tableInsights?.[tableName];
             if (insight) {
@@ -228,6 +342,7 @@ export const SchemaDiscoveryView: React.FC = () => {
             ...baseData,
             visibleColumns,
             filterableColumns,
+            disabledFilterColumns,
             tableInsights: maskedInsights
         };
     };
@@ -239,6 +354,7 @@ export const SchemaDiscoveryView: React.FC = () => {
         const dateColumns: { table: string; column: string; type: string }[] = [];
         const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
         const entityColumns: { viaTable: string; from: string; to: string }[] = [];
+        const searchColumns: { table: string; column: string; score: number }[] = [];
 
         Object.entries(tableInsights || {}).forEach(([tableName, insight]: [string, any]) => {
             const filters = Array.isArray(insight?.filters) ? insight.filters : [];
@@ -257,14 +373,24 @@ export const SchemaDiscoveryView: React.FC = () => {
                         from: `${tableName}.${filter.column}`,
                         to: `${filter.targetTable || ''}`.trim()
                     });
+                } else if (filter.type === 'search') {
+                    searchColumns.push({
+                        table: tableName,
+                        column: filter.column,
+                        score: 1
+                    });
                 }
             });
         });
 
         const primaryDate = dateColumns[0];
+        const primarySearch = searchColumns[0];
         const summaryLines: string[] = [];
         if (primaryDate) {
             summaryLines.push(`Date range filter: ${primaryDate.table}.${primaryDate.column}`);
+        }
+        if (primarySearch) {
+            summaryLines.push(`Search filter: ${primarySearch.table}.${primarySearch.column}`);
         }
         if (categoricalColumns.length > 0) {
             summaryLines.push(`Categorical filters: ${categoricalColumns.slice(0, 5).map(c => `${c.table}.${c.column}`).join(', ')}${categoricalColumns.length > 5 ? ' ...' : ''}`);
@@ -277,6 +403,8 @@ export const SchemaDiscoveryView: React.FC = () => {
             dateColumns,
             categoricalColumns,
             entityColumns,
+            searchColumns,
+            primarySearch,
             primaryDate,
             summary: summaryLines.join('\n') || 'No filterable dimensions detected.'
         };
@@ -286,25 +414,42 @@ export const SchemaDiscoveryView: React.FC = () => {
         const dateColumns: { table: string; column: string; type: string }[] = [];
         const categoricalColumns: { table: string; column: string; distinct: any[] }[] = [];
         const entityColumns: { viaTable: string; from: string; to: string }[] = [];
+        const searchColumns: { table: string; column: string; score: number }[] = [];
 
         Object.entries(filterable || {}).forEach(([table, columns]) => {
             const info = schemaInfo?.[table];
             const cols = info?.columns || [];
+            const foreignKeys = Array.isArray(info?.foreignKeys) ? info.foreignKeys : [];
             columns.forEach((column) => {
                 const match = cols.find((c: any) => (c?.name || c?.column_name) === column);
                 const type = String(match?.type || match?.data_type || '').toLowerCase();
                 if (/date|time|timestamp/.test(type)) {
                     dateColumns.push({ table, column, type });
-                } else {
+                } else if (type.includes('enum')) {
                     categoricalColumns.push({ table, column, distinct: [] });
+                }
+                if (/(char|text|string|uuid|citext|json)/.test(type) && /name|title|label|email|code|reference|number/i.test(column)) {
+                    searchColumns.push({ table, column, score: 1 });
+                }
+                const fk = foreignKeys.find((candidate: any) => String(candidate?.column_name || '') === column);
+                if (fk?.foreign_table_name) {
+                    entityColumns.push({
+                        viaTable: table,
+                        from: `${table}.${column}`,
+                        to: `${fk.foreign_table_name}.${fk.foreign_column_name || 'id'}`
+                    });
                 }
             });
         });
 
         const primaryDate = dateColumns[0];
+        const primarySearch = searchColumns[0];
         const summaryLines: string[] = [];
         if (primaryDate) {
             summaryLines.push(`Date range filter: ${primaryDate.table}.${primaryDate.column}`);
+        }
+        if (primarySearch) {
+            summaryLines.push(`Search filter: ${primarySearch.table}.${primarySearch.column}`);
         }
         if (categoricalColumns.length > 0) {
             summaryLines.push(`Categorical filters: ${categoricalColumns.slice(0, 5).map(c => `${c.table}.${c.column}`).join(', ')}${categoricalColumns.length > 5 ? ' ...' : ''}`);
@@ -317,6 +462,8 @@ export const SchemaDiscoveryView: React.FC = () => {
             dateColumns,
             categoricalColumns,
             entityColumns,
+            searchColumns,
+            primarySearch,
             primaryDate,
             summary: summaryLines.join('\n') || 'No filterable dimensions detected.'
         };
@@ -361,22 +508,58 @@ export const SchemaDiscoveryView: React.FC = () => {
         setLocalLoading(true);
         setError(null);
 
+        const defaultStages = [
+            { id: 'connect', label: 'Connecting to database', status: 'pending' as const },
+            { id: 'discover', label: 'Discovering schema', status: 'pending' as const },
+            { id: 'analyze', label: 'Analyzing tables', status: 'pending' as const },
+            { id: 'enrich', label: 'Enriching with insights', status: 'pending' as const },
+        ];
+        
+        setProgressStages(defaultStages);
+
         try {
             const tryDiscover = async (attempts: number) => {
                 let lastError: any = null;
+                
+                updateProgressStage('connect', { status: 'in_progress' });
+                
                 for (let i = 0; i < attempts; i++) {
                     try {
-                        const data = await runSchemaDiscovery(postgresUrl, {
-                            enableSemanticSearch: semanticEnabled,
-                            enableTableKpis: tableKpisEnabled,
-                            enableTableMatrix: tableMatrixEnabled,
-                            enableTableFilters: tableMatrixEnabled,
-                            projectContext
-                        }, allowedTables);
-                        if (data?.tables && data.tables.length > 0) return data;
+                        updateProgressStage('connect', { status: 'completed', message: 'Connected' });
+                        updateProgressStage('discover', { status: 'in_progress', message: 'Scanning tables...' });
+                        
+                        const data = await runSchemaDiscovery({
+                            connection: effectiveUrl,
+                            connectorType: effectiveConnectorType,
+                            options: {
+                                enableSemanticSearch: semanticEnabled,
+                                enableTableKpis: tableKpisEnabled,
+                                enableTableMatrix: tableMatrixEnabled,
+                                enableTableFilters: tableMatrixEnabled,
+                                projectContext
+                            },
+                            allowedTables
+                        });
+                        
+                        updateProgressStage('discover', { status: 'completed', message: `Found ${data?.tables?.length || 0} tables` });
+                        
+                        if (data?.tables && data.tables.length > 0) {
+                            updateProgressStage('analyze', { status: 'in_progress', message: 'Analyzing columns...' });
+                            updateProgressStage('analyze', { status: 'completed' });
+                            
+                            if (semanticEnabled) {
+                                updateProgressStage('enrich', { status: 'in_progress', message: 'Generating insights...' });
+                                updateProgressStage('enrich', { status: 'completed' });
+                            } else {
+                                updateProgressStage('enrich', { status: 'completed' });
+                            }
+                            
+                            return data;
+                        }
                         lastError = new Error("Schema discovery returned no tables.");
                     } catch (err: any) {
                         lastError = err;
+                        updateProgressStage('connect', { status: 'error', message: err.message });
                     }
                 }
                 throw lastError || new Error("Schema discovery failed.");
@@ -384,8 +567,21 @@ export const SchemaDiscoveryView: React.FC = () => {
             const semanticEnabled = overrideOptions?.enableSemanticSearch ?? enableSemanticSearch;
             const tableKpisEnabled = false;
             const tableMatrixEnabled = overrideOptions?.enableTableMatrix ?? enableTableMetrics;
-            const storedTablesRaw = localStorage.getItem(SELECTED_TABLES_KEY);
-            const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+            const allowedTables = resolveAllowedTables();
+            if (!Array.isArray(allowedTables) || allowedTables.length === 0) {
+                throw new Error("No tables selected for schema discovery. Open Data Sources, select at least one table, then refresh schema.");
+            }
+
+            // Resolve active connection — supports both PostgreSQL and MSSQL
+            const selectedDs = dataSources.find(ds => ds.id === selectedDataSourceId);
+            const effectiveUrl = selectedDs?.connectionString || postgresUrl || mssqlUrl;
+            const lowerUrl = (effectiveUrl || "").toLowerCase();
+            const isMssqlConn = selectedDs?.type === 'MSSQL' ||
+                (!lowerUrl.startsWith('postgres') && !lowerUrl.startsWith('postgresql') &&
+                    (lowerUrl.startsWith('mssql://') || lowerUrl.startsWith('sqlserver://') ||
+                        lowerUrl.includes('server=') || lowerUrl.includes('data source=')));
+            const effectiveConnectorType = isMssqlConn ? 'mssql' : undefined;
+
             const data = await tryDiscover(3);
             const storedOverrides = loadOverrides();
             const storedToggles = loadColumnToggles();
@@ -400,7 +596,7 @@ export const SchemaDiscoveryView: React.FC = () => {
                 : data.filterCandidates;
             const nextData = {
                 ...maskedData,
-                connectionString: postgresUrl,
+                connectionString: effectiveUrl,
                 filterCandidates,
                 filterSummary: filterCandidates?.summary || data.filterSummary,
                 projectContext
@@ -416,7 +612,7 @@ export const SchemaDiscoveryView: React.FC = () => {
             setProcessing(false);
             setLocalLoading(false);
         }
-    }, [connectionStatus, postgresUrl, projectContext, setSchemaData, setError, setProcessing, setLocalLoading, staleStep, setStaleStep, enableSemanticSearch, enableTableMetrics]);
+    }, [connectionStatus, postgresUrl, mssqlUrl, dataSources, selectedDataSourceId, projectContext, setSchemaData, setError, setProcessing, setLocalLoading, staleStep, setStaleStep, enableSemanticSearch, enableTableMetrics, resolveAllowedTables]);
 
     useEffect(() => {
         if (!rawSchemaData) return;
@@ -453,23 +649,22 @@ export const SchemaDiscoveryView: React.FC = () => {
         if (autoRefreshMissingRef.current) return;
         if (!schemaData || isProcessing || localLoading) return;
         const missingProfiles = !schemaData.sampleData || !schemaData.tableInsights;
-        if (missingProfiles && connectionStatus === "Connected" && postgresUrl) {
+        if (missingProfiles && connectionStatus === "Connected" && (postgresUrl || mssqlUrl)) {
             autoRefreshMissingRef.current = true;
             handleDiscover();
         }
-    }, [schemaData, connectionStatus, postgresUrl, isProcessing, localLoading, handleDiscover]);
+    }, [schemaData, connectionStatus, postgresUrl, mssqlUrl, isProcessing, localLoading, handleDiscover]);
 
     useEffect(() => {
         if (autoRefreshMissingRef.current) return;
         if (schemaData?.tables?.length) return;
         if (isProcessing || localLoading) return;
-        if (connectionStatus !== "Connected" || !postgresUrl) return;
-        const storedTablesRaw = localStorage.getItem(SELECTED_TABLES_KEY);
-        const selectedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+        if (connectionStatus !== "Connected" || !(postgresUrl || mssqlUrl)) return;
+        const selectedTables = resolveAllowedTables();
         if (!Array.isArray(selectedTables) || selectedTables.length === 0) return;
         autoRefreshMissingRef.current = true;
         handleDiscover();
-    }, [schemaData, connectionStatus, postgresUrl, isProcessing, localLoading, handleDiscover]);
+    }, [schemaData, connectionStatus, postgresUrl, mssqlUrl, isProcessing, localLoading, handleDiscover, resolveAllowedTables]);
 
     const updateOverridesForTable = (tableName: string, updates: Record<string, any>) => {
         const next = {
@@ -503,7 +698,7 @@ export const SchemaDiscoveryView: React.FC = () => {
         columns.forEach((col: any) => {
             const name = col?.name || col?.column_name;
             if (!name) return;
-            tableMap[name] = { show: true, filterable: true };
+            tableMap[name] = { show: true };
         });
         const next = { ...columnToggles, [tableName]: tableMap };
         saveColumnToggles(next);
@@ -584,25 +779,27 @@ export const SchemaDiscoveryView: React.FC = () => {
 
     // Auto-discovery disabled: only fetch schema on explicit user action.
 
-    const handleSaveNotes = () => {
-        setUserSchemaNotes(localNotes);
-        setIsEditingNotes(false);
-    };
-
-    if (localLoading || (isProcessing && !schemaData)) {
-        return (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16 }}>
-                <Spin size="large" />
-                <Text type="secondary">Profiling database and generating semantic analysis...</Text>
-            </div>
-        );
-    }
-
     const hasTables = schemaData?.tables && schemaData.tables.length > 0;
+    const tableCount = schemaData?.tables?.length || 0;
     const totalRecords = schemaData?.tableCounts
         ? Object.values(schemaData.tableCounts).reduce((sum: number, val: any) => sum + Number(val || 0), 0)
         : 0;
     const relationshipCount = schemaData?.relationships?.length || 0;
+    const joinExamples = useMemo(() => {
+        if (!schemaData?.relationships?.length) return [];
+        return schemaData.relationships.slice(0, 6).map((rel: any, idx: number) => {
+            const fromTable = rel.from?.table || rel.fromTable;
+            const fromColumn = rel.from?.column || rel.via;
+            const toTable = rel.to?.table || rel.toTable;
+            const toColumn = rel.to?.column || rel.targetColumn || "id";
+            if (!fromTable || !toTable || !fromColumn) return null;
+            return {
+                id: `join-example-${idx}`,
+                label: `${fromTable}.${fromColumn} -> ${toTable}.${toColumn}`,
+                sql: `SELECT a.*, b.*\nFROM "${fromTable}" a\nJOIN "${toTable}" b\n  ON a."${fromColumn}" = b."${toColumn}"\nLIMIT 50;`
+            };
+        }).filter(Boolean) as Array<{ id: string; label: string; sql: string }>;
+    }, [schemaData?.relationships]);
     const handleToggleSemantic = (checked: boolean) => {
         setEnableSemanticSearch(checked);
         if (schemaData && connectionStatus === "Connected") {
@@ -610,9 +807,119 @@ export const SchemaDiscoveryView: React.FC = () => {
         }
     };
 
+    // Filtered tables for search
+    const filteredTables = useMemo(() => {
+        const t = schemaData?.tables || [];
+        if (!tableSearch.trim()) return t;
+        return t.filter((n: string) => n.toLowerCase().includes(tableSearch.toLowerCase()));
+    }, [schemaData?.tables, tableSearch]);
+
+    // Aggregate quality across all tables
+    const allQualityScores = useMemo(() => {
+        if (!schemaData?.tableInsights) return null;
+        const scores = Object.values(schemaData.tableInsights)
+            .map((ins: any) => ins?.dataMatrix?.qualityReport?.healthScore)
+            .filter((s: any) => typeof s === 'number') as number[];
+        if (scores.length === 0) return null;
+        return Math.round(scores.reduce((a, b) => a + b, 0) / scores.length);
+    }, [schemaData?.tableInsights]);
+
+    // Per-table classification summary for the overview
+    const classificationSummary = useMemo(() => {
+        if (!schemaData?.tableInsights) return { fact: 0, dimension: 0, junction: 0, lookup: 0, unknown: 0 };
+        const counts: Record<string, number> = { fact: 0, dimension: 0, junction: 0, lookup: 0, unknown: 0 };
+        Object.values(schemaData.tableInsights).forEach((ins: any) => {
+            const cls = ins?.dataMatrix?.classification?.tableClass || 'unknown';
+            counts[cls] = (counts[cls] || 0) + 1;
+        });
+        return counts;
+    }, [schemaData?.tableInsights]);
+
+    if (localLoading || (isProcessing && !schemaData)) {
+        return (
+            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16 }}>
+                <Spin size="large" />
+                <Text type="secondary">Profiling database schema — running column statistics, data quality scoring, and semantic analysis...</Text>
+            </div>
+        );
+    }
+
     const handleToggleMetrics = () => {
         // KPI agent is enforced for pipeline stability.
     };
+
+    // Helper: render classification badge
+    const renderClassBadge = (cls: any) => {
+        if (!cls) return null;
+        const clsMap: Record<string, { color: string; label: string; icon: React.ReactNode }> = {
+            fact: { color: '#6366f1', label: 'Fact', icon: <LineChartOutlined /> },
+            dimension: { color: '#10b981', label: 'Dimension', icon: <TableOutlined /> },
+            junction: { color: '#f59e0b', label: 'Junction', icon: <ArrowRightOutlined /> },
+            lookup: { color: '#3b82f6', label: 'Lookup', icon: <SafetyOutlined /> },
+            unknown: { color: '#6b7280', label: 'Mixed', icon: <InfoCircleOutlined /> },
+        };
+        const cfg = clsMap[cls.tableClass] || clsMap.unknown;
+        return (
+            <Tooltip title={`${cls.confidence}% confidence • ${cls.signals?.[0] || ''}`}>
+                <Tag icon={cfg.icon} style={{
+                    background: `${cfg.color}22`,
+                    border: `1px solid ${cfg.color}55`,
+                    color: cfg.color,
+                    fontWeight: 600,
+                    fontSize: 11
+                }}>
+                    {cfg.label}
+                </Tag>
+            </Tooltip>
+        );
+    };
+
+    // Helper: render column role badge
+    const renderRoleBadge = (role: string) => {
+        const roleMap: Record<string, { color: string; label: string }> = {
+            measure: { color: '#6366f1', label: 'Measure' },
+            label: { color: '#10b981', label: 'Label' },
+            category: { color: '#f59e0b', label: 'Category' },
+            timestamp: { color: '#3b82f6', label: 'Timestamp' },
+            id: { color: '#8b5cf6', label: 'ID' },
+            flag: { color: '#ec4899', label: 'Flag' },
+            unknown: { color: '#6b7280', label: '—' },
+        };
+        const cfg = roleMap[role] || roleMap.unknown;
+        if (role === 'unknown') return null;
+        return (
+            <span style={{
+                fontSize: 9,
+                fontWeight: 700,
+                padding: '1px 5px',
+                borderRadius: 4,
+                background: `${cfg.color}22`,
+                border: `1px solid ${cfg.color}44`,
+                color: cfg.color,
+                letterSpacing: '0.04em',
+                textTransform: 'uppercase'
+            }}>
+                {cfg.label}
+            </span>
+        );
+    };
+
+    // Helper: render null rate indicator bar
+    const renderNullBar = (nullRate: number) => {
+        const pct = Math.round(nullRate * 100);
+        const color = pct > 50 ? '#ef4444' : pct > 20 ? '#f59e0b' : '#10b981';
+        return (
+            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                <div style={{ flex: 1, height: 4, borderRadius: 2, background: 'rgba(255,255,255,0.08)' }}>
+                    <div style={{ width: `${pct}%`, height: '100%', borderRadius: 2, background: color }} />
+                </div>
+                <Text style={{ fontSize: 10, color, minWidth: 30 }}>{pct}%</Text>
+            </div>
+        );
+    };
+
+    // Helper: data quality health color
+    const qualityColor = (score: number) => score >= 80 ? '#10b981' : score >= 60 ? '#f59e0b' : '#ef4444';
 
     return (
         <div style={{ padding: '24px', height: '100%', overflowY: 'auto' }}>
@@ -623,7 +930,7 @@ export const SchemaDiscoveryView: React.FC = () => {
                         Schema Discovery
                     </Title>
                     <Space separator={<Text type="secondary">|</Text>}>
-                        <Text type="secondary">Review schema before planning</Text>
+                        <Text type="secondary">Pro Data Profiling</Text>
                         <Tag color="blue">Step 1 of 5</Tag>
                         {schemaTimestamp && (
                             <Text type="secondary">
@@ -659,6 +966,41 @@ export const SchemaDiscoveryView: React.FC = () => {
                     </Button>
                 </Space>
             </div>
+
+            {isProcessing && progressStages.length > 0 && (
+                <div style={{ 
+                    marginBottom: 24, 
+                    padding: 16, 
+                    background: 'rgba(99, 102, 241, 0.05)', 
+                    borderRadius: 8,
+                    border: '1px solid rgba(99, 102, 241, 0.2)'
+                }}>
+                    <div style={{ marginBottom: 12, fontWeight: 600, color: '#fff' }}>
+                        <LoadingOutlined style={{ marginRight: 8 }} />
+                        Discovering Database Schema...
+                    </div>
+                    <Space direction="vertical" style={{ width: '100%' }} size={8}>
+                        {progressStages.map((stage, index) => (
+                            <div key={stage.id} style={{ 
+                                display: 'flex', 
+                                alignItems: 'center',
+                                opacity: stage.status === 'pending' ? 0.5 : 1
+                            }}>
+                                {stage.status === 'completed' && <CheckCircleOutlined style={{ color: '#10b981', marginRight: 8 }} />}
+                                {stage.status === 'in_progress' && <LoadingOutlined style={{ color: '#6366f1', marginRight: 8 }} />}
+                                {stage.status === 'error' && <CloseCircleOutlined style={{ color: '#ef4444', marginRight: 8 }} />}
+                                {stage.status === 'pending' && <LoadingOutlined style={{ color: '#6b7280', marginRight: 8 }} />}
+                                <span style={{ color: '#fff', flex: 1 }}>{stage.label}</span>
+                                {stage.message && (
+                                    <span style={{ color: 'rgba(255,255,255,0.5)', fontSize: 12 }}>
+                                        {stage.message}
+                                    </span>
+                                )}
+                            </div>
+                        ))}
+                    </Space>
+                </div>
+            )}
 
             {connectionStatus !== "Connected" && (
                 <Alert
@@ -697,23 +1039,17 @@ export const SchemaDiscoveryView: React.FC = () => {
                     gap: 20
                 }}>
                     <div style={{
-                        width: 48,
-                        height: 48,
-                        borderRadius: '14px',
-                        background: 'rgba(19, 91, 236, 0.2)',
-                        display: 'flex',
-                        alignItems: 'center',
-                        justifyContent: 'center',
-                        color: '#135bec',
-                        boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
+                        width: 48, height: 48, borderRadius: '14px',
+                        background: 'rgba(19, 91, 236, 0.2)', display: 'flex',
+                        alignItems: 'center', justifyContent: 'center',
+                        color: '#135bec', boxShadow: '0 4px 12px rgba(0,0,0,0.1)'
                     }}>
                         <InfoCircleOutlined style={{ fontSize: 24 }} />
                     </div>
                     <div style={{ flex: 1 }}>
                         <Title level={4} style={{ margin: '0 0 4px 0', color: '#fff', fontSize: 18 }}>Strategic Intent Needed</Title>
                         <Text style={{ color: 'rgba(248, 250, 252, 0.8)', fontSize: 14, lineHeight: 1.5, display: 'block' }}>
-                            Success! You've discovered the schema. Now, the AI needs a specific objective or query to architect your dashboard blueprint.
-                            Please enter your request in the chat panel to the left.
+                            Schema profiled successfully. Enter your analytics objective in the chat panel to generate a dashboard blueprint.
                         </Text>
                     </div>
                 </div>
@@ -725,436 +1061,405 @@ export const SchemaDiscoveryView: React.FC = () => {
 
             {schemaData && (
                 <div style={{ display: 'flex', flexDirection: 'column', gap: 24 }}>
-                    {/* Expert Analysis Section */}
-                    <Card
-                        title={
-                            <Space>
-                                <span>Expert Analysis</span>
-                                <Tag color="blue">AI Generated</Tag>
-                            </Space>
-                        }
-                        extra={
-                            <Button
-                                type="text"
-                                icon={isEditingNotes ? <SaveOutlined /> : <EditOutlined />}
-                                onClick={isEditingNotes ? handleSaveNotes : () => setIsEditingNotes(true)}
-                            >
-                                {isEditingNotes ? 'Save Notes' : 'Edit Notes'}
-                            </Button>
-                        }
-                    >
-                        {isEditingNotes ? (
-                            <TextArea
-                                value={localNotes}
-                                onChange={(e) => setLocalNotes(e.target.value)}
-                                placeholder="Add custom notes about the schema here..."
-                                autoSize={{ minRows: 4, maxRows: 12 }}
-                                style={{ marginBottom: 12 }}
-                            />
-                        ) : (
-                            <Paragraph style={{ whiteSpace: 'pre-wrap' }}>
-                                {userSchemaNotes || schemaData.rawAnalysis}
-                            </Paragraph>
+                    {/* ── Schema Overview Stats ───────────────────────────────── */}
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(180px, 1fr))', gap: 16 }}>
+                        <Card size="small" style={{ textAlign: 'center' }}>
+                            <Statistic title="Tables" value={schemaData.tables?.length || 0} styles={{ content: { color: '#6366f1' } }} />
+                        </Card>
+                        <Card size="small" style={{ textAlign: 'center' }}>
+                            <Statistic title="Total Records" value={totalRecords} formatter={(v) => Number(v).toLocaleString()} styles={{ content: { color: '#10b981' } }} />
+                        </Card>
+                        <Card size="small" style={{ textAlign: 'center' }}>
+                            <Statistic title="Relationships" value={relationshipCount} styles={{ content: { color: '#3b82f6' } }} />
+                        </Card>
+                        {allQualityScores !== null && (
+                            <Card size="small" style={{ textAlign: 'center' }}>
+                                <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 4 }}>Avg Data Quality</Text>
+                                <Progress
+                                    type="circle"
+                                    percent={allQualityScores}
+                                    size={64}
+                                    strokeColor={qualityColor(allQualityScores)}
+                                    format={(p) => <span style={{ fontSize: 14, fontWeight: 700, color: qualityColor(allQualityScores!) }}>{p}</span>}
+                                />
+                            </Card>
                         )}
-                    </Card>
+                        {/* Table classification summary */}
+                        {Object.values(classificationSummary).some(v => v > 0) && (
+                            <Card size="small">
+                                <Text type="secondary" style={{ fontSize: 12, display: 'block', marginBottom: 8 }}>Table Types</Text>
+                                <div style={{ display: 'flex', flexWrap: 'wrap', gap: 4 }}>
+                                    {classificationSummary.fact > 0 && <Tag style={{ background: '#6366f122', border: '1px solid #6366f155', color: '#6366f1' }}>Fact ×{classificationSummary.fact}</Tag>}
+                                    {classificationSummary.dimension > 0 && <Tag style={{ background: '#10b98122', border: '1px solid #10b98155', color: '#10b981' }}>Dim ×{classificationSummary.dimension}</Tag>}
+                                    {classificationSummary.junction > 0 && <Tag style={{ background: '#f59e0b22', border: '1px solid #f59e0b55', color: '#f59e0b' }}>Junction ×{classificationSummary.junction}</Tag>}
+                                    {classificationSummary.lookup > 0 && <Tag style={{ background: '#3b82f622', border: '1px solid #3b82f655', color: '#3b82f6' }}>Lookup ×{classificationSummary.lookup}</Tag>}
+                                </div>
+                            </Card>
+                        )}
+                    </div>
 
-                    {/* Schema Summary */}
-                    {schemaData && (
-                        <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit, minmax(220px, 1fr))', gap: 16 }}>
-                            <Card size="small">
-                                <Text type="secondary">Tables</Text>
-                                <Title level={3} style={{ margin: '4px 0 0 0' }}>{schemaData.tables?.length || 0}</Title>
-                            </Card>
-                            <Card size="small">
-                                <Text type="secondary">Rows Profiled</Text>
-                                <Title level={3} style={{ margin: '4px 0 0 0' }}>{totalRecords.toLocaleString()}</Title>
-                            </Card>
-                            <Card size="small">
-                                <Text type="secondary">Relationships</Text>
-                                <Title level={3} style={{ margin: '4px 0 0 0' }}>{relationshipCount}</Title>
-                            </Card>
-                            {schemaData.filterSummary && (
-                                <Card size="small">
-                                    <Text type="secondary">Filterable Dimensions</Text>
-                                    <Paragraph style={{ margin: '4px 0 0 0', whiteSpace: 'pre-line' }}>
-                                        {schemaData.filterSummary}
-                                    </Paragraph>
-                                </Card>
-                            )}
-                        </div>
-                    )}
-
-                    {/* Relationships */}
+                    {/* ── Relationships ───────────────────────────────────────── */}
                     {relationshipCount > 0 && (
                         <Card
-                            title="Detected Relationships"
+                            title={<Space><ArrowRightOutlined /><span>Detected Relationships</span><Badge count={relationshipCount} style={{ backgroundColor: '#6366f1' }} /></Space>}
                             size="small"
                         >
-                            <Space orientation="vertical" style={{ width: '100%' }}>
-                                {schemaData.relationships.map((rel: any, idx: number) => (
-                                    <div key={idx} style={{ display: 'flex', alignItems: 'center', gap: 12 }}>
-                                        <Tag color="cyan">{rel.type || 'many-to-one'}</Tag>
-                                        <Text code>{`${rel.from?.table}.${rel.from?.column}`}</Text>
-                                        <ArrowRightOutlined />
-                                        <Text code>{`${rel.to?.table}.${rel.to?.column}`}</Text>
+                            <div style={{ display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                                {schemaData.relationships.map((rel: any, idx: number) => {
+                                    const typeColorMap: Record<string, string> = {
+                                        'many-to-one': '#3b82f6',
+                                        '1-to-many': '#10b981',
+                                        'many-to-many': '#f59e0b',
+                                        'junction': '#6366f1',
+                                    };
+                                    const relType = rel.type || rel.relType || 'many-to-one';
+                                    const color = typeColorMap[relType] || '#6b7280';
+                                    const fromLabel = rel.from?.table ? `${rel.from.table}.${rel.from.column}` : `${rel.fromTable}.${rel.via}`;
+                                    const toLabel = rel.to?.table ? `${rel.to.table}.${rel.to.column}` : rel.toTable;
+                                    return (
+                                        <div key={idx} style={{
+                                            display: 'flex', alignItems: 'center', gap: 6,
+                                            padding: '4px 10px', borderRadius: 8,
+                                            background: `${color}11`, border: `1px solid ${color}33`
+                                        }}>
+                                            <Tag style={{ background: `${color}22`, border: `1px solid ${color}55`, color, margin: 0, fontSize: 10 }}>{relType}</Tag>
+                                            <Text code style={{ fontSize: 11 }}>{fromLabel}</Text>
+                                            <ArrowRightOutlined style={{ color, fontSize: 10 }} />
+                                            <Text code style={{ fontSize: 11 }}>{toLabel}</Text>
+                                        </div>
+                                    );
+                                })}
+                            </div>
+                        </Card>
+                    )}
+                    {tableCount > 1 && relationshipCount === 0 && (
+                        <Alert
+                            showIcon
+                            type="warning"
+                            title="No relationships detected across selected tables"
+                            description="Foreign keys may be missing or table names may not match exactly. If your schema has relationships, click Refresh Schema to rescan."
+                            style={{ background: 'rgba(250, 173, 20, 0.1)', border: '1px solid rgba(250, 173, 20, 0.35)' }}
+                        />
+                    )}
+
+                    {joinExamples.length > 0 && (
+                        <Card
+                            title={<Space><TableOutlined /><span>Join Examples</span><Tag color="processing">Auto Generated</Tag></Space>}
+                            size="small"
+                        >
+                            <div style={{ display: 'flex', flexDirection: 'column', gap: 10 }}>
+                                {joinExamples.map((example) => (
+                                    <div key={example.id} style={{ border: '1px solid rgba(99, 102, 241, 0.25)', borderRadius: 8, background: 'rgba(99, 102, 241, 0.08)' }}>
+                                        <div style={{ padding: '8px 10px', borderBottom: '1px solid rgba(99, 102, 241, 0.2)' }}>
+                                            <Text strong>{example.label}</Text>
+                                        </div>
+                                        <pre style={{ margin: 0, padding: '10px 12px', whiteSpace: 'pre-wrap', fontSize: 12, color: '#dbe4ff' }}>
+                                            {example.sql}
+                                        </pre>
                                     </div>
                                 ))}
-                            </Space>
+                            </div>
                         </Card>
                     )}
 
-                    {/* Table Details Grid */}
-                    <Card title="Active Table Preview" size="small" style={{ marginBottom: 20 }}>
-                        {activeTable ? (
-                            <div style={{ display: 'grid', gridTemplateColumns: 'minmax(0, 1fr) minmax(0, 1fr)', gap: 16 }}>
-                                <div>
-                                    <Space orientation="vertical" size={4} style={{ width: '100%' }}>
-                                        <Text strong>{activeTable}</Text>
-                                        <Text type="secondary" style={{ fontSize: 12 }}>
-                                            Rows: {schemaData.tableCounts?.[activeTable] ?? 0}
-                                        </Text>
-                                        <div style={{ display: 'flex', flexWrap: 'wrap', gap: 6 }}>
-                                            {(schemaData.tableInsights?.[activeTable]?.kpis || []).map((kpi: any) => (
-                                                <Tag key={`${activeTable}-${kpi.id}`} color="blue" style={{ margin: 0 }}>
-                                                    {kpi.title}
-                                                </Tag>
-                                            ))}
-                                            {(schemaData.tableInsights?.[activeTable]?.kpis || []).length === 0 && (
-                                                <Text type="secondary" style={{ fontSize: 12 }}>No KPIs detected.</Text>
-                                            )}
+                    {/* ── Table Search & Grid ─────────────────────────────────── */}
+                    {(schemaData.tables?.length || 0) > 6 && (
+                        <Input
+                            prefix={<SearchOutlined style={{ color: '#6b7280' }} />}
+                            placeholder={`Search ${schemaData.tables?.length} tables...`}
+                            value={tableSearch}
+                            onChange={(e) => setTableSearch(e.target.value)}
+                            allowClear
+                            style={{ maxWidth: 340 }}
+                        />
+                    )}
+
+                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(460px, 1fr))', gap: 24 }}>
+                        {filteredTables.map((tableName: string) => {
+                            const insight = schemaData.tableInsights?.[tableName];
+                            const qualityReport: DataQualityReport | undefined = insight?.dataMatrix?.qualityReport;
+                            const classification: TableClassification | undefined = insight?.dataMatrix?.classification;
+                            const columnProfiles: ColumnProfile[] = insight?.dataMatrix?.columnProfiles || [];
+                            const columnCount = Array.isArray(schemaData?.schemaInfo?.[tableName]?.columns)
+                                ? schemaData.schemaInfo[tableName].columns.length
+                                : (insight?.dataMatrix?.columnCounts?.total || 0);
+                            const rowCount = schemaData.tableCounts?.[tableName] ?? 0;
+                            const qs = qualityReport?.healthScore;
+
+                            return (
+                                <Card
+                                    key={tableName}
+                                    hoverable
+                                    onClick={() => setActiveTable(tableName)}
+                                    style={{ border: activeTable === tableName ? '1.5px solid #6366f1' : '1px solid #1e2530', borderRadius: 14 }}
+                                    title={
+                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', flexWrap: 'wrap', gap: 6 }}>
+                                            <Space>
+                                                <Text code strong style={{ fontSize: 13 }}>{tableName}</Text>
+                                                <Badge count={rowCount} overflowCount={9999999} style={{ backgroundColor: '#135bec' }} />
+                                                <Tag color="blue" style={{ margin: 0, fontSize: 10 }}>Columns: {columnCount}</Tag>
+                                            </Space>
+                                            <Space size={4}>
+                                                {classification && renderClassBadge(classification)}
+                                                {qs !== undefined && (
+                                                    <Tooltip title={`Data quality: ${qualityReport?.completeness}% complete, ${qualityReport?.uniqueness}% unique`}>
+                                                        <span style={{
+                                                            fontSize: 11, fontWeight: 700,
+                                                            padding: '2px 8px', borderRadius: 99,
+                                                            background: `${qualityColor(qs)}22`,
+                                                            border: `1px solid ${qualityColor(qs)}55`,
+                                                            color: qualityColor(qs)
+                                                        }}>
+                                                            ♥ {qs}
+                                                        </span>
+                                                    </Tooltip>
+                                                )}
+                                            </Space>
                                         </div>
-                                    </Space>
-                                </div>
-                                <div>
-                                    <Text strong type="secondary">Last 5 Records</Text>
-                                    <div style={{ marginTop: 8, overflowX: 'auto' }}>
-                                        <Table
-                                            size="small"
-                                            pagination={false}
-                                            dataSource={schemaData.sampleData?.[activeTable]?.slice(0, 5)?.map((row: any, idx: number) => {
-                                                const { __rowKey, ...rest } = row || {};
-                                                return { ...rest, __rowKey: __rowKey || `row-${idx}` };
+                                    }
+                                >
+
+                                    {/* ── Quality Issues ─── */}
+                                    {qualityReport && qualityReport.issues.length > 0 && (
+                                        <div style={{ marginBottom: 12, padding: '8px 10px', borderRadius: 8, background: 'rgba(239,68,68,0.05)', border: '1px solid rgba(239,68,68,0.15)' }}>
+                                            <Text strong style={{ fontSize: 11, color: '#ef4444', display: 'flex', alignItems: 'center', gap: 6, marginBottom: 6 }}>
+                                                <WarningOutlined /> Data Quality Issues ({qualityReport.issues.length})
+                                            </Text>
+                                            {qualityReport.issues.slice(0, 5).map((issue, i) => {
+                                                const sColor = issue.severity === 'high' ? '#ef4444' : issue.severity === 'medium' ? '#f59e0b' : '#6b7280';
+                                                return (
+                                                    <div key={i} style={{ display: 'flex', alignItems: 'center', gap: 8, marginBottom: 3 }}>
+                                                        <span style={{ width: 6, height: 6, borderRadius: '50%', background: sColor, flexShrink: 0 }} />
+                                                        <Text code style={{ fontSize: 10 }}>{issue.column}</Text>
+                                                        <Text style={{ fontSize: 10, color: 'rgba(255,255,255,0.6)' }}>{issue.issue}</Text>
+                                                    </div>
+                                                );
                                             })}
-                                            columns={Object.keys(schemaData.sampleData?.[activeTable]?.[0] || {})
-                                                .filter(key => key !== '__rowKey')
-                                                .map(key => ({
-                                                    title: key,
-                                                    dataIndex: key,
-                                                    key: key,
-                                                    render: (val: any) => (
-                                                        <div style={{ maxWidth: 140, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                            {String(val)}
-                                                        </div>
-                                                    )
-                                                }))}
-                                            rowKey="__rowKey"
-                                        />
-                                    </div>
-                                </div>
-                            </div>
-                        ) : (
-                            <Text type="secondary">Select a table to preview KPIs and last 5 records.</Text>
-                        )}
-                    </Card>
+                                        </div>
+                                    )}
 
-                    <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(450px, 1fr))', gap: 24 }}>
-                        {schemaData.tables?.map((tableName: string) => (
-                            <Card
-                                key={tableName}
-                                hoverable
-                                onClick={() => setActiveTable(tableName)}
-                                title={
-                                    <Space>
-                                        <Text code strong>{tableName}</Text>
-                                        <Badge count={schemaData.tableCounts?.[tableName] || 0} overflowCount={999999} style={{ backgroundColor: '#135bec' }} />
-                                        <Text type="secondary" style={{ fontSize: 12 }}>Records</Text>
-                                    </Space>
-                                }
-                            >
-                                {schemaData.tableInsights?.[tableName] && (
-                                    <div style={{ marginBottom: 16 }}>
-                                        {schemaData.tableInsights[tableName]?.semanticMatches && (
-                                            <div style={{ marginBottom: 12 }}>
-                                                <Text strong type="secondary">SEMANTIC MATCHES</Text>
-                                                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                    {schemaData.tableInsights[tableName].semanticMatches.metrics.map((metric: any) => (
-                                                        <Tag key={`${tableName}-metric-${metric.slug}`} color="geekblue" style={{ margin: 0 }}>
-                                                            {metric.name || metric.slug}
-                                                        </Tag>
-                                                    ))}
-                                                    {schemaData.tableInsights[tableName].semanticMatches.dimensions.map((dim: any) => (
-                                                        <Tag key={`${tableName}-dim-${dim.slug}`} color="green" style={{ margin: 0 }}>
-                                                            {dim.name || dim.slug}
-                                                        </Tag>
-                                                    ))}
-                                                    {schemaData.tableInsights[tableName].semanticMatches.metrics.length === 0 &&
-                                                        schemaData.tableInsights[tableName].semanticMatches.dimensions.length === 0 && (
-                                                            <Text type="secondary" style={{ fontSize: 12 }}>No semantic matches found.</Text>
-                                                        )}
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {schemaData.tableInsights[tableName]?.kpis && (
-                                            <div style={{ marginBottom: 12 }}>
-                                                <Text strong type="secondary">SUGGESTED KPIS</Text>
-                                                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                    {schemaData.tableInsights[tableName].kpis.map((kpi: any) => (
-                                                        <Tooltip key={`${tableName}-kpi-${kpi.id}`} title={kpi.description}>
-                                                            <Tag
-                                                                color="blue"
-                                                                style={{ margin: 0 }}
-                                                                closable
-                                                                closeIcon={<span style={{ fontSize: 12, marginLeft: 4 }}>×</span>}
-                                                                onClose={(e) => {
-                                                                    e.preventDefault();
-                                                                    removeKpi(tableName, kpi.title);
-                                                                }}
-                                                            >
-                                                                {kpi.title}
-                                                            </Tag>
-                                                        </Tooltip>
-                                                    ))}
-                                                </div>
-                                                <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                                    <Input
-                                                        size="small"
-                                                        placeholder="Add KPI title"
-                                                        value={kpiDrafts[tableName] || ''}
-                                                        onChange={(e) => setKpiDrafts((prev) => ({ ...prev, [tableName]: e.target.value }))}
-                                                        onPressEnter={() => addKpi(tableName)}
-                                                    />
-                                                    <Button size="small" onClick={() => addKpi(tableName)}>Add</Button>
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {schemaData.tableInsights[tableName]?.dataMatrix && (
-                                            <div>
-                                                <Text strong type="secondary">DATA MATRIX</Text>
-                                                <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                    <Tag color="default" style={{ margin: 0 }}>
-                                                        Rows: {schemaData.tableInsights[tableName].dataMatrix.rowCount ?? 0}
-                                                    </Tag>
-                                                    <Tag color="default" style={{ margin: 0 }}>
-                                                        Numeric: {schemaData.tableInsights[tableName].dataMatrix.columnCounts.numeric}
-                                                    </Tag>
-                                                    <Tag color="default" style={{ margin: 0 }}>
-                                                        Temporal: {schemaData.tableInsights[tableName].dataMatrix.columnCounts.temporal}
-                                                    </Tag>
-                                                    <Tag color="default" style={{ margin: 0 }}>
-                                                        Text: {schemaData.tableInsights[tableName].dataMatrix.columnCounts.text}
-                                                    </Tag>
-                                                </div>
-                                                <div style={{ marginTop: 10 }}>
-                                                    <Text type="secondary" style={{ fontSize: 12 }}>Categorical Columns</Text>
-                                                    <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                        {schemaData.tableInsights[tableName].dataMatrix.categoricalCandidates.map((c: any, idx: number) => (
-                                                            <Tag
-                                                                key={`${tableName}-cat-${c.column}-${idx}`}
-                                                                color="default"
-                                                                style={{ margin: 0 }}
-                                                                closable
-                                                                closeIcon={<span style={{ fontSize: 12, marginLeft: 4 }}>×</span>}
-                                                                onClose={(e) => {
-                                                                    e.preventDefault();
-                                                                    removeCategorical(tableName, c.column);
-                                                                }}
-                                                            >
-                                                                {c.column}
-                                                            </Tag>
-                                                        ))}
-                                                    </div>
-                                                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                                        <Input
-                                                            size="small"
-                                                            placeholder="Add categorical column"
-                                                            value={catDrafts[tableName] || ''}
-                                                            onChange={(e) => setCatDrafts((prev) => ({ ...prev, [tableName]: e.target.value }))}
-                                                            onPressEnter={() => addCategorical(tableName)}
-                                                        />
-                                                        <Button size="small" onClick={() => addCategorical(tableName)}>Add</Button>
-                                                    </div>
-                                                </div>
-                                                <div style={{ marginTop: 12 }}>
-                                                    <Text type="secondary" style={{ fontSize: 12 }}>Numeric Columns</Text>
-                                                    <div style={{ marginTop: 6, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
-                                                        {schemaData.tableInsights[tableName].dataMatrix.numericCandidates.map((c: any, idx: number) => (
-                                                            <Tag
-                                                                key={`${tableName}-num-${c.column}-${idx}`}
-                                                                color="default"
-                                                                style={{ margin: 0 }}
-                                                                closable
-                                                                closeIcon={<span style={{ fontSize: 12, marginLeft: 4 }}>×</span>}
-                                                                onClose={(e) => {
-                                                                    e.preventDefault();
-                                                                    removeNumeric(tableName, c.column);
-                                                                }}
-                                                            >
-                                                                {c.column}
-                                                            </Tag>
-                                                        ))}
-                                                    </div>
-                                                    <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
-                                                        <Input
-                                                            size="small"
-                                                            placeholder="Add numeric column"
-                                                            value={numDrafts[tableName] || ''}
-                                                            onChange={(e) => setNumDrafts((prev) => ({ ...prev, [tableName]: e.target.value }))}
-                                                            onPressEnter={() => addNumeric(tableName)}
-                                                        />
-                                                        <Button size="small" onClick={() => addNumeric(tableName)}>Add</Button>
-                                                    </div>
-                                                </div>
-                                            </div>
-                                        )}
-
-                                        {/* Query Examples with Results */}
-                                        {schemaData.tableInsights[tableName]?.queryExamples && schemaData.tableInsights[tableName].queryExamples.length > 0 && (
-                                            <div style={{ marginTop: 16, padding: '12px', borderRadius: 8, background: 'rgba(19, 91, 236, 0.05)', border: '1px solid rgba(19, 91, 236, 0.2)' }}>
-                                                <Text strong type="secondary" style={{ fontSize: 12, display: 'flex', alignItems: 'center', gap: 6 }}>
-                                                    <span style={{ fontSize: 14 }}>🧪</span>
-                                                    Query Examples (Executed)
-                                                </Text>
-                                                <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                                                    {schemaData.tableInsights[tableName].queryExamples.slice(0, 5).map((example: any, idx: number) => (
-                                                        <details key={`query-${idx}`} style={{ borderRadius: 6, overflow: 'hidden', background: 'rgba(0,0,0,0.2)' }}>
-                                                            <summary style={{ cursor: 'pointer', padding: '8px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                                                                    <Tag color={example.error ? 'red' : 'green'} style={{ margin: 0, fontSize: 10 }}>
-                                                                        {example.error ? '✗' : '✓'}
-                                                                    </Tag>
-                                                                    <Text style={{ fontSize: 11 }}>{example.description}</Text>
-                                                                </div>
-                                                                {example.executionTime && (
-                                                                    <Text type="secondary" style={{ fontSize: 10 }}>
-                                                                        {example.executionTime}ms
-                                                                    </Text>
-                                                                )}
-                                                            </summary>
-                                                            <div style={{ padding: '8px 10px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
-                                                                <Text code style={{ fontSize: 10, display: 'block', padding: '6px', background: 'rgba(0,0,0,0.3)', borderRadius: 4, marginBottom: 8, overflow: 'auto' }}>
-                                                                    {example.sql}
-                                                                </Text>
-                                                                
-                                                                    {example.error ? (
-                                                                        <Alert message={example.error} type="error" style={{ fontSize: 10 }} />
-                                                                    ) : example.results && example.results.length > 0 ? (
-                                                                    <div style={{ marginTop: 6 }}>
-                                                                        <Text type="secondary" style={{ fontSize: 10, display: 'block', marginBottom: 4 }}>
-                                                                            Results ({example.results.length} rows):
-                                                                        </Text>
-                                                                        <div style={{ maxHeight: 120, overflow: 'auto' }}>
-                                                                            <Table
-                                                                                size="small"
-                                                                                pagination={false}
-                                                                                dataSource={example.results.map((row: any, ridx: number) => ({ ...row, key: ridx }))}
-                                                                                columns={Object.keys(example.results[0] || {}).map((key) => ({
-                                                                                    title: key,
-                                                                                    dataIndex: key,
-                                                                                    key: key,
-                                                                                    render: (val: any) => (
-                                                                                        <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10 }}>
-                                                                                            {String(val)}
-                                                                                        </div>
-                                                                                    )
-                                                                                }))}
-                                                                            />
-                                                                        </div>
-                                                                    </div>
-                                                                ) : (
-                                                                    <Text type="secondary" style={{ fontSize: 10 }}>No results</Text>
-                                                                )}
-                                                            </div>
-                                                        </details>
-                                                    ))}
-                                                </div>
-                                            </div>
-                                        )}
-
-                                    </div>
-                                )}
-
-                                {rawSchemaData?.schemaInfo?.[tableName]?.columns?.length > 0 && (
-                                    <div style={{ marginBottom: 16 }}>
-                                        <details style={{ marginTop: 4 }} className="group">
-                                            <summary style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
-                                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                                    <span className="material-symbols-outlined text-[16px] text-slate-400 group-open:rotate-180 transition-transform">expand_more</span>
-                                                    <Text strong type="secondary">Column Controls</Text>
-                                                </div>
-                                                <Button size="small" onClick={(e) => { e.preventDefault(); showAllColumns(tableName, rawSchemaData.schemaInfo[tableName].columns); }}>
-                                                    Show all
-                                                </Button>
+                                    {/* ── Column Profiles ─── */}
+                                    {columnProfiles.length > 0 && (
+                                        <details style={{ marginBottom: 12 }}>
+                                            <summary style={{ cursor: 'pointer', padding: '6px 0', display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                <ThunderboltOutlined style={{ color: '#6366f1', fontSize: 12 }} />
+                                                <Text strong type="secondary" style={{ fontSize: 11 }}>COLUMN PROFILES ({columnProfiles.length})</Text>
                                             </summary>
-                                            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 8 }}>
-                                                {rawSchemaData.schemaInfo[tableName].columns.map((col: any, idx: number) => {
-                                                    const name = col?.name || col?.column_name;
-                                                    const toggles = getColumnToggle(tableName, name);
-                                                    return (
-                                                        <div key={`${tableName}-col-${name}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 12, padding: '6px 8px', borderRadius: 8, background: 'rgba(255,255,255,0.03)' }}>
-                                                            <div style={{ flex: 1, display: 'flex', flexDirection: 'column' }}>
-                                                                <Text style={{ fontSize: 12 }}>{name}</Text>
-                                                                <Text type="secondary" style={{ fontSize: 11 }}>{col.type || col.data_type}</Text>
+                                            <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                                {columnProfiles.map((cp, idx) => (
+                                                    <div key={idx} style={{ padding: '8px 10px', borderRadius: 8, background: 'rgba(255,255,255,0.02)', border: '1px solid rgba(255,255,255,0.06)' }}>
+                                                        <div style={{ display: 'flex', alignItems: 'center', justifyContent: 'space-between', marginBottom: 4 }}>
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                                <Text style={{ fontSize: 12, fontWeight: 600 }}>{cp.name}</Text>
+                                                                {renderRoleBadge(cp.role)}
+                                                                <Text type="secondary" style={{ fontSize: 10 }}>{cp.type}</Text>
                                                             </div>
-                                                            <div style={{ display: 'flex', alignItems: 'center', gap: 10 }}>
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                                                    <Text type="secondary" style={{ fontSize: 11 }}>Show</Text>
-                                                                    <span className="material-symbols-outlined text-[16px] text-slate-400">{toggles.show ? 'visibility' : 'visibility_off'}</span>
-                                                                    <Switch
-                                                                        size="small"
-                                                                        checked={toggles.show}
-                                                                        onChange={(checked) => updateColumnToggle(tableName, name, 'show', checked)}
-                                                                    />
-                                                                </div>
-                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
-                                                                    <Text type="secondary" style={{ fontSize: 11 }}>Filterable</Text>
-                                                                    <span className="material-symbols-outlined text-[16px] text-slate-400">{toggles.filterable ? 'filter_alt' : 'filter_alt_off'}</span>
-                                                                    <Switch
-                                                                        size="small"
-                                                                        checked={toggles.filterable}
-                                                                        onChange={(checked) => updateColumnToggle(tableName, name, 'filterable', checked)}
-                                                                    />
-                                                                </div>
+                                                            <div style={{ display: 'flex', gap: 4 }}>
+                                                                {cp.qualityFlags.map(f => (
+                                                                    <Tooltip key={f} title={f.replace(/_/g, ' ')}>
+                                                                        <span style={{
+                                                                            fontSize: 9, padding: '1px 4px', borderRadius: 3,
+                                                                            background: f === 'potential_pii' ? 'rgba(239,68,68,0.2)' : 'rgba(245,158,11,0.2)',
+                                                                            border: f === 'potential_pii' ? '1px solid rgba(239,68,68,0.4)' : '1px solid rgba(245,158,11,0.4)',
+                                                                            color: f === 'potential_pii' ? '#ef4444' : '#f59e0b'
+                                                                        }}>
+                                                                            {f === 'potential_pii' ? '\u{1F512}' : f === 'high_nulls' ? '\u26a0' : '\u2691'}
+                                                                        </span>
+                                                                    </Tooltip>
+                                                                ))}
                                                             </div>
                                                         </div>
-                                                    );
-                                                })}
+                                                        <div style={{ display: 'grid', gridTemplateColumns: '1fr 1fr', gap: '4px 16px' }}>
+                                                            <div>
+                                                                <Text type="secondary" style={{ fontSize: 10 }}>Null rate</Text>
+                                                                {renderNullBar(cp.nullRate)}
+                                                            </div>
+                                                            <div>
+                                                                <Text type="secondary" style={{ fontSize: 10 }}>Cardinality</Text>
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                                                    <Text style={{ fontSize: 10 }}>{cp.cardinality}</Text>
+                                                                    {cp.isHighCardinality && <Tag style={{ fontSize: 9, padding: '0 4px', margin: 0, background: 'rgba(99,102,241,0.15)', border: '1px solid rgba(99,102,241,0.3)', color: '#6366f1' }}>high</Tag>}
+                                                                    {cp.isConstant && <Tag color="warning" style={{ fontSize: 9, padding: '0 4px', margin: 0 }}>const</Tag>}
+                                                                </div>
+                                                            </div>
+                                                            {cp.mean !== undefined && (
+                                                                <>
+                                                                    <div>
+                                                                        <Text type="secondary" style={{ fontSize: 10 }}>Min / Max</Text>
+                                                                        <Text style={{ fontSize: 10 }}>{cp.min?.toLocaleString()} \u2014 {cp.max?.toLocaleString()}</Text>
+                                                                    </div>
+                                                                    <div>
+                                                                        <Text type="secondary" style={{ fontSize: 10 }}>Mean \u00b1 StdDev</Text>
+                                                                        <Text style={{ fontSize: 10 }}>
+                                                                            {cp.mean?.toFixed(2)} \u00b1 {cp.stddev?.toFixed(2)}
+                                                                            {cp.isSkewed && <span style={{ color: '#f59e0b', marginLeft: 4 }}>\u2197 skew</span>}
+                                                                        </Text>
+                                                                    </div>
+                                                                </>
+                                                            )}
+                                                        </div>
+                                                        {cp.topValues.length > 0 && !cp.isHighCardinality && (
+                                                            <div style={{ marginTop: 6 }}>
+                                                                <Text type="secondary" style={{ fontSize: 10 }}>Top values: </Text>
+                                                                {cp.topValues.slice(0, 3).map((tv, vi) => (
+                                                                    <Tooltip key={vi} title={`${tv.count}\u00d7 (${tv.pct}%)`}>
+                                                                        <Tag style={{ fontSize: 9, padding: '0 5px', margin: '0 3px 0 0', background: 'rgba(255,255,255,0.04)', border: '1px solid rgba(255,255,255,0.1)' }}>
+                                                                            {tv.value.substring(0, 18)}{tv.value.length > 18 ? '\u2026' : ''} \u00b7 {tv.pct}%
+                                                                        </Tag>
+                                                                    </Tooltip>
+                                                                ))}
+                                                            </div>
+                                                        )}
+                                                    </div>
+                                                ))}
                                             </div>
                                         </details>
-                                    </div>
-                                )}
+                                    )}
 
-                                <Divider style={{ margin: '12px 0' }} />
+                                    {/* ── Suggested KPIs ─── */}
+                                    {insight?.kpis && (
+                                        <div style={{ marginBottom: 12 }}>
+                                            <Text strong type="secondary" style={{ fontSize: 11 }}>SUGGESTED KPIS</Text>
+                                            <div style={{ marginTop: 8, display: 'flex', flexWrap: 'wrap', gap: 8 }}>
+                                                {insight.kpis.map((kpi: any) => (
+                                                    <Tooltip key={`${tableName}-kpi-${kpi.id}`} title={kpi.description}>
+                                                        <Tag color="blue" style={{ margin: 0 }} closable closeIcon={<span style={{ fontSize: 12, marginLeft: 4 }}>\u00d7</span>} onClose={(e) => { e.preventDefault(); removeKpi(tableName, kpi.title); }}>
+                                                            {kpi.title}
+                                                        </Tag>
+                                                    </Tooltip>
+                                                ))}
+                                            </div>
+                                            <div style={{ display: 'flex', gap: 8, marginTop: 8 }}>
+                                                <Input size="small" placeholder="Add KPI title" value={kpiDrafts[tableName] || ''} onChange={(e) => setKpiDrafts((prev) => ({ ...prev, [tableName]: e.target.value }))} onPressEnter={() => addKpi(tableName)} />
+                                                <Button size="small" onClick={() => addKpi(tableName)}>Add</Button>
+                                            </div>
+                                        </div>
+                                    )}
 
-                                <div>
-                                    <Text strong type="secondary">SAMPLES (LAST 5)</Text>
-                                    <div style={{ marginTop: 8, overflowX: 'auto' }}>
-                                        <Table
-                                            size="small"
-                                            pagination={false}
-                                            dataSource={schemaData.sampleData[tableName]?.map((row: any, idx: number) => {
-                                                const { __rowKey, ...rest } = row || {};
-                                                return { ...rest, __rowKey: __rowKey || `row-${idx}` };
-                                            })}
-                                            columns={(schemaData.visibleColumns?.[tableName] || Object.keys(schemaData.sampleData[tableName]?.[0] || {}))
-                                                .filter((key: string) => key !== '__rowKey')
-                                                .map((key: string) => ({
-                                                    title: key,
-                                                    dataIndex: key,
-                                                    key: key,
-                                                    render: (val: any) => (
-                                                        <div style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                                                            {String(val)}
+                                    {/* ── Query Examples ─── */}
+                                    {insight?.queryExamples && insight.queryExamples.length > 0 && (
+                                        <div style={{ marginBottom: 12, padding: '12px', borderRadius: 8, background: 'rgba(19, 91, 236, 0.05)', border: '1px solid rgba(19, 91, 236, 0.2)' }}>
+                                            <Text strong type="secondary" style={{ fontSize: 11, display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                Query Examples (Executed)
+                                            </Text>
+                                            <div style={{ marginTop: 10, display: 'flex', flexDirection: 'column', gap: 8 }}>
+                                                {insight.queryExamples.slice(0, 5).map((example: any, idx: number) => (
+                                                    <details key={`query-${idx}`} style={{ borderRadius: 6, overflow: 'hidden', background: 'rgba(0,0,0,0.2)' }}>
+                                                        <summary style={{ cursor: 'pointer', padding: '8px 10px', display: 'flex', alignItems: 'center', justifyContent: 'space-between', fontSize: 11 }}>
+                                                            <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                                <Tag color={example.error ? 'red' : 'green'} style={{ margin: 0, fontSize: 10 }}>{example.error ? 'X' : 'OK'}</Tag>
+                                                                <Text style={{ fontSize: 11 }}>{example.description}</Text>
+                                                            </div>
+                                                            {example.executionTime && <Text type="secondary" style={{ fontSize: 10 }}>{example.executionTime}ms</Text>}
+                                                        </summary>
+                                                        <div style={{ padding: '8px 10px', borderTop: '1px solid rgba(255,255,255,0.05)' }}>
+                                                            <Text code style={{ fontSize: 10, display: 'block', padding: '6px', background: 'rgba(0,0,0,0.3)', borderRadius: 4, marginBottom: 8, overflow: 'auto' }}>
+                                                                {example.sql}
+                                                            </Text>
+                                                            {example.error ? (
+                                                                <Alert title={example.error} type="error" style={{ fontSize: 10 }} />
+                                                            ) : example.results && example.results.length > 0 ? (
+                                                                <div style={{ maxHeight: 120, overflow: 'auto' }}>
+                                                                    <Table size="small" pagination={false}
+                                                                        dataSource={example.results.map((row: any, ridx: number) => ({ ...row, key: ridx }))}
+                                                                        columns={Object.keys(example.results[0] || {}).map((key) => ({
+                                                                            title: key, dataIndex: key, key,
+                                                                            render: (val: any) => <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 10 }}>{String(val)}</div>
+                                                                        }))}
+                                                                    />
+                                                                </div>
+                                                            ) : (
+                                                                <Text type="secondary" style={{ fontSize: 10 }}>No results</Text>
+                                                            )}
                                                         </div>
-                                                    )
-                                                }))}
-                                            rowKey="__rowKey"
-                                        />
+                                                    </details>
+                                                ))}
+                                            </div>
+                                        </div>
+                                    )}
+
+                                    {/* ── Column Controls ─── */}
+                                    {rawSchemaData?.schemaInfo?.[tableName]?.columns?.length > 0 && (
+                                        <div style={{ marginBottom: 12 }}>
+                                            <details>
+                                                <summary style={{ cursor: 'pointer', display: 'flex', alignItems: 'center', justifyContent: 'space-between' }}>
+                                                    <Text strong type="secondary" style={{ fontSize: 11 }}>COLUMN CONTROLS</Text>
+                                                    <Button size="small" onClick={(e) => { e.preventDefault(); showAllColumns(tableName, rawSchemaData.schemaInfo[tableName].columns); }}>Show all</Button>
+                                                </summary>
+                                                <div style={{ marginTop: 8, display: 'flex', flexDirection: 'column', gap: 6 }}>
+                                                    {rawSchemaData.schemaInfo[tableName].columns.map((col: any, idx: number) => {
+                                                        const colName = col?.name || col?.column_name;
+                                                        const toggles = getColumnToggle(tableName, colName, columnToggles, {
+                                                            show: true,
+                                                            filterable: isDefaultFilterableColumn(tableName, colName, rawSchemaData.schemaInfo[tableName].columns)
+                                                        });
+                                                        const profile = columnProfiles.find(p => p.name === colName);
+                                                        return (
+                                                            <div key={`${tableName}-col-${colName}-${idx}`} style={{ display: 'flex', alignItems: 'center', gap: 10, padding: '5px 8px', borderRadius: 7, background: 'rgba(255,255,255,0.02)' }}>
+                                                                <div style={{ flex: 1, display: 'flex', flexDirection: 'column', gap: 2 }}>
+                                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 6 }}>
+                                                                        <Text style={{ fontSize: 12 }}>{colName}</Text>
+                                                                        {profile && renderRoleBadge(profile.role)}
+                                                                    </div>
+                                                                    <Text type="secondary" style={{ fontSize: 10 }}>{col.type || col.data_type}</Text>
+                                                                </div>
+                                                                <div style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
+                                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                                                        <Text type="secondary" style={{ fontSize: 10 }}>Show</Text>
+                                                                        <Switch size="small" checked={toggles.show} onChange={(checked) => updateColumnToggle(tableName, colName, 'show', checked)} />
+                                                                    </div>
+                                                                    <div style={{ display: 'flex', alignItems: 'center', gap: 4 }}>
+                                                                        <Text type="secondary" style={{ fontSize: 10 }}>Filter</Text>
+                                                                        <Switch size="small" checked={toggles.filterable} onChange={(checked) => updateColumnToggle(tableName, colName, 'filterable', checked)} />
+                                                                    </div>
+                                                                </div>
+                                                            </div>
+                                                        );
+                                                    })}
+                                                </div>
+                                            </details>
+                                        </div>
+                                    )}
+
+                                    <Divider style={{ margin: '10px 0' }} />
+
+                                    {/* ── Sample Data ─── */}
+                                    <div>
+                                        <Text strong type="secondary" style={{ fontSize: 11 }}>SAMPLES (LAST 10)</Text>
+                                        <div style={{ marginTop: 8, overflowX: 'auto' }}>
+                                            <Table
+                                                size="small"
+                                                pagination={false}
+                                                dataSource={schemaData.sampleData[tableName]?.map((row: any, idx: number) => {
+                                                    const { __rowKey, ...rest } = row || {};
+                                                    return { ...rest, __rowKey: __rowKey || `row-${idx}` };
+                                                })}
+                                                columns={(() => {
+                                                    const controlsOrder = (rawSchemaData?.schemaInfo?.[tableName]?.columns || [])
+                                                        .map((col: any) => col?.name || col?.column_name)
+                                                        .filter(Boolean);
+                                                    const visible = (schemaData.visibleColumns?.[tableName] || controlsOrder)
+                                                        .filter((key: string) => key !== '__rowKey');
+                                                    const ordered = [
+                                                        ...controlsOrder.filter((key: string) => visible.includes(key)),
+                                                        ...visible.filter((key: string) => !controlsOrder.includes(key))
+                                                    ];
+                                                    return ordered.map((key: string) => ({
+                                                        title: key, dataIndex: key, key,
+                                                        render: (val: any) => (
+                                                            <div style={{ maxWidth: 120, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
+                                                                {String(val)}
+                                                            </div>
+                                                        )
+                                                    }));
+                                                })()}
+                                                rowKey="__rowKey"
+                                            />
+                                        </div>
                                     </div>
-                                </div>
-                            </Card>
-                        ))}
+                                </Card>
+                            );
+                        })}
                     </div>
                 </div>
             )}

@@ -25,7 +25,7 @@ export interface PlanStep {
     status: 'pending' | 'processing' | 'completed';
 }
 
-export type ConnectionStatus = 'Connected' | 'Auth Error' | 'Disconnected' | 'Pending';
+export type ConnectionStatus = 'Connected' | 'Auth Error' | 'Disconnected' | 'Pending' | 'Error' | 'Connecting';
 
 export interface DataSource {
     id: string;

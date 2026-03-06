@@ -146,5 +146,5 @@ export const ACTIVE_CONNECTIONS: DataSource[] = [
 export const AVAILABLE_INTEGRATIONS: Integration[] = [
     { id: 'int_mcp', name: 'MCP Agent', icon: 'smart_toy', description: 'Model Context Protocol' },
     { id: 'int1', name: 'PostgreSQL', icon: 'database', description: 'Relational Database' },
-    { id: 'int2', name: 'MSSQL', icon: 'database', description: 'SQL Server Database' }
+    { id: 'int2', name: 'MSSQL', icon: 'database', description: 'MSSQL' }
 ];

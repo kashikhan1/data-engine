@@ -42,6 +42,7 @@ export const DashboardLayoutSchema = z.object({
 export const QueryPlanSchema = z.object({
     title: z.string().optional(),
     actionable_plan: z.string().optional(),
+    rawPlan: z.string().optional(),
     intent: z.string().optional(),
     entities: z.array(z.string()).optional(),
     timeRange: z.object({
@@ -59,6 +60,13 @@ export const QueryPlanSchema = z.object({
         metrics: z.array(z.string()).optional(),
         dimensions: z.array(z.string()).optional(),
     })),
+    filters: z.array(z.object({
+        id: z.string().optional(),
+        dimension: z.string(),
+        label: z.string().optional(),
+        type: z.string().optional(),
+        value: z.any().optional(),
+    })).optional(),
 });
 
 export const IntentSchema = z.object({

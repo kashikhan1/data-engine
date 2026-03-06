@@ -1,11 +1,11 @@
 "use client";
 
-import React, { useState, useRef, useEffect, useMemo } from "react";
-import { Send, Sparkles, Lightbulb, History, X, ChevronLeft, ChevronDown, ChevronUp, LayoutDashboard, MessageSquare, FileBarChart, Database, Table2, AlertCircle, CheckCircle2, Loader2, FileText, TrendingUp, ChevronRight } from "lucide-react";
+import React, { useState, useRef, useEffect, useMemo, useCallback } from "react";
+import { Send, Sparkles, Lightbulb, History, X, ChevronLeft, ChevronDown, ChevronUp, LayoutDashboard, MessageSquare, FileBarChart, Database, Table2, AlertCircle, CheckCircle2, FileText, TrendingUp, ChevronRight } from "lucide-react";
 import { motion, AnimatePresence } from "framer-motion";
 import { useRunStore, useDashboardStore, useConfigStore, useWorkflowStore, useUIStore } from "@/state/stores";
-import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from "@/lib/agents/nodes";
-import { runSchemaDiscovery } from "@/lib/agents/schema-discovery";
+import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from "@/modules/sql/agent";
+import { runSchemaDiscovery } from "@/modules/schema/agent";
 import { buildExecutionContext as buildSharedExecutionContext } from "@/lib/execution-context";
 import { getPaginationForId } from "@/lib/pagination";
 import { AgentTimeline } from "./AgentTimeline";
@@ -29,6 +29,7 @@ interface QAResult {
     rowCount: number;
     repaired?: boolean;
     error?: string;
+    narrative?: string;
 }
 
 interface ReportSection {
@@ -40,6 +41,7 @@ interface ReportSection {
     columns: string[];
     rowCount: number;
     error?: string;
+    narrative?: string;
 }
 
 interface ReportResult {
@@ -52,6 +54,21 @@ interface ReportResult {
     question: string;
 }
 
+type PlannerDebugPayload = {
+    plannerAgents?: string | null;
+    plannerAgentStatus?: Record<string, "start" | "done" | "error">;
+    agentInputs?: Record<string, string>;
+    agentStreams?: Record<string, string>;
+    agentDrafts?: Record<string, string>;
+    agentOrder?: string[];
+    intentLabels?: string[];
+    selectedAgent?: string | null;
+};
+const PLANNER_DEBUG_STORAGE_KEY = "planner_debug_outputs_v1";
+const PLANNER_DEBUG_STORAGE_VERSION = 2;
+
+type PipelineStage = "schema" | "plan" | "sql" | "execute" | "dashboard";
+
 const SUGGESTION_CHIPS: Record<ChatMode, string[]> = {
     dashboard: [
         "Show revenue by country for last month",
@@ -61,18 +78,24 @@ const SUGGESTION_CHIPS: Record<ChatMode, string[]> = {
         "Compare Q3 vs Q4 revenue",
     ],
     chat: [
-        "How many orders were placed today?",
-        "What are the top 5 customers by revenue?",
-        "Show all products with low stock",
+        "How many orders placed today?",
+        "Top 5 customers by revenue this month",
+        "Which products have low stock right now?",
         "Average order value per category",
-        "List recent transactions",
+        "List the 10 most recent transactions",
+        "How many new customers signed up this week?",
+        "What is the total revenue for this month so far?",
+        "Which categories had the most returns?",
     ],
     report: [
         "Monthly sales performance report",
-        "Customer acquisition analysis",
-        "Inventory health overview",
+        "Customer acquisition and churn analysis",
+        "Inventory health and stock-out risks",
         "Revenue breakdown by region and product",
-        "User engagement summary for this quarter",
+        "Top customers by lifetime value",
+        "Sales rep performance summary this quarter",
+        "Product profitability and margin analysis",
+        "Weekly order volume and fulfillment trends",
     ],
 };
 
@@ -101,6 +124,32 @@ interface ChatPanelProps {
     onCollapse?: () => void;
 }
 
+const ensurePlanWidgets = (widgets: any[] | undefined, schemaLike: any): any[] => {
+    if (Array.isArray(widgets) && widgets.length > 0) return widgets;
+    const schemaInfo = schemaLike?.schemaInfo || {};
+    const firstTable = Object.keys(schemaInfo)[0] || "unknown_table";
+    return [
+        {
+            id: "w1",
+            type: "kpi",
+            title: "Total Records",
+            goal: "COUNT(*)",
+            primaryTable: firstTable,
+            requiredTables: [firstTable],
+            uses: `${firstTable}.*`,
+        },
+        {
+            id: "w2",
+            type: "table",
+            title: "Sample Rows",
+            goal: "Inspect detailed rows",
+            primaryTable: firstTable,
+            requiredTables: [firstTable],
+            uses: `${firstTable}.*`,
+        }
+    ];
+};
+
 export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const [input, setInput] = useState("");
     const [chatMode, setChatMode] = useState<ChatMode>('dashboard');
@@ -118,6 +167,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const [showSuggestions, setShowSuggestions] = useState(true);
     const [showHistory, setShowHistory] = useState(false);
     const [awaitingSqlContinue, setAwaitingSqlContinue] = useState(false);
+    const [awaitingExecutionApprove, setAwaitingExecutionApprove] = useState(false);
+    const [followUpSuggestions, setFollowUpSuggestions] = useState<string[]>([]);
 
     const inputRef = useRef<HTMLInputElement>(null);
     const messagesEndRef = useRef<HTMLDivElement>(null);
@@ -126,6 +177,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const { recentQueries, addToRecentQueries, activeFilters, filtersActivated, setDashboard, dashboard } = useDashboardStore();
     const {
         schemaData,
+        query: workflowQuery,
+        userSchemaNotes,
         userPlan,
         aiPlan,
         userQueries,
@@ -141,7 +194,6 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setUserQueries,
         setExecutionResults,
         setDashboardConfig,
-        reset: resetWorkflow,
         setProcessing,
         isProcessing,
         currentStep,
@@ -149,7 +201,14 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setError,
         setStaleStep,
         addSqlError,
-        sqlErrorLog
+        sqlErrorLog,
+        todoListState,
+        initTodoList,
+        applyTodoItemUpdate,
+        setTodoSummary,
+        resetTodoList,
+        setPlannerLiveDebug,
+        resetPlannerLiveDebug,
     } = useWorkflowStore();
     const { setCurrentView } = useUIStore();
 
@@ -178,20 +237,41 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const [planDraft, setPlanDraft] = useState('');
     const [sqlDrafts, setSqlDrafts] = useState<Record<string, string>>({});
     const [showConnectorPicker, setShowConnectorPicker] = useState(true);
-    const [pipelineLogs, setPipelineLogs] = useState<string[]>([]);
+    const [, setPipelineLogs] = useState<string[]>([]);
     const [pipelineStageLogs, setPipelineStageLogs] = useState<{
+        schema: string[];
+        plan: string[];
         sql: string[];
         execute: string[];
         dashboard: string[];
-    }>({ sql: [], execute: [], dashboard: [] });
+    }>({ schema: [], plan: [], sql: [], execute: [], dashboard: [] });
     const [showLivePanel, setShowLivePanel] = useState(true);
     const autoRefreshTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
     const autoRefreshInFlightRef = useRef(false);
+    const appendPipelineStageLog = useCallback((stage: PipelineStage, line: string) => {
+        setPipelineStageLogs((prev) => ({
+            ...prev,
+            [stage]: [...prev[stage].slice(-99), line]
+        }));
+    }, []);
+    const appendPipelineLog = useCallback((stage: PipelineStage, line: string) => {
+        setPipelineLogs((prev) => [...prev.slice(-199), line]);
+        appendPipelineStageLog(stage, line);
+    }, [appendPipelineStageLog]);
     const connectors = (dataSources || []).filter((ds) => {
-        const type = ds.type?.toLowerCase() || "";
-        return type.includes("mcp") || type.includes("postgres") || type.includes("mssql");
+        const type = String(ds?.type || "").toLowerCase();
+        const isSqlType = type.includes("mcp") || type.includes("postgres") || type.includes("mssql") || type.includes("sql");
+        if (!isSqlType) return false;
+        const status = String(ds?.status || "").toLowerCase();
+        const hasConnection = Boolean(String(ds?.connectionString || "").trim());
+        return status === "connected" && hasConnection;
     });
-    const selectedConnector = connectors.find((ds) => ds.id === selectedDataSourceId) || null;
+    // Always prefer the explicitly-selected data source by ID, regardless of health-check status.
+    // This prevents a transient "Error" health status from falling back to the wrong database.
+    const selectedDataSourceById = (dataSources || []).find(
+        (ds) => ds.id === selectedDataSourceId && Boolean(String(ds?.connectionString || "").trim())
+    ) || null;
+    const selectedConnector = selectedDataSourceById || connectors.find((ds) => ds.id === selectedDataSourceId) || connectors[0] || null;
     const resolvedConnectionString = selectedConnector?.connectionString || postgresUrl || schemaData?.connectionString || undefined;
     const resolvedConnectorType = selectedConnector?.type || schemaData?.connectorType || "";
     const resolvedConnectorInstructions = selectedConnector?.instructions || schemaData?.connectorInstructions || "";
@@ -236,6 +316,59 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             includeTotal: true,
             allowGlobalFallback: true
         });
+    };
+    const persistPlannerDebugToLocal = (input: {
+        query: string;
+        schemaTimestamp?: string | null;
+        title?: string;
+        rawPlan?: string;
+        widgets?: any[];
+        plannerDebug?: PlannerDebugPayload;
+        plannerAgents?: string | null;
+    }) => {
+        try {
+            if (!input?.query) return;
+            const schemaKey = String(input.schemaTimestamp || schemaData?.schemaTimestamp || "");
+            const entryKey = `${input.query}::${schemaKey}`;
+            const payload = {
+                query: input.query,
+                schemaTimestamp: schemaKey || null,
+                title: input.title || "AI Analytics Dashboard",
+                rawPlan: String(input.rawPlan || ""),
+                widgets: Array.isArray(input.widgets) ? input.widgets : [],
+                plannerAgents: input.plannerAgents || null,
+                plannerDebug: input.plannerDebug || null,
+                savedAt: new Date().toISOString()
+            };
+            const raw = localStorage.getItem(PLANNER_DEBUG_STORAGE_KEY);
+            let nextStore: any = {
+                version: PLANNER_DEBUG_STORAGE_VERSION,
+                latestKey: entryKey,
+                entries: {}
+            };
+            if (raw) {
+                try {
+                    const parsed = JSON.parse(raw);
+                    if (parsed && typeof parsed === "object" && parsed.version === PLANNER_DEBUG_STORAGE_VERSION && parsed.entries) {
+                        nextStore = {
+                            version: PLANNER_DEBUG_STORAGE_VERSION,
+                            latestKey: parsed.latestKey || entryKey,
+                            entries: { ...parsed.entries }
+                        };
+                    } else if (parsed && typeof parsed === "object" && parsed.query) {
+                        const legacyKey = `${String(parsed.query)}::${String(parsed.schemaTimestamp || "")}`;
+                        nextStore.entries[legacyKey] = parsed;
+                    }
+                } catch {
+                    // ignore parse issues and overwrite with fresh structure
+                }
+            }
+            nextStore.latestKey = entryKey;
+            nextStore.entries[entryKey] = payload;
+            localStorage.setItem(PLANNER_DEBUG_STORAGE_KEY, JSON.stringify(nextStore));
+        } catch {
+            // ignore localStorage failures
+        }
     };
 
     const getExecutionWidgets = (fallback: any[] = []) => {
@@ -310,11 +443,11 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
     const runSequentialPipeline = async (query: string) => {
         const runId = `local_${Date.now()}`;
-        const startedAt = new Date().toISOString();
         startRun(runId);
         setAwaitingSqlContinue(false);
         setPipelineLogs([]);
-        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
+        setPipelineStageLogs({ schema: [], plan: [], sql: [], execute: [], dashboard: [] });
+        resetTodoList();
         setDashboardConfig(null);
         setDashboard(null);
         setIsPipelineRunning(true);
@@ -339,6 +472,18 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
         const sendStep = (step: any, status: any, message?: string) => {
             const ts = new Date().toISOString();
+            const stageLabel =
+                step === "schema" || step === "kpi" ? "Schema"
+                    : step === "plan" ? "Planner"
+                        : step === "sql" ? "SQL Engineer"
+                            : step === "execute" ? "Executor"
+                                : (step === "viz" || step === "narrative") ? "Dashboard"
+                                    : String(step);
+            const statusLabel =
+                status === "running" ? "Running"
+                    : status === "done" ? "Done"
+                        : status === "error" ? "Error"
+                            : String(status);
             handleEvent({
                 type: "step",
                 step,
@@ -353,16 +498,18 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     message,
                     ts
                 } as any);
-                setPipelineLogs((prev) => [...prev, `${String(step).toUpperCase()} [${String(status).toUpperCase()}] ${message}`]);
+                setPipelineLogs((prev) => [...prev.slice(-199), `${stageLabel}: ${statusLabel} - ${message}`]);
                 const stage =
-                    step === "sql" ? "sql"
+                    (step === "schema" || step === "kpi") ? "schema"
+                        : step === "plan" ? "plan"
+                        : step === "sql" ? "sql"
                         : step === "execute" ? "execute"
                             : (step === "viz" || step === "narrative") ? "dashboard"
                                 : null;
                 if (stage) {
                     setPipelineStageLogs((prev) => ({
                         ...prev,
-                        [stage]: [...prev[stage as "sql" | "execute" | "dashboard"], `${String(status).toUpperCase()}: ${message}`]
+                        [stage]: [...prev[stage as PipelineStage].slice(-99), `${statusLabel}: ${message}`]
                     }));
                 }
             }
@@ -372,6 +519,25 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             // Step 1: Schema discovery
             sendStep("schema", "running", "Schema discovery");
             let resolvedSchema = schemaData;
+            if (resolvedSchema && resolvedConnectionString) {
+                const cachedConn = String((resolvedSchema as any)?.connectionString || "").trim();
+                const activeConn = String(resolvedConnectionString || "").trim();
+                if (cachedConn && activeConn && cachedConn !== activeConn) {
+                    resolvedSchema = null;
+                } else {
+                    // Also invalidate if selected-tables filter changed
+                    const storedTablesRaw = localStorage.getItem('schema_selected_tables');
+                    const selectedTables: string[] = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+                    if (selectedTables.length > 0) {
+                        const cachedTables: string[] = Array.isArray((resolvedSchema as any)?.tables)
+                            ? (resolvedSchema as any).tables
+                            : Object.keys((resolvedSchema as any)?.schemaInfo || {});
+                        const sel = [...selectedTables].map(t => t.toLowerCase()).sort().join(',');
+                        const cached = [...cachedTables].map(t => t.toLowerCase()).sort().join(',');
+                        if (sel !== cached) resolvedSchema = null;
+                    }
+                }
+            }
             if (!resolvedSchema) {
                 const tryDiscover = async (attempts: number) => {
                     let lastError: any = null;
@@ -379,17 +545,20 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         try {
                             const storedTablesRaw = localStorage.getItem('schema_selected_tables');
                             const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                            if (allowedTables.length > 0 && resolvedConnectionString) {
-                                const data = await runSchemaDiscovery(resolvedConnectionString, {
-                                    enableSemanticSearch: false,
+                            if (!resolvedConnectionString) continue;
+                            const data = await runSchemaDiscovery(
+                                resolvedConnectionString,
+                                {
+                                    enableSemanticSearch: true,
                                     enableTableKpis: true,
                                     enableTableMatrix: true,
                                     enableTableFilters: true,
                                     projectContext
-                                }, allowedTables);
-                                if (data?.tables && data.tables.length > 0) return data;
-                                lastError = new Error("Schema discovery returned no tables.");
-                            }
+                                },
+                                allowedTables.length > 0 ? allowedTables : undefined
+                            );
+                            if (data?.tables && data.tables.length > 0) return data;
+                            lastError = new Error("Schema discovery returned no tables.");
                         } catch (err: any) {
                             lastError = err;
                         }
@@ -413,6 +582,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
             // Step 2: Plan
             setStep(2);
+            resetPlannerLiveDebug();
             sendStep("plan", "running", "Planning dashboard");
             setActiveOutputTab('plan');
             setShowPipelineOutput(true);
@@ -423,6 +593,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     query,
                     schema: {
                         ...resolvedSchema,
+                        userSchemaNotes,
                         disabledWidgetTypes,
                         connectorInstructions: resolvedConnectorInstructions,
                         connectorType: resolvedConnectorType,
@@ -441,6 +612,25 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             let planBuffer = '';
             let planText = '';
             let plannerAgents: string | null = null;
+            const plannerAgentStatus: Record<string, "start" | "done" | "error"> = {};
+            const agentInputs: Record<string, string> = {};
+            const agentStreams: Record<string, string> = {};
+            const agentDrafts: Record<string, string> = {};
+            const agentOrder: string[] = [];
+            const intentLabels: string[] = [];
+            let selectedAgent: string | null = null;
+            const pushPlannerLiveDebug = () => {
+                setPlannerLiveDebug({
+                    plannerAgents,
+                    plannerAgentStatus: { ...plannerAgentStatus },
+                    agentInputs: { ...agentInputs },
+                    agentStreams: { ...agentStreams },
+                    agentDrafts: { ...agentDrafts },
+                    agentOrder: [...agentOrder],
+                    intentLabels: [...intentLabels],
+                    selectedAgent
+                });
+            };
             while (true) {
                 const { done, value } = await planReader.read();
                 if (done) break;
@@ -452,7 +642,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     if (!trimmed.startsWith('data: ')) continue;
                     try {
                         const data = JSON.parse(trimmed.substring(6));
-                        if (data.chunk) {
+                        if ((data?.kind === 'chunk' || (!data?.kind && data.chunk)) && data.chunk) {
                             planText += data.chunk;
                             if (!plannerAgents && planText.includes("EVENT_STREAM:")) {
                                 const marker = "EVENT_STREAM:";
@@ -479,187 +669,148 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                             setUserPlan({
                                 title: "AI Analytics Dashboard",
                                 rawPlan: planText,
-                                widgets: []
+                                widgets: [],
+                                plannerDebug: {
+                                    plannerAgents,
+                                    plannerAgentStatus: { ...plannerAgentStatus },
+                                    agentInputs: { ...agentInputs },
+                                    agentStreams: { ...agentStreams },
+                                    agentDrafts: { ...agentDrafts },
+                                    agentOrder: [...agentOrder],
+                                    intentLabels: [...intentLabels],
+                                    selectedAgent
+                                } as PlannerDebugPayload
                             });
+                        } else if ((data?.kind === 'event' && data.event) || data?.event || data?.type) {
+                            const evt = data.event || data;
+                            if (evt?.type === 'planner_agents' && typeof evt.content === 'string') {
+                                plannerAgents = evt.content;
+                                const line = `PLAN AGENTS: ${evt.content}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'planner_agent_status' && evt.agent && evt.status) {
+                                plannerAgentStatus[evt.agent] = evt.status;
+                                if (evt.status === 'start' && !agentOrder.includes(evt.agent)) agentOrder.push(evt.agent);
+                                if (!selectedAgent && evt.agent) selectedAgent = evt.agent;
+                                const line = `PLAN ${String(evt.agent)}: ${String(evt.status).toUpperCase()}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'planner_agent_token' && evt.agent && evt.token) {
+                                agentStreams[evt.agent] = `${agentStreams[evt.agent] || ""}${evt.token}`;
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'planner_agent_input' && evt.agent) {
+                                agentInputs[evt.agent] = String(evt.content || "");
+                                if (!selectedAgent && evt.agent) selectedAgent = evt.agent;
+                                if (!agentOrder.includes(evt.agent)) agentOrder.push(evt.agent);
+                                const preview = String(evt.content || "").replace(/\s+/g, " ").trim().slice(0, 180);
+                                const line = `PLAN ${String(evt.agent)} INPUT: ${preview || "INPUT READY"}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'planner_agent_draft' && evt.agent) {
+                                agentDrafts[evt.agent] = String(evt.content || "");
+                                if (!selectedAgent && evt.agent) selectedAgent = evt.agent;
+                                const preview = String(evt.content || "").replace(/\s+/g, " ").trim().slice(0, 180);
+                                const line = `PLAN ${String(evt.agent)}: ${preview || "DRAFT READY"}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'planner_intents' && Array.isArray(evt.intents)) {
+                                intentLabels.splice(0, intentLabels.length, ...evt.intents.map((x: any) => String(x)));
+                                const line = `PLAN INTENTS: ${evt.intents.map((x: any) => String(x)).join(", ")}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                                pushPlannerLiveDebug();
+                            }
+                            if (evt?.type === 'todo_list_initialized' && evt.todoList) {
+                                initTodoList(evt.todoList);
+                                const line = `TODO INIT: ${(evt.todoList?.items || []).length || 0} items`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                            }
+                            if (evt?.type === 'todo_item_updated' && evt.item) {
+                                applyTodoItemUpdate(evt.item);
+                                const line = `TODO ${String(evt.item.domain).toUpperCase()}: ${evt.item.title} -> ${evt.item.status}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                            }
+                            if (evt?.type === 'todo_summary' && evt.summary) {
+                                setTodoSummary(evt.summary);
+                            }
+                            if (evt?.type === 'planner_schema_usage') {
+                                const line = `PLAN SCHEMA INPUT: ${evt.tables || 0} tables, ${evt.columns || 0} columns (${evt.visibleColumns || 0} visible, ${evt.hiddenColumns || 0} hidden), ${evt.relationships || 0} relationships`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                            }
+                            if (evt?.type === 'planner_error') {
+                                const line = `PLAN ERROR: ${String(evt.message || "Planner failed")}`;
+                                setPipelineLogs((prev) => [...prev.slice(-199), line]);
+                                setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), line] }));
+                            }
                         }
                     } catch {
                         // ignore malformed chunks
                     }
                 }
             }
-            const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
+            const { extractDashboardTitle, parseNaturalLanguagePlan, parsePlanFilters } = await import('@/utils/plan-parser');
             const cleanedPlanText = planText.split("EVENT_STREAM:")[0]?.trim() || planText.trim();
             const allowedTypes = new Set(["kpi", "line", "area", "bar", "pie", "donut", "table", "cohort", "funnel", "map", "scatter", "markdown"]);
             (disabledWidgetTypes || []).forEach((t) => allowedTypes.delete(t));
-            const buildFilteredPlanText = (title: string, widgets: any[]) => {
-                const lines: string[] = [];
-                lines.push(`DASHBOARD TITLE: ${title || "AI Analytics Dashboard"}`);
-                lines.push("PURPOSE: Auto-generated plan based on enabled widget types.");
-                lines.push("");
-                lines.push("FILTERS TO INCLUDE:");
-                lines.push("1) None");
-                lines.push("");
-                widgets.forEach((w: any, idx: number) => {
-                    const widgetTitle = String(w?.title || `Widget ${idx + 1}`).trim();
-                    const widgetType = String(w?.type || "chart").trim();
-                    const goal = String(w?.goal || "Visualization").trim();
-                    lines.push(`WIDGET ${idx + 1}: ${widgetType} - ${widgetTitle}`);
-                    lines.push(`Shows: ${goal}`);
-                    lines.push("Why: Enabled widget type per settings.");
-                    lines.push("Uses: Not specified.");
-                    lines.push("Filters applied: None.");
-                    lines.push("Notes: Filtered to enabled widget types.");
-                    lines.push("");
-                });
-                return lines.join("\n").trim();
-            };
             const parsedWidgets = parseNaturalLanguagePlan(cleanedPlanText).filter((w: any) => allowedTypes.has(w?.type));
+            const safeWidgets = ensurePlanWidgets(parsedWidgets, resolvedSchema);
             const title = extractDashboardTitle(cleanedPlanText) || "AI Analytics Dashboard";
-            const normalizedPlanText = (disabledWidgetTypes || []).length > 0
-                ? buildFilteredPlanText(title, parsedWidgets)
-                : cleanedPlanText;
             const finalizedPlan = {
                 title,
                 rawPlan: plannerAgents
-                    ? `${normalizedPlanText}\n\nEVENT_STREAM:\n{"type":"planner_agents","content":"${plannerAgents}"}`
-                    : normalizedPlanText,
-                widgets: parsedWidgets,
-                plannerAgents
+                    ? `${cleanedPlanText}\n\nEVENT_STREAM:\n{"type":"planner_agents","content":"${plannerAgents}"}`
+                    : cleanedPlanText,
+                widgets: safeWidgets,
+                filters: parsePlanFilters(cleanedPlanText),
+                plannerAgents,
+                plannerDebug: {
+                    plannerAgents,
+                    plannerAgentStatus,
+                    agentInputs,
+                    agentStreams,
+                    agentDrafts,
+                    agentOrder,
+                    intentLabels,
+                    selectedAgent
+                } as PlannerDebugPayload
             };
+            setPlannerLiveDebug(finalizedPlan.plannerDebug as PlannerDebugPayload);
+            persistPlannerDebugToLocal({
+                query,
+                schemaTimestamp: schemaData?.schemaTimestamp || null,
+                title: finalizedPlan.title,
+                rawPlan: finalizedPlan.rawPlan,
+                widgets: finalizedPlan.widgets,
+                plannerAgents,
+                plannerDebug: finalizedPlan.plannerDebug as PlannerDebugPayload
+            });
             setAiPlan(finalizedPlan);
             setUserPlan(finalizedPlan);
             sendStep("plan", "done", "Plan ready");
-            setAwaitingSqlContinue(false);
+            setAwaitingSqlContinue(true);
             setActiveOutputTab('plan');
             setShowPipelineOutput(true);
             setCurrentView("build");
 
-            // Step 3: SQL generation
-            setStep(3);
-            sendStep("sql", "running", "Generating SQL");
-            const sqlResponse = await fetch('/api/sql/stream', {
-                method: 'POST',
-                headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify({
-                    plan: finalizedPlan,
-                    schema: resolvedSchema,
-                    filters: Object.fromEntries(activeFilters),
-                    applyFilters: filtersActivated,
-                    errorLog: sqlErrorLog,
-                    connectorInstructions: resolvedConnectorInstructions,
-                    connectorType: resolvedConnectorType,
-                    connectionString: resolvedConnectionString
-                })
-            });
-            if (!sqlResponse.ok) {
-                throw new Error("SQL generator connection failed.");
-            }
-            const sqlBody = sqlResponse.body;
-            if (!sqlBody) {
-                throw new Error("SQL generator stream not available.");
-            }
-            const sqlReader = sqlBody!.getReader();
-            const sqlDecoder = new TextDecoder();
-            let sqlBuffer = '';
-            let finalQueries: Record<string, string> | null = null;
-            while (true) {
-                const { done, value } = await sqlReader.read();
-                if (done) break;
-                sqlBuffer += sqlDecoder.decode(value, { stream: true });
-                const lines = sqlBuffer.split('\n');
-                sqlBuffer = lines.pop() || '';
-                for (const line of lines) {
-                    const trimmed = line.trim();
-                    if (!trimmed.startsWith('data:')) continue;
-                    try {
-                        const payload = JSON.parse(trimmed.slice(5).trim());
-                        if (payload.status === 'error') {
-                            throw new Error(payload.message || 'SQL generation failed.');
-                        }
-                        if (payload.status === 'completed' && payload.queries) {
-                            finalQueries = payload.queries;
-                        }
-                    } catch {
-                        // ignore malformed chunks
-                    }
-                }
-            }
-            if (!finalQueries) {
-                throw new Error("SQL generation returned no queries.");
-            }
-            const finalQueryMap = finalQueries || {};
-            const queryList = Object.entries(finalQueryMap).map(([id, sql]) => ({
-                id,
-                sql: sql as string,
-                title: finalizedPlan.widgets?.find((w: any) => w.id === id)?.title || id
-            }));
-            setAiQueries(queryList);
-            setUserQueries(queryList);
-            sendStep("sql", "done", "SQL ready");
-
-            // Step 4: Execute
-            setStep(4);
-            sendStep("execute", "running", "Executing queries");
-            const execQueryMap: Record<string, string> = {};
-            queryList.forEach((q) => {
-                execQueryMap[q.id] = q.sql;
-            });
-            const initialExecContext = buildExecutionContext(((finalizedPlan as any).filters) || [], finalizedPlan.widgets || []);
-            const execResults = await runQueryExecutor(execQueryMap, resolvedConnectionString, {
-                connectorInstructions: resolvedConnectorInstructions,
-                connectorType: resolvedConnectorType,
-                tablePagination: initialExecContext.tablePagination,
-                runtimeParams: initialExecContext.runtimeParams
-            });
-            const resultsList = Object.entries(execResults).map(([id, result]: [string, any]) => ({
-                id,
-                ...result,
-                title: queryList.find((q) => q.id === id)?.title || id
-            }));
-            setExecutionResults(resultsList);
-            resultsList.forEach((res: any) => {
-                if (res.status === 'error') {
-                    addSqlError({
-                        id: res.id,
-                        title: res.title,
-                        error: res.error
-                    });
-                }
-            });
-            sendStep("execute", "done", "Execution complete");
-
-            // Step 5: Assemble dashboard
-            setStep(5);
-            sendStep("viz", "running", "Assembling dashboard");
-            let insights: string[] = [];
-            try {
-                insights = await runNarrativeGenerator(resultsList as any[]);
-                sendStep("narrative", "done", "Insights ready");
-            } catch {
-                insights = ["Data retrieval successful. Full analysis ready for inspection."];
-            }
-            const finalDashboard = await assembleFinalDashboard(finalizedPlan, queryList as any[], resultsList as any[], insights, resolvedSchema?.filterCandidates);
-            setDashboardConfig(finalDashboard);
-            handleEvent({
-                type: "partial_dashboard",
-                dashboard: finalDashboard,
-                ts: new Date().toISOString()
-            } as any);
-
-            handleEvent({
-                type: "final",
-                envelope: {
-                    runId,
-                    status: "completed",
-                    dashboard: finalDashboard,
-                    startedAt,
-                    completedAt: new Date().toISOString(),
-                    error: ""
-                },
-                ts: new Date().toISOString()
-            } as any);
+            // Stop after plan and wait for explicit user continue.
+            setPipelineLogs((prev) => [...prev.slice(-199), "Planner: Done - Plan ready. Waiting for Continue to SQL."]);
+            setPipelineStageLogs((prev) => ({ ...prev, plan: [...prev.plan.slice(-99), "Done: Plan ready. Waiting for Continue to SQL."] }));
             endRun(true);
-            sendStep("viz", "done", "Dashboard ready");
+            setProcessing(false);
+            setIsPipelineRunning(false);
+            return;
         } catch (err: any) {
             const message = err?.message || "Pipeline failed";
             handleEvent({
@@ -669,7 +820,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             } as any);
             setError(message);
             endRun(false, message);
-            throw err;
+            return;
         } finally {
             setProcessing(false);
             setIsPipelineRunning(false);
@@ -695,7 +846,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     question: query,
-                    schema: resolvedSchema,
+                    schema: scopeSchemaForQuery(resolvedSchema),
                     connectorInstructions: resolvedConnectorInstructions,
                     connectorType: resolvedConnectorType,
                     connectionString: resolvedConnectionString
@@ -733,7 +884,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                 data: payload.data || [],
                                 columns: payload.columns || [],
                                 rowCount: payload.rowCount || 0,
-                                repaired: payload.repaired || false
+                                repaired: payload.repaired || false,
+                                narrative: payload.narrative || ''
                             };
                         }
                         if (payload.status === 'error') {
@@ -756,10 +908,11 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 setMessages(prev => [...prev, {
                     id: `qa-${Date.now()}`,
                     type: "ai",
-                    content: `✅ Query returned ${result!.rowCount} rows`,
+                    content: result!.narrative || `Found ${result!.rowCount} result${result!.rowCount !== 1 ? "s" : ""}.`,
                     timestamp: new Date().toISOString(),
                     qaResult: result
                 }]);
+                setFollowUpSuggestions(SUGGESTION_CHIPS.chat.filter(s => s !== query).slice(0, 4));
             } else {
                 setMessages(prev => [...prev, {
                     id: `qa-error-${Date.now()}`,
@@ -802,7 +955,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 headers: { 'Content-Type': 'application/json' },
                 body: JSON.stringify({
                     question: query,
-                    schema: resolvedSchema,
+                    schema: scopeSchemaForQuery(resolvedSchema),
                     connectorInstructions: resolvedConnectorInstructions,
                     connectorType: resolvedConnectorType,
                     connectionString: resolvedConnectionString
@@ -849,13 +1002,18 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             setMessages(prev => prev.filter(m => m.id !== thinkingId));
 
             if (report) {
+                // Auto-expand first section
+                if (report.sections?.length > 0) {
+                    setExpandedSections(new Set([report.sections[0].id]));
+                }
                 setMessages(prev => [...prev, {
                     id: `report-${Date.now()}`,
                     type: "ai",
-                    content: `📊 Report: ${report!.title}`,
+                    content: report!.summary || `Report: ${report!.title}`,
                     timestamp: new Date().toISOString(),
                     reportResult: report
                 }]);
+                setFollowUpSuggestions(SUGGESTION_CHIPS.report.filter(s => s !== query).slice(0, 4));
             } else {
                 setMessages(prev => [...prev, {
                     id: `error-${Date.now()}`,
@@ -901,6 +1059,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setMessages(prev => [...prev, userMessage]);
         setInput("");
         setShowSuggestions(false);
+        setFollowUpSuggestions([]);
 
         addToRecentQueries(query);
 
@@ -967,6 +1126,55 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     }, [plan?.rawPlan]);
 
     useEffect(() => {
+        if (!plan?.rawPlan) return;
+        const hasDebug = Boolean((plan as any)?.plannerDebug);
+        if (hasDebug) return;
+        try {
+            const raw = localStorage.getItem(PLANNER_DEBUG_STORAGE_KEY);
+            if (!raw) return;
+            const parsed = JSON.parse(raw);
+            const schemaKey = String(schemaData?.schemaTimestamp || "");
+            const queryKey = String(workflowQuery || "");
+            const entryKey = `${queryKey}::${schemaKey}`;
+            const cached = (() => {
+                if (parsed && typeof parsed === "object" && parsed.version === PLANNER_DEBUG_STORAGE_VERSION && parsed.entries) {
+                    return parsed.entries[entryKey] || parsed.entries[parsed.latestKey] || null;
+                }
+                if (parsed && typeof parsed === "object" && parsed.query) {
+                    return parsed;
+                }
+                return null;
+            })();
+            if (!cached) return;
+            if (!cached?.plannerDebug) return;
+            if (cached?.rawPlan && plan?.rawPlan && String(cached.rawPlan) !== String(plan.rawPlan)) {
+                // fallback match when query/schema key doesn't align
+                const byRawPlan: any = parsed?.entries
+                    ? Object.values(parsed.entries).find((entry: any) => String(entry?.rawPlan || "") === String(plan.rawPlan))
+                    : null;
+                if (!byRawPlan?.plannerDebug) return;
+                const mergedRaw = {
+                    ...plan,
+                    plannerAgents: (plan as any)?.plannerAgents || byRawPlan?.plannerAgents || null,
+                    plannerDebug: byRawPlan.plannerDebug
+                };
+                setAiPlan(mergedRaw);
+                setUserPlan(mergedRaw);
+                return;
+            }
+            const merged = {
+                ...plan,
+                plannerAgents: (plan as any)?.plannerAgents || cached?.plannerAgents || null,
+                plannerDebug: cached.plannerDebug
+            };
+            setAiPlan(merged);
+            setUserPlan(merged);
+        } catch {
+            // ignore cache parse issues
+        }
+    }, [plan?.rawPlan, workflowQuery, schemaData?.schemaTimestamp, setAiPlan, setUserPlan]);
+
+    useEffect(() => {
         const map: Record<number, typeof activeOutputTab> = {
             1: 'schema',
             2: 'plan',
@@ -989,6 +1197,58 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setSqlDrafts(next);
     }, [queries]);
 
+    // Reads the saved column toggles from localStorage and applies them to produce:
+    // - disabledFilterColumns: columns explicitly turned OFF for filtering by the user
+    // - filterableColumns: updated list of enabled filter columns (base from schema minus disabled, plus explicit enables)
+    // This runs on every schema fetch so the latest toggle state is always used.
+    const applyLatestTogglesToSchema = (base: Record<string, unknown>): { disabledFilterColumns: Record<string, string[]>; filterableColumns: Record<string, string[]> } => {
+        try {
+            const raw = localStorage.getItem('schema_column_toggles');
+            const toggles = raw ? JSON.parse(raw) as Record<string, Record<string, { show?: boolean; filterable?: boolean }>> : {};
+
+            const disabled: Record<string, string[]> = {};
+            const filterableCols: Record<string, string[]> = {};
+
+            const baseFilterable = (base?.filterableColumns || {}) as Record<string, string[]>;
+            const schemaInfo = (base?.schemaInfo || {}) as Record<string, unknown>;
+            const allTables = Array.from(new Set([...Object.keys(schemaInfo), ...Object.keys(baseFilterable)]));
+
+            for (const table of allTables) {
+                const baseList: string[] = Array.isArray(baseFilterable[table]) ? [...baseFilterable[table]] : [];
+                const tableToggles = toggles[table] || {};
+                const disabledForTable: string[] = [];
+
+                // Build enabled set starting from base, then apply explicit overrides
+                const enabledSet = new Set<string>(baseList.map((c: string) => c.toLowerCase()));
+                Object.entries(tableToggles).forEach(([col, entry]) => {
+                    if (entry && 'filterable' in entry) {
+                        if (entry.filterable === false) {
+                            enabledSet.delete(col.toLowerCase());
+                            disabledForTable.push(col);
+                        } else if (entry.filterable === true) {
+                            enabledSet.add(col.toLowerCase());
+                        }
+                    }
+                });
+
+                // Rebuild filterableColumns preserving original casing
+                const candidates = [
+                    ...baseList,
+                    ...Object.keys(tableToggles).filter(c => tableToggles[c]?.filterable === true)
+                ];
+                filterableCols[table] = candidates
+                    .filter(c => enabledSet.has(c.toLowerCase()))
+                    .filter((c, i, arr) => arr.findIndex(x => x.toLowerCase() === c.toLowerCase()) === i);
+
+                if (disabledForTable.length > 0) disabled[table] = disabledForTable;
+            }
+
+            return { disabledFilterColumns: disabled, filterableColumns: filterableCols };
+        } catch {
+            return { disabledFilterColumns: {}, filterableColumns: (base?.filterableColumns || {}) as Record<string, string[]> };
+        }
+    };
+
     const ensureSchema = async () => {
         const tryDiscover = async (attempts: number) => {
             let lastError: any = null;
@@ -996,98 +1256,104 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 try {
                     const storedTablesRaw = localStorage.getItem('schema_selected_tables');
                     const allowedTables = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
-                    if (allowedTables.length > 0 && resolvedConnectionString) {
-                        const data = await runSchemaDiscovery(resolvedConnectionString, {
-                            enableSemanticSearch: false,
+                    if (!resolvedConnectionString) continue;
+                    const data = await runSchemaDiscovery(
+                        resolvedConnectionString,
+                        {
+                            enableSemanticSearch: true,
                             enableTableKpis: true,
                             enableTableMatrix: true,
                             enableTableFilters: true,
                             projectContext
-                        }, allowedTables);
-                        if (data?.tables && data.tables.length > 0) return data;
-                        lastError = new Error("Schema discovery returned no tables.");
-                    }
+                        },
+                        allowedTables.length > 0 ? allowedTables : undefined
+                    );
+                    if (data?.tables && data.tables.length > 0) return data;
+                    lastError = new Error("Schema discovery returned no tables.");
                 } catch (err: any) {
                     lastError = err;
                 }
             }
             throw lastError || new Error("Schema discovery failed.");
         };
-        if (schemaData) return schemaData;
+        if (schemaData) {
+            const cachedConn = String((schemaData as any)?.connectionString || "").trim();
+            const activeConn = String(resolvedConnectionString || "").trim();
+            if (!activeConn || !cachedConn || cachedConn === activeConn) {
+                // Check if the selected-tables filter has changed since the schema was cached.
+                const storedTablesRaw = localStorage.getItem('schema_selected_tables');
+                const selectedTables: string[] = storedTablesRaw ? JSON.parse(storedTablesRaw) : [];
+                const cachedTables: string[] = Array.isArray((schemaData as any)?.tables)
+                    ? (schemaData as any).tables
+                    : Object.keys((schemaData as any)?.schemaInfo || {});
+
+                if (selectedTables.length > 0) {
+                    const sel = [...selectedTables].map(t => t.toLowerCase()).sort().join(',');
+                    const cached = [...cachedTables].map(t => t.toLowerCase()).sort().join(',');
+                    if (sel !== cached) {
+                        // Filter changed — fall through to re-run discovery
+                    } else {
+                        const { disabledFilterColumns, filterableColumns } = applyLatestTogglesToSchema(schemaData as Record<string, unknown>);
+                        return { ...schemaData, disabledFilterColumns, filterableColumns };
+                    }
+                } else {
+                    const { disabledFilterColumns, filterableColumns } = applyLatestTogglesToSchema(schemaData as Record<string, unknown>);
+                    return { ...schemaData, disabledFilterColumns, filterableColumns };
+                }
+            }
+        }
         try {
             const data = await tryDiscover(3);
-            setSchemaData(data);
-            return data;
-        } catch (err: any) {
+            const { disabledFilterColumns, filterableColumns } = applyLatestTogglesToSchema(data as Record<string, unknown>);
+            const withToggles = { ...data, disabledFilterColumns, filterableColumns };
+            setSchemaData(withToggles);
+            return withToggles;
+        } catch {
             // continue to manual fallback
         }
         const manual = loadManualSchema();
         if (manual) {
-            setSchemaData(manual);
-            return manual;
+            const { disabledFilterColumns, filterableColumns } = applyLatestTogglesToSchema(manual as Record<string, unknown>);
+            const withToggles = { ...manual, disabledFilterColumns, filterableColumns };
+            setSchemaData(withToggles);
+            return withToggles;
         }
         throw new Error("No schema selected or found.");
     };
 
-    const generateSql = async (planToUse: any, schemaToUse: any) => {
-        const response = await fetch('/api/sql/stream', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify({
-                plan: planToUse,
-                schema: schemaToUse,
-                connectorInstructions: resolvedConnectorInstructions,
-                connectorType: resolvedConnectorType,
-                connectionString: resolvedConnectionString,
-                filters: Object.fromEntries(activeFilters),
-                applyFilters: filtersActivated,
-                errorLog: sqlErrorLog
-            })
-        });
-        if (!response.ok || !response.body) {
-            throw new Error("SQL generator connection failed.");
-        }
-        const reader = response.body.getReader();
-        const decoder = new TextDecoder();
-        let buffer = '';
-        let finalQueries: Record<string, string> | null = null;
-        const streamMap: Record<string, string> = {};
-        while (true) {
-            const { done, value } = await reader.read();
-            if (done) break;
-            buffer += decoder.decode(value, { stream: true });
-            const lines = buffer.split('\n');
-            buffer = lines.pop() || '';
-            for (const line of lines) {
-                const trimmed = line.trim();
-                if (!trimmed.startsWith('data:')) continue;
-                const payload = JSON.parse(trimmed.slice(5).trim());
-                if (payload.status === 'error') {
-                    throw new Error(payload.message || 'SQL generation failed.');
-                }
-                if (payload.status === 'query' && payload.id && payload.sql) {
-                    streamMap[payload.id] = payload.sql;
-                    const streamedList = Object.entries(streamMap).map(([id, sql]) => ({
-                        id,
-                        sql,
-                        title: planToUse.widgets?.find((w: any) => w.id === id)?.title || id
-                    }));
-                    setAiQueries(streamedList);
-                    setUserQueries(streamedList);
-                }
-                if (payload.status === 'completed' && payload.queries) {
-                    finalQueries = payload.queries;
-                }
-            }
-        }
-        if (!finalQueries) {
-            throw new Error("SQL generation returned no queries.");
-        }
-        return Object.entries(finalQueries).map(([id, sql]) => ({
-            id,
-            sql: sql as string,
-            title: planToUse.widgets?.find((w: any) => w.id === id)?.title || id
-        }));
+    /**
+     * Restrict a schema object to only the allowed tables from localStorage
+     * and stamp it with the active connection string + connector type.
+     * This ensures chat-QA and report modes never reference tables the user
+     * hasn't selected, regardless of what the cached schemaData contains.
+     */
+    const scopeSchemaForQuery = (schema: any): any => {
+        const storedRaw = localStorage.getItem('schema_selected_tables');
+        const allowedTables: string[] = storedRaw ? JSON.parse(storedRaw) : [];
+        const allowedNorm = allowedTables.length > 0
+            ? new Set(allowedTables.map((t) => String(t || '').trim().toLowerCase()))
+            : null;
+
+        const normalize = (t: string) => String(t || '').trim().toLowerCase();
+
+        const scopedTables = allowedNorm
+            ? (Array.isArray(schema?.tables) ? schema.tables : []).filter((t: string) => allowedNorm.has(normalize(t)))
+            : schema?.tables || [];
+
+        const scopedSchemaInfo = allowedNorm
+            ? Object.fromEntries(
+                Object.entries(schema?.schemaInfo || {}).filter(([t]) => allowedNorm.has(normalize(t)))
+              )
+            : schema?.schemaInfo || {};
+
+        return {
+            ...schema,
+            tables: scopedTables,
+            schemaInfo: scopedSchemaInfo,
+            // Always stamp with the live active connection so APIs use the right DB
+            connectionString: resolvedConnectionString,
+            connectorType: resolvedConnectorType,
+        };
     };
 
     const executeQueries = async (queryList: any[]) => {
@@ -1220,7 +1486,11 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         } catch {
             insights = ["Data retrieval successful. Full analysis ready for inspection."];
         }
-        const finalDashboard = await assembleFinalDashboard(planToUse, queryList as any[], resultsList as any[], insights, schemaToUse?.filterCandidates);
+        const finalDashboard = await assembleFinalDashboard(
+            planToUse, queryList as any[], resultsList as any[], insights,
+            schemaToUse?.filterCandidates,
+            { visibleColumns: schemaToUse?.visibleColumns, filterableColumns: schemaToUse?.filterableColumns }
+        );
         setDashboardConfig(finalDashboard);
         return finalDashboard;
     };
@@ -1261,14 +1531,16 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
     const streamSqlAndExecuteParallel = async (
         planToUse: any,
         schemaToUse: any,
-        sendStep?: (step: any, status: any, message?: string) => void
+        sendStep?: (step: any, status: any, message?: string) => void,
+        options?: { generateOnly?: boolean; prebuiltSqlMap?: Record<string, string> }
     ) => {
+        setPipelineLogs([]);
+        setPipelineStageLogs({ schema: [], plan: [], sql: [], execute: [], dashboard: [] });
+        appendPipelineLog("sql", "Running: Initializing SQL stream");
         setStep(3);
         sendStep?.("sql", "running", "Generating SQL");
         setActiveOutputTab('sql');
         setShowPipelineOutput(true);
-        setPipelineLogs([]);
-        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
 
         const response = await fetch('/api/widget-pipeline/stream', {
             method: 'POST',
@@ -1281,11 +1553,15 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 errorLog: sqlErrorLog,
                 connectorType: resolvedConnectorType,
                 connectorInstructions: resolvedConnectorInstructions,
-                connectionString: resolvedConnectionString
+                connectionString: resolvedConnectionString,
+                todoListState,
+                generateOnly: options?.generateOnly ?? false,
+                prebuiltSqlMap: options?.prebuiltSqlMap ?? {},
             })
         });
         if (!response.ok || !response.body) {
-            throw new Error("SQL generator connection failed.");
+            const bodyText = await response.text().catch(() => "");
+            throw new Error(bodyText || "SQL generator connection failed.");
         }
 
         const reader = response.body.getReader();
@@ -1296,6 +1572,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         const inflight = new Map<string, Promise<any>>();
         let executeStarted = false;
         let dashboardStarted = false;
+        let sqlCompletionLogged = false;
 
         const upsertQueries = () => {
             const queryList = Object.entries(queryMap).map(([id, sql]) => ({
@@ -1324,7 +1601,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 setStep(5);
                 sendStep?.("viz", "running", "Assembling dashboard");
             }
-            const partial = await assembleFinalDashboard(planToUse, queryList, resultsList, [], schemaToUse?.filterCandidates);
+            const partial = await assembleFinalDashboard(planToUse, queryList, resultsList, [], schemaToUse?.filterCandidates,
+                { visibleColumns: schemaToUse?.visibleColumns, filterableColumns: schemaToUse?.filterableColumns });
             setDashboardConfig(partial);
             handleEvent({
                 type: "partial_dashboard",
@@ -1333,48 +1611,6 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             } as any);
         };
 
-        const normalizeSqlForValidation = (sql: string) => {
-            let text = String(sql || '');
-            if (!text) return '';
-            text = text.replace(/^\uFEFF/, '');
-            text = text.replace(/```/g, '');
-            text = text.replace(/^\s*sql\s*:/i, '');
-            text = text.trimStart();
-            while (text.startsWith('--') || text.startsWith('#') || text.startsWith('/*')) {
-                if (text.startsWith('--') || text.startsWith('#')) {
-                    text = text.replace(/^(--|#)[^\n]*\n?/, '').trimStart();
-                    continue;
-                }
-                if (text.startsWith('/*')) {
-                    text = text.replace(/^\/\*[\s\S]*?\*\//, '').trimStart();
-                    continue;
-                }
-                break;
-            }
-            return text.trim();
-        };
-
-        const validateSql = (sql: string) => {
-            const trimmed = normalizeSqlForValidation(sql);
-            if (!trimmed.toLowerCase().startsWith('select')) {
-                return { ok: false, error: 'Validation failed: SQL must start with SELECT.' };
-            }
-            const isMssql = (() => {
-                const lower = String(postgresUrl || "").toLowerCase();
-                return lower.startsWith("mssql://") || lower.startsWith("sqlserver://") || lower.includes("server=") || lower.includes("data source=");
-            })();
-            const blocked = ['drop', 'delete', 'truncate', 'update', 'insert', 'alter'];
-            if (blocked.some((kw) => trimmed.toLowerCase().includes(kw))) {
-                return { ok: false, error: 'Validation failed: unsafe SQL detected.' };
-            }
-            if (isMssql && /\blimit\s+\d+/i.test(trimmed)) {
-                return { ok: false, error: 'Validation failed: MSSQL does not support LIMIT. Use TOP or OFFSET/FETCH.' };
-            }
-            if (!isMssql && /\btop\s+\d+/i.test(trimmed)) {
-                return { ok: false, error: 'Validation failed: PostgreSQL does not support TOP. Use LIMIT.' };
-            }
-            return { ok: true };
-        };
 
         while (true) {
             const { done, value } = await reader.read();
@@ -1385,72 +1621,141 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             for (const line of lines) {
                 const trimmed = line.trim();
                 if (!trimmed.startsWith('data:')) continue;
-                const payload = JSON.parse(trimmed.slice(5).trim());
+                let payload: any;
+                try {
+                    payload = JSON.parse(trimmed.slice(5).trim());
+                } catch {
+                    continue;
+                }
                 if (payload.status === 'error') {
                     throw new Error(payload.message || 'Widget pipeline failed.');
                 }
+                if (payload.status === 'started') appendPipelineLog("sql", "Running: Stream started");
+                if (payload.status === 'todo_sql_started' && payload.todoList) {
+                    initTodoList(payload.todoList);
+                    appendPipelineLog("sql", `TODO SQL STARTED: ${(payload.todoList?.items || []).length || 0} items`);
+                }
+                if (payload.status === 'todo_sql_widget_update' && payload.item) {
+                    applyTodoItemUpdate(payload.item);
+                    appendPipelineLog("sql", `TODO SQL: ${payload.item.title} -> ${payload.item.status}`);
+                }
+                if (payload.status === 'todo_sql_summary' && payload.summary) {
+                    setTodoSummary(payload.summary);
+                    appendPipelineLog("sql", `TODO SQL SUMMARY: total=${payload.summary?.total || 0}`);
+                }
                 const widgetId = payload.widgetId as string | undefined;
-                if (payload.status === 'sql_builder_running' && widgetId) {
-                    setPipelineLogs((prev) => [...prev, `SQL Builder → ${widgetId} started`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Builder: ${widgetId}`] }));
+                const status = String(payload.status || "");
+                const widgetLabel = widgetId ? ` for ${widgetId}` : "";
+                if (status === 'sql_builder_running' && widgetId) {
+                    appendPipelineLog("sql", `Running: Builder started${widgetLabel}`);
                 }
-                if (payload.status === 'sql_builder_done' && widgetId && payload.sql) {
+                if (status === 'sql_generation_path' && widgetId) {
+                    const mode = String(payload.path || "full");
+                    appendPipelineLog("sql", `SQL path${widgetLabel}: ${mode.toUpperCase()}`);
+                }
+                if (status === 'sql_builder_done' && widgetId && payload.sql) {
                     queryMap[widgetId] = payload.sql;
                     upsertQueries();
-                    setPipelineLogs((prev) => [...prev, `SQL Builder → ${widgetId} done`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Built: ${widgetId}`] }));
+                    appendPipelineLog("sql", `Done: Builder finished${widgetLabel}`);
                 }
-                if (payload.status === 'sql_validator_running' && widgetId) {
-                    setPipelineLogs((prev) => [...prev, `SQL Validator → ${widgetId} running`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Validate: ${widgetId}`] }));
+                if (status === 'sql_validator_running' && widgetId) {
+                    appendPipelineLog("sql", `Running: Validator checking${widgetLabel}`);
                 }
-                if (payload.status === 'sql_validator_fixed' && widgetId && payload.sql) {
+                if (status === 'sql_validator_fixed' && widgetId && payload.sql) {
                     queryMap[widgetId] = payload.sql;
                     upsertQueries();
-                    setPipelineLogs((prev) => [...prev, `SQL Validator → ${widgetId} fixed`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, sql: [...prev.sql, `Fixed: ${widgetId}`] }));
+                    appendPipelineLog("sql", `Done: Validator fixed${widgetLabel}`);
                 }
-                if (payload.status === 'execution_running' && !executeStarted) {
+                if (status === 'sql_validator_done' && widgetId) {
+                    appendPipelineLog("sql", `Done: Validator approved${widgetLabel}`);
+                }
+                if (status === 'sql_review_ready' && widgetId && payload.sql) {
+                    queryMap[widgetId] = payload.sql;
+                    upsertQueries();
+                    appendPipelineLog("sql", `Review ready${widgetLabel}`);
+                }
+                if (status === 'execution_running' && !executeStarted) {
                     executeStarted = true;
                     setStep(4);
                     sendStep?.("execute", "running", "Executing queries");
                 }
-                if (payload.status === 'execution_running' && widgetId) {
-                    setPipelineLogs((prev) => [...prev, `Executor → ${widgetId} running`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Running: ${widgetId}`] }));
+                if (status === 'execution_running' && widgetId) {
+                    appendPipelineLog("execute", `Running: Executing${widgetLabel}`);
                 }
-                if (payload.status === 'manual_required' && widgetId) {
-                    setPipelineLogs((prev) => [...prev, `Manual fix needed → ${widgetId}`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Manual: ${widgetId}`] }));
+                if (status === 'execution_retry' && widgetId) {
+                    if (payload.sql) {
+                        queryMap[widgetId] = payload.sql;
+                        upsertQueries();
+                    }
+                    appendPipelineLog("execute", `Warning: Auto-repair retry${widgetLabel} (attempt ${payload.attempt || "?"})`);
                 }
-                if (payload.status === 'execution_done' && widgetId && payload.result) {
+                if (status === 'manual_required' && widgetId) {
+                    appendPipelineLog("execute", `Warning: Manual fix needed${widgetLabel}`);
+                }
+                if (status === 'execution_done' && widgetId && payload.result) {
                     resultsMap[widgetId] = payload.result;
                     const queryList = upsertQueries();
                     const resultsList = upsertResults(queryList);
                     const task = updateDashboardPartial(queryList, resultsList);
                     inflight.set(widgetId, task);
-                    setPipelineLogs((prev) => [...prev, `Executor → ${widgetId} done`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, execute: [...prev.execute, `Done: ${widgetId}`] }));
+                    appendPipelineLog("execute", `Done: Execution completed${widgetLabel}`);
                 }
-                if (payload.status === 'formatter_done' && widgetId && payload.result) {
+                if (status === 'formatter_done' && widgetId && payload.result) {
                     resultsMap[widgetId] = payload.result;
                     const queryList = upsertQueries();
                     const resultsList = upsertResults(queryList);
                     const task = updateDashboardPartial(queryList, resultsList);
                     inflight.set(widgetId, task);
-                    setPipelineLogs((prev) => [...prev, `Formatter → ${widgetId} ready`]);
-                    setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, `Widget ready: ${widgetId}`] }));
+                    appendPipelineLog("dashboard", `Running: Widget formatted${widgetLabel}`);
+                }
+                if (status === 'completed') {
+                    const queryCount = Object.keys(queryMap).length;
+                    appendPipelineLog("sql", `✓ SQL generation completed: ${queryCount} queries generated`);
+                    appendPipelineLog("sql", "Done: Stream completed");
+                    sqlCompletionLogged = true;
+                }
+                if (widgetId && status.startsWith("sql_") && ![
+                    "sql_builder_running",
+                    "sql_builder_done",
+                    "sql_validator_running",
+                    "sql_validator_fixed",
+                    "sql_validator_done",
+                ].includes(status)) {
+                    appendPipelineLog("sql", `${status.replace(/_/g, " ")}${widgetLabel}`);
                 }
             }
         }
 
-        await Promise.all(Array.from(inflight.values()));
-        sendStep?.("execute", "done", "Execution complete");
-        setPipelineLogs((prev) => [...prev, "Dashboard → assembling final output"]);
-        setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, "Assembling dashboard"] }));
+        if (Object.keys(queryMap).length === 0) {
+            throw new Error("SQL Engineering produced no queries from DB streaming pipeline.");
+        }
+        if (!sqlCompletionLogged) {
+            const queryCount = Object.keys(queryMap).length;
+            appendPipelineLog("sql", `✓ SQL generation completed: ${queryCount} queries generated`);
+        }
+        sendStep?.("sql", "done", "SQL generation complete");
+        appendPipelineLog("sql", "Done: SQL generation complete");
 
+        // HITL: generateOnly mode — pause here and wait for user to approve execution
+        if (options?.generateOnly) {
+            upsertQueries();
+            setAwaitingExecutionApprove(true);
+            setActiveOutputTab('sql');
+            return;
+        }
+
+        await Promise.all(Array.from(inflight.values()));
         const queryList = upsertQueries();
-        const resultsList = upsertResults(queryList);
+        let resultsList = upsertResults(queryList);
+        if (resultsList.length === 0 && queryList.length > 0) {
+            setStep(4);
+            sendStep?.("execute", "running", "Executing queries");
+            setPipelineLogs((prev) => [...prev.slice(-199), "Executor: Running - Executing generated SQL queries"]);
+            appendPipelineLog("execute", "Running: Executing generated SQL queries");
+            resultsList = await executeQueries(queryList);
+        }
+        sendStep?.("execute", "done", "Execution complete");
+        appendPipelineLog("dashboard", "Running: Assembling final output");
         let insights: string[] = [];
         try {
             insights = await runNarrativeGenerator(resultsList as any[]);
@@ -1459,7 +1764,8 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             insights = ["Data retrieval successful. Full analysis ready for inspection."];
         }
 
-        const finalDashboard = await assembleFinalDashboard(planToUse, queryList, resultsList, insights, schemaToUse?.filterCandidates);
+        const finalDashboard = await assembleFinalDashboard(planToUse, queryList, resultsList, insights, schemaToUse?.filterCandidates,
+            { visibleColumns: schemaToUse?.visibleColumns, filterableColumns: schemaToUse?.filterableColumns });
         setDashboardConfig(finalDashboard);
         handleEvent({
             type: "partial_dashboard",
@@ -1467,28 +1773,46 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
             ts: new Date().toISOString()
         } as any);
         sendStep?.("viz", "done", "Dashboard ready");
-        setPipelineLogs((prev) => [...prev, "Dashboard → ready"]);
-        setPipelineStageLogs((prev) => ({ ...prev, dashboard: [...prev.dashboard, "Dashboard ready"] }));
+        appendPipelineLog("dashboard", "Done: Dashboard ready");
     };
 
-    const rerunFromPlan = async () => {
+    const rerunFromPlan = async (options?: { generateOnly?: boolean }) => {
         const schemaToUse = await ensureSchema();
         if (!schemaToUse) throw new Error("Schema context missing. Please run Schema Discovery first.");
-        if (!planDraft.trim()) throw new Error("Plan is empty.");
-        const { extractDashboardTitle, parseNaturalLanguagePlan } = await import('@/utils/plan-parser');
-        const cleaned = planDraft.split("EVENT_STREAM:")[0]?.trim() || planDraft.trim();
-        const nextPlan = {
-            title: extractDashboardTitle(cleaned) || plan?.title || "AI Analytics Dashboard",
-            rawPlan: cleaned,
-            widgets: parseNaturalLanguagePlan(cleaned)
-        };
+        let nextPlan: any;
+        const hasCurrentPlanWidgets = Array.isArray(plan?.widgets) && plan.widgets.length > 0;
+        if (hasCurrentPlanWidgets) {
+            const raw = String(plan?.rawPlan || planDraft || "").trim();
+            const cleaned = raw ? (raw.split("EVENT_STREAM:")[0]?.trim() || raw) : "";
+            nextPlan = {
+                ...plan,
+                rawPlan: cleaned || String(plan?.rawPlan || ""),
+                widgets: ensurePlanWidgets(plan.widgets, schemaToUse),
+            };
+        } else {
+            const { extractDashboardTitle, parseNaturalLanguagePlan, parsePlanFilters } = await import('@/utils/plan-parser');
+            const sourcePlanText = (planDraft || plan?.rawPlan || "").trim();
+            if (!sourcePlanText) throw new Error("Plan is empty.");
+            const cleaned = sourcePlanText.split("EVENT_STREAM:")[0]?.trim() || sourcePlanText;
+            const parsedWidgets = parseNaturalLanguagePlan(cleaned);
+            const fallbackWidgets = Array.isArray(plan?.widgets) ? plan.widgets : [];
+            const safeWidgets = ensurePlanWidgets(parsedWidgets.length > 0 ? parsedWidgets : fallbackWidgets, schemaToUse);
+            nextPlan = {
+                title: extractDashboardTitle(cleaned) || plan?.title || "AI Analytics Dashboard",
+                rawPlan: cleaned,
+                widgets: safeWidgets,
+                filters: parsePlanFilters(cleaned)
+            };
+        }
         setAiPlan(nextPlan);
         setUserPlan(nextPlan);
         const runId = `local_continue_${Date.now()}`;
         startRun(runId);
         setAwaitingSqlContinue(false);
+        setAwaitingExecutionApprove(false);
         setPipelineLogs([]);
-        setPipelineStageLogs({ sql: [], execute: [], dashboard: [] });
+        setPipelineStageLogs({ schema: [], plan: [], sql: [], execute: [], dashboard: [] });
+        resetTodoList();
         setDashboardConfig(null);
         setDashboard(null);
         setIsPipelineRunning(true);
@@ -1496,6 +1820,18 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         setError(null);
         const sendStep = (step: any, status: any, message?: string) => {
             const ts = new Date().toISOString();
+            const stageLabel =
+                step === "schema" || step === "kpi" ? "Schema"
+                    : step === "plan" ? "Planner"
+                        : step === "sql" ? "SQL Engineer"
+                            : step === "execute" ? "Executor"
+                                : (step === "viz" || step === "narrative") ? "Dashboard"
+                                    : String(step);
+            const statusLabel =
+                status === "running" ? "Running"
+                    : status === "done" ? "Done"
+                        : status === "error" ? "Error"
+                            : String(status);
             handleEvent({
                 type: "step",
                 step,
@@ -1510,22 +1846,24 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     message,
                     ts
                 } as any);
-                setPipelineLogs((prev) => [...prev, `${String(step).toUpperCase()} [${String(status).toUpperCase()}] ${message}`]);
+                setPipelineLogs((prev) => [...prev.slice(-199), `${stageLabel}: ${statusLabel} - ${message}`]);
                 const stage =
-                    step === "sql" ? "sql"
+                    (step === "schema" || step === "kpi") ? "schema"
+                        : step === "plan" ? "plan"
+                        : step === "sql" ? "sql"
                         : step === "execute" ? "execute"
                             : (step === "viz" || step === "narrative") ? "dashboard"
                                 : null;
                 if (stage) {
                     setPipelineStageLogs((prev) => ({
                         ...prev,
-                        [stage]: [...prev[stage as "sql" | "execute" | "dashboard"], `${String(status).toUpperCase()}: ${message}`]
+                        [stage]: [...prev[stage as PipelineStage].slice(-99), `${statusLabel}: ${message}`]
                     }));
                 }
             }
         };
         try {
-            await streamSqlAndExecuteParallel(nextPlan, schemaToUse, sendStep);
+            await streamSqlAndExecuteParallel(nextPlan, schemaToUse, sendStep, options);
             endRun(true);
         } catch (err: any) {
             const message = err?.message || "Pipeline failed";
@@ -1545,7 +1883,51 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
     const continueToSql = async () => {
         setAwaitingSqlContinue(false);
-        await rerunFromPlan();
+        setAwaitingExecutionApprove(false);
+        setActiveOutputTab('sql');
+        setShowPipelineOutput(true);
+        setCurrentView("build");
+        setStep(3);
+        // HITL: generate SQL only first — user reviews before execution
+        await rerunFromPlan({ generateOnly: true });
+    };
+
+    /** HITL: User reviewed SQL and clicked "Run Queries" — execute using current userQueries as-is. */
+    const approveAndExecute = async () => {
+        setAwaitingExecutionApprove(false);
+        const schemaToUse = await ensureSchema();
+        if (!schemaToUse) throw new Error("Schema context missing.");
+        const planToUse = userPlan || aiPlan;
+        if (!planToUse) throw new Error("No plan available.");
+
+        // Build prebuiltSqlMap from the user-reviewed (possibly edited) queries
+        const prebuiltSqlMap: Record<string, string> = {};
+        (queries || []).forEach((q: any) => {
+            if (q?.id && q?.sql) prebuiltSqlMap[q.id] = q.sql;
+        });
+
+        const runId = `local_execute_${Date.now()}`;
+        startRun(runId);
+        setPipelineLogs([]);
+        setPipelineStageLogs({ schema: [], plan: [], sql: [], execute: [], dashboard: [] });
+        setIsPipelineRunning(true);
+        setProcessing(true);
+        setError(null);
+        const sendStep = (step: any, status: any, message?: string) => {
+            const ts = new Date().toISOString();
+            handleEvent({ type: "step", step, status, message, ts } as any);
+        };
+        try {
+            await streamSqlAndExecuteParallel(planToUse, schemaToUse, sendStep, { prebuiltSqlMap });
+            endRun(true);
+        } catch (err: any) {
+            const message = err?.message || "Execution failed";
+            setError(message);
+            endRun(false, message);
+        } finally {
+            setProcessing(false);
+            setIsPipelineRunning(false);
+        }
     };
 
     const rerunFromSql = async () => {
@@ -1565,10 +1947,58 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
     const renderPipelineOutput = () => {
         if (!showPipelineOutput) return null;
+        const summary = todoListState?.summary;
+        const byDomain = (todoListState?.items || []).reduce<Record<string, any[]>>((acc, item) => {
+            const key = String(item?.domain || "other");
+            if (!acc[key]) acc[key] = [];
+            acc[key].push(item);
+            return acc;
+        }, {});
+        const renderTodoList = (domains: string[]) => {
+            const items = domains.flatMap((domain) => byDomain[domain] || []);
+            if (items.length === 0) return null;
+            const grouped = domains
+                .map((domain) => ({ domain, items: byDomain[domain] || [] }))
+                .filter((group) => group.items.length > 0);
+            return (
+                <div className={styles.outputItem}>
+                    <div className={styles.outputItemHeader}>
+                        <span>Dynamic TODO List</span>
+                        <span className={styles.outputPill}>total {summary?.total || items.length}</span>
+                    </div>
+                    {!!summary && (
+                        <div className={styles.outputMeta}>
+                            <span>Pending: {summary.byStatus?.pending || 0}</span>
+                            <span>Running: {summary.byStatus?.running || 0}</span>
+                            <span>Done: {summary.byStatus?.done || 0}</span>
+                            <span>Blocked: {(summary.byStatus?.blocked || 0) + (summary.byStatus?.failed || 0)}</span>
+                        </div>
+                    )}
+                    {grouped.map((group) => (
+                        <div key={`todo-group-${group.domain}`} style={{ marginTop: 8 }}>
+                            <div style={{ fontSize: 12, textTransform: "uppercase", opacity: 0.7, marginBottom: 6 }}>{group.domain}</div>
+                            {group.items.map((item) => (
+                                <div key={item.id} className={styles.outputMeta}>
+                                    <span>{item.title}</span>
+                                    <span className={styles.outputPill}>{item.status}</span>
+                                </div>
+                            ))}
+                        </div>
+                    ))}
+                </div>
+            );
+        };
 
         if (activeOutputTab === 'schema') {
             return (
                 <div className={styles.outputBody}>
+                    {pipelineStageLogs.schema.length > 0 && (
+                        <div className={styles.outputLog}>
+                            {pipelineStageLogs.schema.slice(-8).map((line, idx) => (
+                                <div key={`log-schema-${idx}`} className={styles.outputLogLine}>{line}</div>
+                            ))}
+                        </div>
+                    )}
                     <div className={styles.outputMeta}>
                         <span>Tables: {resolvedTables.length || 0}</span>
                         <span>Filters: {schemaData?.filterSummary || 'None detected'}</span>
@@ -1585,6 +2015,13 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         if (activeOutputTab === 'plan') {
             return (
                 <div className={styles.outputBody}>
+                    {pipelineStageLogs.plan.length > 0 && (
+                        <div className={styles.outputLog}>
+                            {pipelineStageLogs.plan.slice(-8).map((line, idx) => (
+                                <div key={`log-plan-${idx}`} className={styles.outputLogLine}>{line}</div>
+                            ))}
+                        </div>
+                    )}
                     <div className={styles.outputMeta}>
                         <span>Title: {plan?.title || '—'}</span>
                         <span>Widgets: {plan?.widgets?.length || 0}</span>
@@ -1598,6 +2035,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     ) : (
                         <pre className={styles.outputCode}>{plan?.rawPlan || planDraft || 'No plan generated yet.'}</pre>
                     )}
+                    {renderTodoList(["widget", "column", "filter", "agent"])}
                 </div>
             );
         }
@@ -1605,10 +2043,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         if (activeOutputTab === 'sql') {
             return (
                 <div className={styles.outputBody}>
-                    {pipelineLogs.length > 0 && (
+                    {pipelineStageLogs.sql.length > 0 && (
                         <div className={styles.outputLog}>
-                            {pipelineLogs.slice(-8).map((line, idx) => (
-                                <div key={`log-${idx}`} className={styles.outputLogLine}>{line}</div>
+                            {pipelineStageLogs.sql.slice(-12).map((line, idx) => (
+                                <div key={`log-sql-${idx}`} className={styles.outputLogLine}>{line}</div>
                             ))}
                         </div>
                     )}
@@ -1631,6 +2069,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     ) : (
                         <span className={styles.outputEmpty}>No SQL generated yet.</span>
                     )}
+                    {renderTodoList(["sql", "agent"])}
                 </div>
             );
         }
@@ -1638,9 +2077,9 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
         if (activeOutputTab === 'execute') {
             return (
                 <div className={styles.outputBody}>
-                    {pipelineLogs.length > 0 && (
+                    {pipelineStageLogs.execute.length > 0 && (
                         <div className={styles.outputLog}>
-                            {pipelineLogs.slice(-8).map((line, idx) => (
+                            {pipelineStageLogs.execute.slice(-12).map((line, idx) => (
                                 <div key={`log-exec-${idx}`} className={styles.outputLogLine}>{line}</div>
                             ))}
                         </div>
@@ -1668,9 +2107,9 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
         return (
             <div className={styles.outputBody}>
-                {pipelineLogs.length > 0 && (
+                {pipelineStageLogs.dashboard.length > 0 && (
                     <div className={styles.outputLog}>
-                        {pipelineLogs.slice(-8).map((line, idx) => (
+                        {pipelineStageLogs.dashboard.slice(-12).map((line, idx) => (
                             <div key={`log-dash-${idx}`} className={styles.outputLogLine}>{line}</div>
                         ))}
                     </div>
@@ -1707,16 +2146,32 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                 </div>
             );
         }
+        const humanizeCol = (col: string) =>
+            col.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+        const formatCell = (val: any): string => {
+            if (val == null) return "—";
+            if (typeof val === "number") return val.toLocaleString();
+            const s = String(val);
+            // ISO date-like: format nicely
+            if (/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(s)) {
+                try {
+                    return new Date(s).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+                } catch { return s; }
+            }
+            return s;
+        };
+
         return (
             <div className={styles.qaResult}>
                 <div className={styles.qaStats}>
                     <span className={styles.qaStat}>
                         <Table2 size={14} />
-                        {qa.rowCount} rows
+                        {qa.rowCount.toLocaleString()} row{qa.rowCount !== 1 ? "s" : ""}
                     </span>
                     <span className={styles.qaStat}>
                         <Database size={14} />
-                        {qa.columns.length} columns
+                        {qa.columns.length} col{qa.columns.length !== 1 ? "s" : ""}
                     </span>
                     {qa.repaired && (
                         <span className={styles.qaStatRepaired}>
@@ -1731,7 +2186,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                             <thead>
                                 <tr>
                                     {qa.columns.map((col, i) => (
-                                        <th key={i}>{col}</th>
+                                        <th key={i}>{humanizeCol(col)}</th>
                                     ))}
                                 </tr>
                             </thead>
@@ -1739,7 +2194,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                 {qa.data.slice(0, 20).map((row, ri) => (
                                     <tr key={ri}>
                                         {qa.columns.map((col, ci) => (
-                                            <td key={ci}>{row[col] != null ? String(row[col]) : '—'}</td>
+                                            <td key={ci}>{formatCell(row[col])}</td>
                                         ))}
                                     </tr>
                                 ))}
@@ -1747,7 +2202,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                         </table>
                         {qa.data.length > 20 && (
                             <div className={styles.qaTableMore}>
-                                Showing 20 of {qa.rowCount} rows
+                                Showing 20 of {qa.rowCount.toLocaleString()} rows
                             </div>
                         )}
                     </div>
@@ -1765,6 +2220,23 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
     // ─── Report Result Renderer ───
     const renderReportResult = (report: ReportResult) => {
+        const humanizeCol = (col: string) =>
+            col.replace(/_/g, " ").replace(/\b\w/g, c => c.toUpperCase());
+
+        const formatCell = (val: any): string => {
+            if (val == null) return "—";
+            if (typeof val === "number") return val.toLocaleString();
+            const s = String(val);
+            if (/^\d{4}-\d{2}-\d{2}(T[\d:.Z+-]+)?$/.test(s)) {
+                try { return new Date(s).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" }); }
+                catch { return s; }
+            }
+            return s;
+        };
+
+        const isKpiSection = (section: ReportSection) =>
+            section.data.length === 1 && section.columns.length <= 4;
+
         return (
             <div className={styles.reportResult}>
                 <div className={styles.reportHeader}>
@@ -1772,17 +2244,10 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     <div>
                         <h3 className={styles.reportTitle}>{report.title}</h3>
                         <span className={styles.reportDate}>
-                            {new Date(report.generatedAt).toLocaleString()}
+                            {new Date(report.generatedAt).toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })}
                         </span>
                     </div>
                 </div>
-
-                {report.summary && (
-                    <div className={styles.reportSummary}>
-                        <h4>Executive Summary</h4>
-                        <p>{report.summary}</p>
-                    </div>
-                )}
 
                 {report.insights && report.insights.length > 0 && (
                     <div className={styles.reportInsights}>
@@ -1799,6 +2264,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     <div className={styles.reportSections}>
                         {report.sections.map((section) => {
                             const isExpanded = expandedSections.has(section.id);
+                            const isKpi = isKpiSection(section);
                             return (
                                 <div key={section.id} className={styles.reportSection}>
                                     <button
@@ -1819,17 +2285,31 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                             />
                                             <span>{section.title}</span>
                                             <span className={styles.reportSectionBadge}>
-                                                {section.error ? '❌ Error' : `${section.rowCount} rows`}
+                                                {section.error ? 'Error' : `${section.rowCount.toLocaleString()} rows`}
                                             </span>
                                         </div>
                                         <span className={styles.reportSectionDesc}>{section.description}</span>
                                     </button>
                                     {isExpanded && (
                                         <div className={styles.reportSectionBody}>
+                                            {section.narrative && (
+                                                <div className={styles.reportSectionNarrative}>
+                                                    {section.narrative}
+                                                </div>
+                                            )}
                                             {section.error ? (
                                                 <div className={styles.qaError}>
                                                     <AlertCircle size={14} />
                                                     <span>{section.error}</span>
+                                                </div>
+                                            ) : isKpi && section.data.length > 0 ? (
+                                                <div className={styles.reportKpiGrid}>
+                                                    {section.columns.map((col, i) => (
+                                                        <div key={i} className={styles.reportKpiCard}>
+                                                            <span className={styles.reportKpiLabel}>{humanizeCol(col)}</span>
+                                                            <span className={styles.reportKpiValue}>{formatCell(section.data[0][col])}</span>
+                                                        </div>
+                                                    ))}
                                                 </div>
                                             ) : section.data.length > 0 ? (
                                                 <div className={styles.qaTableWrapper}>
@@ -1837,23 +2317,23 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                                         <thead>
                                                             <tr>
                                                                 {section.columns.map((col, i) => (
-                                                                    <th key={i}>{col}</th>
+                                                                    <th key={i}>{humanizeCol(col)}</th>
                                                                 ))}
                                                             </tr>
                                                         </thead>
                                                         <tbody>
-                                                            {section.data.slice(0, 15).map((row, ri) => (
+                                                            {section.data.slice(0, 25).map((row, ri) => (
                                                                 <tr key={ri}>
                                                                     {section.columns.map((col, ci) => (
-                                                                        <td key={ci}>{row[col] != null ? String(row[col]) : '—'}</td>
+                                                                        <td key={ci}>{formatCell(row[col])}</td>
                                                                     ))}
                                                                 </tr>
                                                             ))}
                                                         </tbody>
                                                     </table>
-                                                    {section.data.length > 15 && (
+                                                    {section.data.length > 25 && (
                                                         <div className={styles.qaTableMore}>
-                                                            Showing 15 of {section.rowCount} rows
+                                                            Showing 25 of {section.rowCount.toLocaleString()} rows
                                                         </div>
                                                     )}
                                                 </div>
@@ -1877,7 +2357,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
 
                 {report.recommendation && (
                     <div className={styles.reportRecommendation}>
-                        <h4>💡 Recommendation</h4>
+                        <h4>Next Steps</h4>
                         <p>{report.recommendation}</p>
                     </div>
                 )}
@@ -1987,8 +2467,33 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     </motion.div>
                 ))}
 
-                {/* Agent Timeline (during streaming) */}
-                {(isStreaming || steps.length > 0) && (
+                {/* Follow-up suggestions after AI response */}
+                <AnimatePresence>
+                    {followUpSuggestions.length > 0 && !isAnyLoading && (
+                        <motion.div
+                            initial={{ opacity: 0, y: 6 }}
+                            animate={{ opacity: 1, y: 0 }}
+                            exit={{ opacity: 0 }}
+                            className={styles.followUpArea}
+                        >
+                            <span className={styles.followUpLabel}>You might also ask:</span>
+                            <div className={styles.followUpChips}>
+                                {followUpSuggestions.map((s, i) => (
+                                    <button
+                                        key={i}
+                                        className={styles.followUpChip}
+                                        onClick={() => { setInput(s); inputRef.current?.focus(); }}
+                                    >
+                                        {s}
+                                    </button>
+                                ))}
+                            </div>
+                        </motion.div>
+                    )}
+                </AnimatePresence>
+
+                {/* Agent Timeline — dashboard mode only */}
+                {chatMode === 'dashboard' && (isStreaming || steps.length > 0) && (
                     <div className={styles.timelineContainer}>
                         <AgentTimeline
                             steps={steps}
@@ -2035,7 +2540,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     </div>
                 )}
 
-                {(steps.length > 0 || isStreaming) && (
+                {chatMode === 'dashboard' && (steps.length > 0 || isStreaming) && (
                     <div className={styles.outputPanel}>
                         <div className={styles.outputHeader}>
                             <span>Pipeline Output</span>
@@ -2069,13 +2574,25 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                     </>
                                 )}
                                 {activeOutputTab === 'sql' && (
-                                    <button
-                                        type="button"
-                                        className={styles.outputActionPrimary}
-                                        onClick={() => rerunFromSql()}
-                                    >
-                                        Rerun SQL
-                                    </button>
+                                    <>
+                                        {awaitingExecutionApprove ? (
+                                            <button
+                                                type="button"
+                                                className={styles.outputActionPrimary}
+                                                onClick={() => approveAndExecute()}
+                                            >
+                                                Run Queries
+                                            </button>
+                                        ) : (
+                                            <button
+                                                type="button"
+                                                className={styles.outputActionPrimary}
+                                                onClick={() => rerunFromSql()}
+                                            >
+                                                Rerun SQL
+                                            </button>
+                                        )}
+                                    </>
                                 )}
                                 <button
                                     type="button"
@@ -2112,36 +2629,45 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                                 </div>
                                 {showLivePanel && (
                                     <div className={styles.livePanel}>
-                                        <div className={styles.liveColumn}>
-                                            <div className={styles.liveTitle}>SQL</div>
-                                            {(pipelineStageLogs.sql.length === 0) ? (
-                                                <div className={styles.liveEmpty}>Waiting for SQL…</div>
-                                            ) : (
-                                                pipelineStageLogs.sql.slice(-5).map((line, idx) => (
-                                                    <div key={`sql-log-${idx}`} className={styles.liveLine}>{line}</div>
-                                                ))
-                                            )}
-                                        </div>
-                                        <div className={styles.liveColumn}>
-                                            <div className={styles.liveTitle}>Executor</div>
-                                            {(pipelineStageLogs.execute.length === 0) ? (
-                                                <div className={styles.liveEmpty}>Waiting for execution…</div>
-                                            ) : (
-                                                pipelineStageLogs.execute.slice(-5).map((line, idx) => (
-                                                    <div key={`exec-log-${idx}`} className={styles.liveLine}>{line}</div>
-                                                ))
-                                            )}
-                                        </div>
-                                        <div className={styles.liveColumn}>
-                                            <div className={styles.liveTitle}>Dashboard</div>
-                                            {(pipelineStageLogs.dashboard.length === 0) ? (
-                                                <div className={styles.liveEmpty}>Waiting for widgets…</div>
-                                            ) : (
-                                                pipelineStageLogs.dashboard.slice(-5).map((line, idx) => (
-                                                    <div key={`dash-log-${idx}`} className={styles.liveLine}>{line}</div>
-                                                ))
-                                            )}
-                                        </div>
+                                        {([
+                                            { key: "schema", label: "Schema", empty: "Waiting for schema…" },
+                                            { key: "plan", label: "Plan", empty: "Waiting for planner…" },
+                                            { key: "sql", label: "SQL", empty: "Waiting for SQL…" },
+                                            { key: "execute", label: "Executor", empty: "Waiting for execution…" },
+                                            { key: "dashboard", label: "Dashboard", empty: "Waiting for widgets…" },
+                                        ] as Array<{ key: PipelineStage; label: string; empty: string }>).map((section) => {
+                                            const items = pipelineStageLogs[section.key] || [];
+                                            const latest = items.length > 0 ? items[items.length - 1] : "";
+                                            const relatedStep = (() => {
+                                                if (section.key === "schema") {
+                                                    return [...steps].reverse().find((s) => s.step === "schema" || s.step === "kpi");
+                                                }
+                                                if (section.key === "dashboard") {
+                                                    return [...steps].reverse().find((s) => s.step === "viz" || s.step === "narrative");
+                                                }
+                                                return [...steps].reverse().find((s) => s.step === section.key);
+                                            })();
+                                            const relatedStatus = String(relatedStep?.status || "");
+                                            const statusText = relatedStatus
+                                                ? `${relatedStatus.toUpperCase()}${relatedStep?.message ? `: ${relatedStep.message}` : ""}`
+                                                : section.empty;
+                                            return (
+                                                <div key={section.key} className={styles.liveColumn}>
+                                                    <div className={styles.liveTitleRow}>
+                                                        <div className={styles.liveTitle}>{section.label}</div>
+                                                        <span className={styles.liveCount}>
+                                                            {relatedStatus || items.length}
+                                                        </span>
+                                                    </div>
+                                                    {latest ? <div className={styles.liveLatest}>{latest}</div> : <div className={styles.liveEmpty}>{statusText}</div>}
+                                                    <div className={styles.liveLines}>
+                                                        {items.slice(-6).map((line, idx) => (
+                                                            <div key={`${section.key}-log-${idx}`} className={styles.liveLine}>{line}</div>
+                                                        ))}
+                                                    </div>
+                                                </div>
+                                            );
+                                        })}
                                     </div>
                                 )}
                                 {renderPipelineOutput()}
@@ -2167,7 +2693,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                             <span>Try asking ({MODE_CONFIG[chatMode].label})</span>
                         </div>
                         <div className={styles.chips}>
-                            {activeSuggestions.map((suggestion, i) => (
+                            {activeSuggestions.slice(0, 4).map((suggestion, i) => (
                                 <button
                                     key={i}
                                     className={styles.chip}
@@ -2250,7 +2776,7 @@ export function ChatPanel({ onCollapse }: ChatPanelProps) {
                     )}
                 </div>
 
-                {isStreaming && (
+                {chatMode === 'dashboard' && isStreaming && (
                     <div className={styles.connectionStatus}>
                         <span className={styles.statusDot} />
                         <span>Running</span>

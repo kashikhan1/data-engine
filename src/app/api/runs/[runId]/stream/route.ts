@@ -1,8 +1,8 @@
 import { NextRequest } from "next/server";
-import { graph } from "@/lib/agents/graph";
+import { graph } from "@/modules/runtime/agent";
 import { HumanMessage } from "@langchain/core/messages";
 import { serializeForClient } from "@/utils/serialization";
-import { runRegistry } from "@/lib/agents/registry";
+import { runRegistry } from "@/modules/runtime/agent";
 import { AgentStep } from "@/types/dashboard";
 
 export async function GET(

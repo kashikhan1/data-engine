@@ -2,8 +2,8 @@
 
 import React, { useState, useEffect, useRef, useCallback, useMemo } from 'react';
 import { useWorkflowStore, useDashboardStore, useConfigStore } from '@/state/stores';
-import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from '@/lib/agents/nodes';
-import { runSchemaDiscovery } from '@/lib/agents/schema-discovery';
+import { runQueryExecutor, assembleFinalDashboard, runNarrativeGenerator, repairFailedQuery } from '@/modules/sql/agent';
+import { runSchemaDiscovery } from '@/modules/schema/agent';
 import { buildExecutionContext as buildSharedExecutionContext } from '@/lib/execution-context';
 import { getPaginationForId, toRecordFromFilterMap } from '@/lib/pagination';
 import {
@@ -19,21 +19,24 @@ import {
     Progress,
     Tooltip
 } from 'antd';
+import { ProgressTracker } from "@/components/ui";
 import {
     ReloadOutlined,
     ArrowRightOutlined,
     PlayCircleOutlined,
-    CheckCircleOutlined,
-    ExclamationCircleOutlined,
     ClockCircleOutlined,
     TableOutlined,
-    ToolOutlined
+    ToolOutlined,
+    DatabaseOutlined,
+    ThunderboltOutlined,
+    CheckCircleOutlined
 } from '@ant-design/icons';
+import styles from './QueryExecutorView.module.css';
 
 const { Title, Text } = Typography;
 
 export const QueryExecutorView: React.FC = () => {
-    const { postgresUrl, projectContext, dataSources, selectedDataSourceId } = useConfigStore();
+    const { postgresUrl, mssqlUrl, projectContext, dataSources, selectedDataSourceId } = useConfigStore();
     const {
         userPlan,
         aiPlan,
@@ -65,13 +68,20 @@ export const QueryExecutorView: React.FC = () => {
     const [repairingIds, setRepairingIds] = useState<Set<string>>(new Set());
     const { setDashboard, activeFilters } = useDashboardStore();
     const selectedConnector = useMemo(() => {
-        const connectors = (dataSources || []).filter((ds) => {
-            const type = String(ds?.type || "").toLowerCase();
+        if (selectedDataSourceId) {
+            return dataSources.find(ds => ds.id === selectedDataSourceId) || null;
+        }
+        // Fallback to first SQL/MCP source if nothing selected
+        return dataSources.find(ds => {
+            const type = String(ds.type || "").toLowerCase();
             return type.includes("postgres") || type.includes("mssql") || type.includes("sql") || type.includes("mcp");
-        });
-        return connectors.find((ds) => ds.id === selectedDataSourceId) || connectors.find((ds) => Boolean(ds.connectionString)) || null;
+        }) || null;
     }, [dataSources, selectedDataSourceId]);
-    const resolvedConnectionString = selectedConnector?.connectionString || postgresUrl || schemaData?.connectionString || undefined;
+
+    const resolvedConnectionString = selectedConnector?.connectionString ||
+        schemaData?.connectionString ||
+        (selectedConnector?.type === 'MSSQL' ? mssqlUrl : postgresUrl) ||
+        undefined;
     const resolvedConnectorType = selectedConnector?.type || schemaData?.connectorType || "";
     const resolvedConnectorInstructions = selectedConnector?.instructions || schemaData?.connectorInstructions || "";
     const normalizeError = (err: any) => {
@@ -437,9 +447,16 @@ export const QueryExecutorView: React.FC = () => {
             setError(err.message);
             enqueueMessage(() => messageApi.error({ content: `Failed to assemble dashboard: ${err.message}`, key: 'assemble', duration: 5 }));
         } finally {
+            messageApi.destroy('assemble');
             setProcessing(false);
         }
     };
+
+    useEffect(() => {
+        return () => {
+            messageApi.destroy('assemble');
+        };
+    }, []);
 
     // Auto-execute when arriving on step 4 with stale or missing results.
     useEffect(() => {
@@ -449,42 +466,109 @@ export const QueryExecutorView: React.FC = () => {
     }, [executionResults, staleStep, userQueries, aiQueries, isProcessing]);
 
     if (isProcessing && !executionResults) {
+        const stages = [
+            { 
+                id: 'connect', 
+                label: 'Connecting to database', 
+                status: 'completed' as const,
+                message: 'Secure connection established'
+            },
+            { 
+                id: 'execute', 
+                label: 'Executing queries', 
+                status: 'in_progress' as const,
+                message: 'Running SQL queries...'
+            },
+            { 
+                id: 'retrieve', 
+                label: 'Retrieving results', 
+                status: 'pending' as const,
+                message: 'Fetching data from database'
+            },
+            { 
+                id: 'process', 
+                label: 'Processing results', 
+                status: 'pending' as const,
+                message: 'Formatting and preparing data'
+            }
+        ];
+        
         return (
-            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', justifyContent: 'center', height: '100%', gap: 16 }}>
-                <Spin size="large" />
-                <Progress
-                    percent={60}
-                    status="active"
-                    showInfo={false}
-                    style={{ width: 200 }}
-                />
-                <Text type="secondary">Establishing secure connection and retrieving data...</Text>
+            <div style={{ 
+                display: 'flex', 
+                flexDirection: 'column', 
+                alignItems: 'center', 
+                justifyContent: 'center', 
+                height: '100%', 
+                padding: 40,
+                background: 'radial-gradient(ellipse at top, rgba(99, 102, 241, 0.1) 0%, transparent 50%)'
+            }}>
+                <div style={{ 
+                    maxWidth: 500, 
+                    width: '100%' 
+                }}>
+                    <div style={{ 
+                        textAlign: 'center', 
+                        marginBottom: 32 
+                    }}>
+                        <div style={{ 
+                            fontSize: 48, 
+                            marginBottom: 16,
+                        }}>
+                            <DatabaseOutlined style={{ 
+                                color: '#6366f1',
+                                animation: 'pulse 1.5s ease-in-out infinite'
+                            }} />
+                        </div>
+                        <Title level={3} style={{ color: '#fff', margin: 0 }}>
+                            Executing SQL Queries
+                        </Title>
+                        <Text type="secondary">
+                            Connecting to database and running queries
+                        </Text>
+                    </div>
+                    
+                    <ProgressTracker 
+                        stages={stages}
+                        title="Query Execution"
+                        showOverallProgress={true}
+                    />
+                </div>
             </div>
         );
     }
 
     const successCount = executionResults?.filter((r: any) => r.status === 'success').length || 0;
     const totalCount = executionResults?.length || 0;
+    const failedCount = executionResults?.filter((r: any) => r.status === 'error').length || 0;
+    const repairingCount = executionResults?.filter((r: any) => r.status === 'repairing').length || 0;
+    const totalRows = executionResults?.reduce((acc: number, r: any) => acc + (Array.isArray(r.data) ? r.data.length : 0), 0) || 0;
     const progressPercent = totalCount > 0 ? Math.round((successCount / totalCount) * 100) : 0;
 
     return (
-        <div style={{ padding: '24px', height: '100%', overflowY: 'auto' }}>
-            <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'flex-start', marginBottom: 20, padding: '16px 20px', borderRadius: 16, border: '1px solid #242a36', background: '#0f1218' }}>
-                <div>
-                    <Title level={2} style={{ margin: 0 }}>
-                        <PlayCircleOutlined style={{ marginRight: 12 }} />
+        <div className={styles.container}>
+            <div className={styles.header}>
+                <div className={styles.headerMain}>
+                    <Title level={2} className={styles.pageTitle}>
+                        <PlayCircleOutlined className={styles.titleIcon} />
                         Data Execution
                     </Title>
-                    <Space separator={<Text type="secondary">|</Text>}>
-                        <Text type="secondary">Run queries and review results</Text>
+                    <div className={styles.metaRow}>
                         <Tag color="blue">Step 4 of 5</Tag>
-                        <Text strong type={progressPercent === 100 ? 'success' : 'warning'}>
-                            {successCount} / {totalCount} Queries Successful
-                        </Text>
-                    </Space>
+                        <Text type="secondary">Run queries and review results</Text>
+                    </div>
+                    <Progress
+                        className={styles.progress}
+                        percent={progressPercent}
+                        size="small"
+                        status={failedCount > 0 ? 'exception' : 'active'}
+                        format={() => `${successCount}/${totalCount || 0} successful`}
+                    />
                 </div>
-                <Space>
-                    <Button icon={<ReloadOutlined />} onClick={handleExecute} loading={isProcessing}>Run Queries</Button>
+                <Space className={styles.actions}>
+                    <Button icon={<ReloadOutlined />} onClick={handleExecute} loading={isProcessing}>
+                        Run Queries
+                    </Button>
                     <Button
                         type="primary"
                         icon={<ArrowRightOutlined />}
@@ -496,27 +580,54 @@ export const QueryExecutorView: React.FC = () => {
                 </Space>
             </div>
 
+            <div className={styles.kpiGrid}>
+                <Card size="small" className={styles.kpiCard}>
+                    <Text type="secondary" className={styles.kpiLabel}>Successful</Text>
+                    <div className={styles.kpiValue}>{successCount}</div>
+                </Card>
+                <Card size="small" className={styles.kpiCard}>
+                    <Text type="secondary" className={styles.kpiLabel}>Failed</Text>
+                    <div className={styles.kpiValue}>{failedCount}</div>
+                </Card>
+                <Card size="small" className={styles.kpiCard}>
+                    <Text type="secondary" className={styles.kpiLabel}>Repairing</Text>
+                    <div className={styles.kpiValue}>{repairingCount}</div>
+                </Card>
+                <Card size="small" className={styles.kpiCard}>
+                    <Text type="secondary" className={styles.kpiLabel}>Rows Retrieved</Text>
+                    <div className={styles.kpiValue}>{totalRows}</div>
+                </Card>
+            </div>
+
             {error && (
                 <Alert
                     title={<span style={{ color: '#fff' }}>Execution Alert</span>}
                     description={<span style={{ color: 'rgba(255, 255, 255, 0.7)' }}>{error}</span>}
                     type="error"
                     showIcon
-                    style={{ marginBottom: 24, background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
+                    className={styles.errorBanner}
                 />
             )}
 
-            <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fill, minmax(400px, 1fr))', gap: 24 }}>
+            {!executionResults?.length && !isProcessing && (
+                <Card className={styles.emptyState}>
+                    <Text type="secondary">No query results yet. Click <Text strong>Run Queries</Text> to execute this step.</Text>
+                </Card>
+            )}
+
+            <div className={styles.resultsGrid}>
                 {executionResults?.map((res: any) => (
                     <Card
                         key={res.id}
                         size="small"
+                        className={styles.resultCard}
                         title={
-                            <Space>
-                                <Text strong>{res.title}</Text>
+                            <Space className={styles.cardTitleWrap}>
+                                <Text strong className={styles.cardTitle}>{res.title}</Text>
                                 <Tag color={res.status === 'success' ? 'success' : 'error'}>
-                                    {res.status === 'success' ? 'READY' : 'FAILED'}
+                                    {res.status === 'success' ? 'READY' : res.status === 'repairing' ? 'REPAIRING' : 'FAILED'}
                                 </Tag>
+                                {res.repairedSql && <Tag color="processing">REPAIRED</Tag>}
                             </Space>
                         }
                         extra={
@@ -532,14 +643,16 @@ export const QueryExecutorView: React.FC = () => {
                         }
                     >
                         {res.status === 'success' ? (
-                            <div>
-                                <div style={{ display: 'flex', justifyContent: 'space-between', marginBottom: 8 }}>
-                                    <Text type="secondary" style={{ fontSize: 12 }}><TableOutlined /> {res.data?.length || 0} rows retrieved</Text>
+                            <div className={styles.successBody}>
+                                <div className={styles.resultMeta}>
+                                    <Text type="secondary" className={styles.metaText}><TableOutlined /> {res.data?.length || 0} rows retrieved</Text>
+                                    {res.repairExplanation && <Text className={styles.repairNote}>{res.repairExplanation}</Text>}
                                 </div>
                                 <Table
                                     size="small"
                                     pagination={false}
                                     dataSource={res.data?.slice(0, 3)}
+                                    className={styles.previewTable}
                                     columns={Object.keys(res.data?.[0] || {})
                                         .filter(key => key !== '__rowKey')
                                         .map(key => ({
@@ -547,7 +660,7 @@ export const QueryExecutorView: React.FC = () => {
                                             dataIndex: key,
                                             key: key,
                                             render: (val: any) => (
-                                                <div style={{ maxWidth: 100, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap', fontSize: 11 }}>
+                                                <div className={styles.cellValue}>
                                                     {String(val)}
                                                 </div>
                                             )
@@ -556,7 +669,7 @@ export const QueryExecutorView: React.FC = () => {
                                 />
                             </div>
                         ) : res.status === 'repairing' ? (
-                            <div style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: 8, padding: 16 }}>
+                            <div className={styles.repairingState}>
                                 <Spin />
                                 <Text type="secondary">AI is analyzing and fixing the query...</Text>
                             </div>
@@ -578,7 +691,7 @@ export const QueryExecutorView: React.FC = () => {
                                 }
                                 type="error"
                                 showIcon
-                                style={{ background: 'rgba(245, 34, 45, 0.1)', border: '1px solid rgba(245, 34, 45, 0.3)' }}
+                                className={styles.queryError}
                                 action={
                                     <Button
                                         size="small"

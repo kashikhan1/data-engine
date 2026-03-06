@@ -1,6 +1,6 @@
 'use client';
 
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useRef } from 'react';
 import { Card, Progress, Typography, List, Tag, Space, Alert, Button, Spin, Timeline, Badge, Divider } from 'antd';
 import {
     DatabaseOutlined,
@@ -14,6 +14,7 @@ import {
 } from '@ant-design/icons';
 import { WidgetRenderer } from "@/components/widgets/WidgetRenderer";
 import type { WidgetSpec } from "@/types/dashboard";
+import { useConfigStore, useWorkflowStore } from "@/state/stores";
 
 const { Title, Text, Paragraph } = Typography;
 
@@ -71,13 +72,20 @@ export default function StreamingSqlEngineerView() {
     const [events, setEvents] = useState<StreamEvent[]>([]);
     const [queryProgress, setQueryProgress] = useState<Record<string, QueryProgress>>({});
     const [widgetProgress, setWidgetProgress] = useState<Record<string, WidgetProgress>>({});
-    const [currentPhase, setCurrentPhase] = useState<string>('idle');
     const [overallProgress, setOverallProgress] = useState(0);
     const [finalResults, setFinalResults] = useState<any>(null);
     const [error, setError] = useState<string | null>(null);
 
-    const eventSourceRef = useRef<EventSource | null>(null);
     const abortControllerRef = useRef<AbortController | null>(null);
+    const {
+        query,
+        schemaData,
+        userPlan,
+        aiPlan,
+        userQueries,
+        aiQueries
+    } = useWorkflowStore();
+    const { postgresUrl, dataSources, selectedDataSourceId } = useConfigStore();
 
     // Define workflow phases for better UX
     const [phases, setPhases] = useState<WorkflowPhase[]>([
@@ -129,12 +137,44 @@ export default function StreamingSqlEngineerView() {
             setOverallProgress(0);
 
             // Reset phases
-            setPhases(phases.map(p => ({ ...p, status: 'waiting', progress: 0 })));
+            setPhases(prev => prev.map(p => ({ ...p, status: 'waiting', progress: 0 })));
+
+            const selectedConnector = dataSources.find(ds => ds.id === selectedDataSourceId) || dataSources.find(ds => ds.connectionString) || null;
+            const effectivePlan = userPlan || aiPlan;
+            const currentQueries = userQueries || aiQueries || [];
+            const sqlMap: Record<string, string> = {};
+            currentQueries.forEach((q: any) => {
+                if (q?.id && q?.sql) sqlMap[String(q.id)] = String(q.sql);
+            });
+            const requestPayload = {
+                query,
+                schema: schemaData ? {
+                    ...schemaData,
+                    connectionString: selectedConnector?.connectionString || schemaData?.connectionString || postgresUrl
+                } : undefined,
+                queryPlan: effectivePlan || undefined,
+                queryValidation: Object.keys(sqlMap).length > 0 ? sqlMap : undefined,
+                securityClearance: { approved: true },
+                context: {
+                    connectionString: selectedConnector?.connectionString || postgresUrl,
+                    connectorInstructions: selectedConnector?.instructions || schemaData?.connectorInstructions || "",
+                    connectorType: selectedConnector?.type || schemaData?.connectorType || ""
+                },
+                ...params
+            };
+
+            if (!requestPayload.schema || !requestPayload.queryPlan) {
+                throw new Error('Missing schema or plan. Run planner + SQL generation first.');
+            }
+
+            const abortController = new AbortController();
+            abortControllerRef.current = abortController;
 
             const response = await fetch('/api/stream-sql-engineer', {
                 method: 'POST',
                 headers: { 'Content-Type': 'application/json' },
-                body: JSON.stringify(params),
+                body: JSON.stringify(requestPayload),
+                signal: abortController.signal,
             });
 
             if (!response.ok) {
@@ -172,6 +212,8 @@ export default function StreamingSqlEngineerView() {
         } catch (err) {
             setError(err instanceof Error ? err.message : 'Unknown error');
             setIsStreaming(false);
+        } finally {
+            abortControllerRef.current = null;
         }
     };
 
@@ -214,12 +256,12 @@ export default function StreamingSqlEngineerView() {
 
     const handleProgressEvent = (event: StreamEvent) => {
         const stage = event.stage || 'unknown';
-        setCurrentPhase(stage);
 
         setPhases(prev => prev.map(phase => {
-            if (phase.name === stage || (stage === 'query_complete_phase' && phase.name === 'query_execution')) {
+            if (stage === 'query_complete_phase' && phase.name === 'query_execution') {
                 return { ...phase, status: 'complete', progress: 100 };
-            } else if (phase.name === stage) {
+            }
+            if (phase.name === stage) {
                 return { ...phase, status: 'running', progress: 50 };
             }
             return phase;
@@ -247,7 +289,6 @@ export default function StreamingSqlEngineerView() {
             };
         });
 
-        setCurrentPhase('query_execution');
     };
 
     const handleQueryComplete = (event: StreamEvent) => {
@@ -304,7 +345,6 @@ export default function StreamingSqlEngineerView() {
             };
         });
 
-        setCurrentPhase('dashboard_building');
     };
 
     const handleWidgetComplete = (event: StreamEvent) => {
@@ -366,9 +406,6 @@ export default function StreamingSqlEngineerView() {
     };
 
     const stopStreaming = () => {
-        if (eventSourceRef.current) {
-            eventSourceRef.current.close();
-        }
         if (abortControllerRef.current) {
             abortControllerRef.current.abort();
         }
@@ -448,7 +485,7 @@ export default function StreamingSqlEngineerView() {
             {/* Workflow Phases */}
             <Card title="Workflow Phases" style={{ marginBottom: 24 }}>
                 <div style={{ display: 'flex', justifyContent: 'space-between', flexWrap: 'wrap' }}>
-                    {phases.map((phase, index) => (
+                    {phases.map((phase) => (
                         <div
                             key={phase.name}
                             style={{

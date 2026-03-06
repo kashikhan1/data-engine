@@ -4,7 +4,7 @@ import React, { useState, useMemo, useEffect, useRef, useCallback } from 'react'
 import { useWorkflowStore, useDashboardStore, useEditorStore, useRunStore, useConfigStore } from '@/state/stores';
 import { DashboardCanvas } from '@/components/canvas/DashboardCanvas';
 import { FilterBar } from '@/components/canvas/FilterBar';
-import { assembleFinalDashboard, runNarrativeGenerator, runQueryExecutor, repairFailedQuery } from '@/lib/agents/nodes';
+import { assembleFinalDashboard, runNarrativeGenerator, runQueryExecutor, repairFailedQuery } from '@/modules/sql/agent';
 import { buildExecutionContext as buildSharedExecutionContext } from '@/lib/execution-context';
 import {
     App,
@@ -19,6 +19,7 @@ import {
     Tag,
     Spin
 } from 'antd';
+import { ProgressTracker } from "@/components/ui";
 import {
     EditOutlined,
     SaveOutlined,
@@ -28,7 +29,9 @@ import {
     ExportOutlined,
     QuestionCircleOutlined,
     UndoOutlined,
-    MoreOutlined
+    MoreOutlined,
+    DashboardOutlined,
+    ThunderboltOutlined
 } from '@ant-design/icons';
 
 
@@ -627,13 +630,32 @@ export const DashboardRenderView: React.FC = () => {
     }
 
     if (isDashboardLoading) {
+        const stages = [
+            { id: 'prepare', label: 'Preparing dashboard data', status: 'in_progress' as const },
+            { id: 'assemble', label: 'Assembling dashboard', status: 'pending' as const },
+            { id: 'render', label: 'Rendering widgets', status: 'pending' as const },
+            { id: 'finalize', label: 'Finalizing layout', status: 'pending' as const },
+        ];
+
         return (
-            <div style={{ padding: '64px', display: 'flex', justifyContent: 'center' }}>
-                <Result
-                    icon={<Spin size="large" />}
-                    title="Assembling dashboard..."
-                    subTitle="Crunching results and rendering widgets."
-                />
+            <div style={{ padding: '64px 24px', display: 'flex', justifyContent: 'center', alignItems: 'center', minHeight: 400 }}>
+                <div style={{ maxWidth: 600, width: '100%' }}>
+                    <div style={{ marginBottom: 32, textAlign: 'center' }}>
+                        <Title level={3} style={{ margin: 0, display: 'flex', alignItems: 'center', justifyContent: 'center', gap: 12 }}>
+                            <span style={{ fontSize: 28 }}>📊</span>
+                            Assembling Dashboard
+                        </Title>
+                        <Text type="secondary">
+                            Crunching results and rendering widgets
+                        </Text>
+                    </div>
+                    
+                    <ProgressTracker 
+                        stages={stages}
+                        title="Dashboard Assembly"
+                        showOverallProgress={true}
+                    />
+                </div>
             </div>
         );
     }
